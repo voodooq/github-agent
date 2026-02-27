@@ -105,40 +105,56 @@ JSON_FORMAT_INSTRUCTION = """
 }
 """
 
-# 评审专家库
-EXPERT_PROMPTS = {
-    "UX_Expert": """你是一个极致的 UX 体验专家，专注于开发者体验（DX）。请分析该项目的 README 和文档：
+# 评审专家注册表 (专家职责、算力要求、数据预处理)
+EXPERT_REGISTRY = {
+    "UX_Expert": {
+        "tier": "LOCAL",
+        "need_preprocess": False,
+        "prompt": """你是一个极致的 UX 体验专家，专注于开发者体验（DX）。请分析该项目的 README 和文档：
 1. **快速开始**：是否有 3 步以内的快速运行指南？
 2. **直观性**：是否有截图、Demo 演示或清晰的示例代码片段？
 3. **完整性**：API 参数说明是否齐全？是否有常见问题（FAQ）？
 4. **评估指标**：从‘新手到跑通’需要的时间成本。
-评分逻辑：缺少示例代码扣 20 分，文档超过半年未更新扣 10 分。""" + JSON_FORMAT_INSTRUCTION,
-
-    "DevOps_Expert": """你是一个高级 DevOps 工程师。请审计项目的工程化程度：
+评分逻辑：缺少示例代码扣 20 分，文档超过半年未更新扣 10 分。""" + JSON_FORMAT_INSTRUCTION
+    },
+    "DevOps_Expert": {
+        "tier": "LOCAL",
+        "need_preprocess": False,
+        "prompt": """你是一个高级 DevOps 工程师。请审计项目的工程化程度：
 1. **环境依赖**：分析依赖文件（requirements.txt/pyproject.toml 等），依赖是否臃肿或包含冲突风险？
 2. **容器化**：是否有高质量的 Dockerfile 或 docker-compose？配置是否符合生产环境标准？
 3. **可维护性**：是否有单元测试 and CI/CD 流水线（如 .github/workflows）？
 4. **复杂性**：部署该项目需要哪些外部中间件（MySQL, Redis, MeiliSearch 等）？
-给出‘部署复杂度等级’：极简/中等/复杂。""" + JSON_FORMAT_INSTRUCTION,
-
-    "Security_Expert": """你是一个网络安全审计专家。请对代码库进行静态扫描式评估：
+给出‘部署复杂度等级’：极简/中等/复杂。""" + JSON_FORMAT_INSTRUCTION
+    },
+    "Security_Expert": {
+        "tier": "PREMIUM",
+        "need_preprocess": True,
+        "prompt": """你是一个网络安全审计专家。请对代码库进行静态扫描式评估：
 1. **硬编码风险**：检查代码中是否存在残留的 API Key、测试账号或 Token 占位符。
 2. **函数风险**：寻找可能导致命令注入或未授权访问的代码模式（如：eval(), os.system(), 动态 SQL）。
 3. **合规性**：识别开源协议。如果是 GPL，请提醒用户其对闭源商业化的影响。
 4. **供应链安全**：识别是否存在已知的陈旧漏洞依赖包。
-结论必须包含‘安全风险等级’：低/中/高/严峻。""" + JSON_FORMAT_INSTRUCTION,
-
-    "Liveliness_Expert": """你是一个开源社区观察员。请分析该项目的健康指标：
+结论必须包含‘安全风险等级’：低/中/高/严峻。""" + JSON_FORMAT_INSTRUCTION
+    },
+    "Liveliness_Expert": {
+        "tier": "LOCAL",
+        "need_preprocess": False,
+        "prompt": """你是一个开源社区观察员。请分析该项目的健康指标：
 1. **更新频率**：分析最近的 Commit 时间轴，最近三个月是否有有效更新？
 2. **响应速度**：Issue 的关闭率 and 维护者对 PR 的反馈周期。
 3. **流行度真实性**：结合 Star 数 and Fork 数，判断其是否具备真实的社区支持。
-结论建议：这是一个‘处于巅峰’、‘稳定维护’还是‘濒临废弃’的项目？""" + JSON_FORMAT_INSTRUCTION,
-
-    "Arch_Expert": """你是一个资深系统架构师。请分析其代码组织结构：
+结论建议：这是一个‘处于巅峰’、‘稳定维护’还是‘濒临废弃’的项目？""" + JSON_FORMAT_INSTRUCTION
+    },
+    "Arch_Expert": {
+        "tier": "LONG_CONTEXT",
+        "need_preprocess": False,
+        "prompt": """你是一个资深系统架构师。请分析其代码组织结构：
 1. **耦合度**：代码是否模块化？是否方便通过插件或 Hook 进行功能扩展？
 2. **技术栈**：是否使用了现代化的库（如 FastAPI, Pydantic, Asyncio 等）？
 3. **代码规范**：变量命名、注释质量是否符合规范（如 PEP8）？
 4. **匹配度**：评估该架构对于用户将其集成到 OpenClaw 平台中的难易程度。""" + JSON_FORMAT_INSTRUCTION
+    }
 }
 
 # 协调员 Agent (Coordinator)

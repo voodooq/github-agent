@@ -7,14 +7,18 @@ import asyncio
 import logging
 import os
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import WordCompleter, Completer
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from config import (
-    LLM_API_KEY,
-    LLM_BASE_URL,
-    LLM_MODEL,
+    CLOUD_API_KEY,
+    CLOUD_BASE_URL,
+    CLOUD_MODEL,
+    LOCAL_API_KEY,
+    LOCAL_BASE_URL,
+    LOCAL_MODEL,
     MCP_COMMAND,
+    MCP_ARGS,
     MCP_ENV,
     MEMORY_FILE,
     AGENT_MODE,
@@ -46,9 +50,16 @@ def printHelp():
 async def main():
     """主函数：初始化 Agent → 连接 MCP → 交互循环"""
     agent = McpAgent(
-        apiKey=LLM_API_KEY,
-        baseUrl=LLM_BASE_URL,
-        model=LLM_MODEL,
+        cloud_config={
+            "api_key": CLOUD_API_KEY,
+            "base_url": CLOUD_BASE_URL,
+            "model": CLOUD_MODEL,
+        },
+        local_config={
+            "api_key": LOCAL_API_KEY,
+            "base_url": LOCAL_BASE_URL,
+            "model": LOCAL_MODEL,
+        },
         systemPrompt=SYSTEM_PROMPT,
         mode=AGENT_MODE,
     )
@@ -61,7 +72,9 @@ async def main():
     env = {**os.environ, **MCP_ENV} if MCP_ENV else None
     serverParams = StdioServerParameters(command=MCP_COMMAND, args=MCP_ARGS, env=env)
 
-    print(f"\n🔍 GitHub 检索分析 Agent 已启动 (模型: {LLM_MODEL}, 模式: {AGENT_MODE})")
+    print(f"\n🚀 OpenClaw Hybrid Agent 已启动 [模式: {AGENT_MODE}]")
+    print(f"☁️  线上模型: {CLOUD_MODEL}")
+    print(f"🏠 本地模型: {LOCAL_MODEL}")
     print(f"📡 MCP 服务: {MCP_COMMAND} {' '.join(MCP_ARGS)}")
     printHelp()
 
@@ -75,7 +88,7 @@ async def main():
             print()
 
             # 配置自动补全
-            command_completer = WordCompleter(
+            word_completer = WordCompleter(
                 [
                     "/search", "/analyze", "/review", "/help", "/clear", "/tools", "/exit", "/quit"
                 ],
@@ -92,7 +105,14 @@ async def main():
                 ignore_case=True,
                 match_middle=True,
             )
-            prompt_session = PromptSession(completer=command_completer, complete_while_typing=True)
+
+            class SlashCommandCompleter(Completer):
+                def get_completions(self, document, complete_event):
+                    # 仅在输入以 / 开头时触发提示，避免输入空格或普通文字时弹出菜单
+                    if document.text.startswith('/'):
+                        yield from word_completer.get_completions(document, complete_event)
+
+            prompt_session = PromptSession(completer=SlashCommandCompleter(), complete_while_typing=True)
 
             # 交互循环
             while True:
@@ -136,19 +156,15 @@ async def main():
                     userInput = ANALYZE_PROMPT_TEMPLATE.format(repo_url=repoUrl)
                     print(f"📊 正在分析: {repoUrl}\n")
                 elif userInput.startswith("/review "):
-                    # 专家团评审：获取数据 -> 并行评审
+                    # 专家团评审：自适应加载 -> 混合算力评审
                     repoUrl = userInput[8:].strip()
                     if not repoUrl:
                         print("⚠️  请输入仓库地址，例如: /review https://github.com/owner/repo\n")
                         continue
-                    print(f"📡 [{AGENT_MODE}] 正在获取项目基础信息 (README/结构/核心源码)...")
                     try:
-                        # 使用自适应加载逻辑获取项目数据
-                        projectData = await agent.adaptive_load_data(repoUrl)
-                        
-                        # 触发专家团评审
+                        # 触发混合算力专家团评审 (内部包含数据加载与脱水)
                         print(f"\n🤖 专家团综合评审报告：\n", end="", flush=True)
-                        async for chunk in agent.multiAgentReview(projectData):
+                        async for chunk in agent.multiAgentReview(repoUrl):
                             print(chunk, end="", flush=True)
                         print("\n")
                     except Exception as e:

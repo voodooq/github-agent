@@ -10,9 +10,77 @@ from typing import AsyncGenerator
 from openai import OpenAI
 from mcp import ClientSession
 from tool_converter import convertMcpToolsToOpenai
-from prompts import EXPERT_PROMPTS, COORDINATOR_SYSTEM_PROMPT
+from prompts import EXPERT_REGISTRY, COORDINATOR_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+class UnifiedClient:
+    """
+    统一 LLM 客户端：支持云端/本地路由与自动降级回退。
+    """
+
+    def __init__(self, cloud_config: dict, local_config: dict):
+        self.cloud_config = cloud_config
+        self.local_config = local_config
+        self.cloud_client = OpenAI(api_key=cloud_config["api_key"], base_url=cloud_config["base_url"])
+        self.local_client = OpenAI(api_key=local_config["api_key"], base_url=local_config["base_url"])
+
+    async def generate(self, tier: str, system_prompt: str, user_content: str, response_format: dict | None = None) -> str:
+        """
+        根据层级决定调用哪个模型，支持回退。
+        """
+        # 定义层级对应的模型顺序
+        if tier in ("PREMIUM", "LONG_CONTEXT"):
+            targets = [
+                (self.cloud_client, self.cloud_config["model"], "CLOUD"),
+                (self.local_client, self.local_config["model"], "LOCAL")
+            ]
+        else:
+            targets = [
+                (self.local_client, self.local_config["model"], "LOCAL"),
+                (self.cloud_client, self.cloud_config["model"], "CLOUD")
+            ]
+
+        last_error = None
+        for client, model, label in targets:
+            if not client.api_key: continue
+            try:
+                kwargs = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content}
+                    ],
+                    "timeout": 60
+                }
+                if response_format:
+                    kwargs["response_format"] = response_format
+
+                # OpenAI client is synchronous, but we can wrap it or use it as is if not hitting event loop issues.
+                # In this simple agent, we use it directly.
+                response = client.chat.completions.create(**kwargs)
+                return response.choices[0].message.content
+            except Exception as e:
+                logger.warning(f"模型 {label}({model}) 调用失败: {e}，正在尝试降级...")
+                last_error = e
+                continue
+        
+        raise Exception(f"所有算力层级均调用失败: {last_error}")
+
+    def generate_stream(self, tier: str, messages: list[dict]):
+        """
+        流式生成，主要用于 Coordinator 或 Chat。
+        """
+        # 简单实现：Chat 优先云端，出错不降级（保持上下文一致性）
+        client = self.cloud_client if self.cloud_config["api_key"] else self.local_client
+        model = self.cloud_config["model"] if self.cloud_config["api_key"] else self.local_config["model"]
+        
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=True
+        )
 
 
 class McpAgent:
@@ -24,14 +92,14 @@ class McpAgent:
 
     def __init__(
         self,
-        apiKey: str,
-        baseUrl: str,
-        model: str,
+        cloud_config: dict,
+        local_config: dict,
         systemPrompt: str = "你是一个智能助手。",
-        mode: str = "TURBO",
+        mode: str = "AUTO",
     ):
-        self.client = OpenAI(api_key=apiKey, base_url=baseUrl)
-        self.model = model
+        self.unified_client = UnifiedClient(cloud_config, local_config)
+        self.cloud_model = cloud_config["model"]
+        self.local_model = local_config["model"]
         self.messages: list[dict] = [{"role": "system", "content": systemPrompt}]
         self.session: ClientSession | None = None
         self.openaiTools: list[dict] = []
@@ -56,20 +124,21 @@ class McpAgent:
         """
         self.messages.append({"role": "user", "content": userInput})
         MAX_ITERATIONS = 10
-
         for _ in range(MAX_ITERATIONS):
             kwargs: dict = {
-                "model": self.model,
                 "messages": self.messages,
-                "stream": True,
             }
+            # Chat 模式下模型选择
+            model = self.cloud_model if self.unified_client.cloud_config["api_key"] else self.local_model
+            client = self.unified_client.cloud_client if self.unified_client.cloud_config["api_key"] else self.unified_client.local_client
+
             if self.openaiTools:
                 kwargs["tools"] = self.openaiTools
 
             fullContent = ""
             toolCallsDict = {}  # 用于按索引累计 tool_calls 数据
 
-            response = self.client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(model=model, stream=True, **kwargs)
 
             for chunk in response:
                 delta = chunk.choices[0].delta
@@ -160,77 +229,92 @@ class McpAgent:
         except FileNotFoundError:
             logger.info("未找到记忆文件 %s，使用空白记忆", filePath)
 
-    async def adaptive_load_data(self, repo_name: str) -> str:
+    async def adaptive_load_data(self, repo_name: str, expert_config: dict | None = None) -> str:
         """
-        自适应数据加载：根据模式决定分析深度。
+        自适应数据加载：根据专家算力层级决定分析深度。
         """
-        print(f"📂 [{self.mode} Mode] 正在获取仓库结构...")
+        tier = expert_config.get("tier", "LOCAL") if expert_config else "LOCAL"
+        print(f"📂 [{self.mode} | {tier}] 正在扫描仓库结构...")
+        
         try:
             # 1. 扫描文件树
-            tree = await self.session.call_tool("list_directory", arguments={"path": "./", "repository": repo_name})
+            tree = await self.session.list_directory(arguments={"path": "./", "repository": repo_name})
             tree_content = str(tree.content)
             
             # 2. 确定待加载文件
             files_to_read = ["README.md"]
-            if self.mode == "TURBO":
-                # Turbo 模式搜寻核心代码
-                candidates = ["requirements.txt", "package.json", "main.py", "app.py", "index.ts", "src/index.ts", "setup.py"]
-                # 简单过滤 tree 中存在的文件
+            if tier in ("PREMIUM", "LONG_CONTEXT") or self.mode == "TURBO":
+                # 深度模式：搜寻核心代码
+                candidates = ["requirements.txt", "package.json", "main.py", "app.py", "index.ts", "src/index.ts", "setup.py", "go.mod"]
                 found_files = [f for f in candidates if f in tree_content]
-                files_to_read.extend(found_files[:3]) # 最多额外读 3 个核心文件
+                # 限制读取数量，防止上下文溢出
+                limit = 5 if tier == "LONG_CONTEXT" else 2
+                files_to_read.extend(found_files[:limit])
 
             # 3. 批量读取源码
-            print(f"🚀 正在加载核心上下文: {files_to_read}...")
+            print(f"🚀 正在加载上下文文件: {files_to_read}...")
             read_tasks = [self.session.call_tool("get_file_contents", arguments={"path": f, "repository": repo_name}) for f in files_to_read]
             file_results = await asyncio.gather(*read_tasks)
+            
             source_context = f"--- 文件树结构 ---\n{tree_content}\n\n"
             for i, r in enumerate(file_results):
                 source_context += f"--- 文件内容: {files_to_read[i]} ---\n{str(r.content)}\n\n"
+            
+            # 4. 数据脱水逻辑 (如果专家需要且是本地模型可处理的)
+            if expert_config and expert_config.get("need_preprocess", False):
+                print("🏠 正在触发本地模型进行数据脱水清洗...")
+                wash_prompt = "你是一个代码清洗助手。请删除以下代码中的许可证声明、冗长注释、HTML标签和非逻辑代码，只保留核心业务逻辑和属性定义。保持代码紧凑。"
+                source_context = await self.unified_client.generate("LOCAL", wash_prompt, source_context)
             
             return source_context
         except Exception as e:
             logger.error("数据加载失败: %s", e)
             return f"数据加载部分失败: {e}"
 
-    async def expertReview(self, expertName: str, systemPrompt: str, projectData: str) -> dict:
+    async def expertReview(self, expertName: str, config: dict, projectData: str) -> dict:
         """
-        单个专家的异步评审逻辑
+        单个专家的异步评审逻辑，自带路由与回退。
         """
-        logger.info("专家评审启动: %s", expertName)
+        logger.info("专家评审启动: %s (%s)", expertName, config["tier"])
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": systemPrompt},
-                    {"role": "user", "content": f"请评价这个项目：\n{projectData}"}
-                ],
+            resultText = await self.unified_client.generate(
+                tier=config["tier"],
+                system_prompt=config["prompt"],
+                user_content=f"请评价这个项目：\n{projectData}",
                 response_format={"type": "json_object"}
             )
-            resultText = response.choices[0].message.content
             return {expertName: json.loads(resultText)}
         except Exception as e:
             logger.error("专家 %s 评审失败: %s", expertName, e)
             return {expertName: {"error": str(e)}}
 
-    async def multiAgentReview(self, projectData: str) -> AsyncGenerator[str, None]:
+    async def multiAgentReview(self, repo_url: str) -> AsyncGenerator[str, None]:
         """
-        多 Agent 评审流：支持 TURBO (并行) 和 SEQUENTIAL (串行) 模式。
+        混合多 Agent 评审流：并发调度、算力路由、自适应加载。
         """
+        print(f"\n🚀 [Hybrid Mode: {self.mode}] 启动 OpenClaw 多专家联合评审团...")
+        
         expert_results = []
-        expert_tasks_info = list(EXPERT_PROMPTS.items())
+        # 将注册表转换为任务列表
+        expert_items = list(EXPERT_REGISTRY.items())
 
-        if self.mode == "TURBO":
-            print(f"\n🚀 [Turbo Mode] 正在并行调用 {len(expert_tasks_info)} 个专家进行深度审计...")
-            tasks = [
-                self.expertReview(name, prompt, projectData) 
-                for name, prompt in expert_tasks_info
-            ]
+        # 1. 专家任务分发
+        async def _run_expert_task(name, cfg):
+            # 自适应加载每个专家所需的数据
+            repo_name = repo_url.split("/")[-1]
+            context = await self.adaptive_load_data(repo_name, cfg)
+            # 执行评审
+            return await self.expertReview(name, cfg, context)
+
+        if self.mode != "SEQUENTIAL":
+            # 并发模式 (Turbo / Auto)
+            tasks = [_run_expert_task(name, cfg) for name, cfg in expert_items]
             expert_results = await asyncio.gather(*tasks)
         else:
-            print(f"\n🐢 [Sequential Mode] 正在逐一请教专家 (本地显存优化)...")
-            for name, prompt in expert_tasks_info:
-                print(f" -> {name} 正在思考...", end="", flush=True)
-                res = await self.expertReview(name, prompt, projectData)
+            # 串行模式 (本地保护)
+            for name, cfg in expert_items:
+                print(f" -> {name} 正在工作...", end="", flush=True)
+                res = await _run_expert_task(name, cfg)
                 expert_results.append(res)
                 print(" ✅")
         
@@ -238,20 +322,13 @@ class McpAgent:
         expertReviewsJson = json.dumps(expert_results, ensure_ascii=False, indent=2)
         
         # 3. 协调员生成最终报告
-        print("✍️  正在由协调员汇总专家意见并生成最终报告...")
-        
-        # 可以在此处根据 mode 调整 coordinator prompt 的前缀
-        mode_hint = "【注意：当前为 Turbo 深度模式，已阅读源码数据。】" if self.mode == "TURBO" else "【注意：当前为 Sequential 轻量模式，仅阅读了 README 数据。】"
-        full_system_prompt = mode_hint + "\n" + COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=expertReviewsJson)
+        print("✍️  正在由首席协调员汇总报告...")
+        full_system_prompt = COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=expertReviewsJson)
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": full_system_prompt},
-                {"role": "user", "content": "请基于以上评审意见，给出你的最终咨询建议。"}
-            ],
-            stream=True
-        )
+        response = self.unified_client.generate_stream("PREMIUM", [
+            {"role": "system", "content": full_system_prompt},
+            {"role": "user", "content": "请基于以上各领域专家的深度审计，给出你作为产品经理的最终投资/选型建议。"}
+        ])
         
         for chunk in response:
             content = chunk.choices[0].delta.content
