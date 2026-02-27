@@ -11,8 +11,7 @@ from prompts import EXPERT_REGISTRY, COORDINATOR_SYSTEM_PROMPT
 from docker_sandbox import DockerSandboxAgent
 
 # Logger configuration
-logger = logging.getLogger(__name__)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -37,15 +36,38 @@ def extract_json(text: str) -> dict:
         raise ValueError(f"JSON 解析失败: {str(e)}\n原文本: {text[:200]}")
 
 
+class AsyncRateLimiter:
+    """
+    异步频率限制器，确保请求频率不超过设定的 RPM。
+    """
+    def __init__(self, rpm: int):
+        self.interval = 60.0 / rpm
+        self.last_called = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self.lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self.last_called
+            if elapsed < self.interval:
+                wait_time = self.interval - elapsed
+                print(f"⏳ [频率控制] 保护中... 需等待 {wait_time:.2f}s 以遵循 NVIDIA 40 RPM 限制")
+                await asyncio.sleep(wait_time)
+                self.last_called = asyncio.get_event_loop().time()
+            else:
+                self.last_called = now
+
+
 class UnifiedClient:
     """
     统一 LLM 客户端：支持云端/本地路由与自动降级回退。
     云端使用 AsyncOpenAI SDK，本地使用 Ollama 原生 HTTP API（绕过兼容层 bug）。
     """
 
-    def __init__(self, cloud_config: dict, local_config: dict):
+    def __init__(self, cloud_config: dict, local_config: dict, agent_mode: str = "AUTO"):
         self.cloud_config = cloud_config
         self.local_config = local_config
+        self.agent_mode = agent_mode.upper()
         
         # 检测可用性
         self.cloud_available = bool(cloud_config.get("api_key") and cloud_config.get("model"))
@@ -57,10 +79,16 @@ class UnifiedClient:
 
         
         # 初始化云端客户端
+        base_url = cloud_config.get("base_url", "https://api.deepseek.com/v1")
+        # [DEFENSIVE] 很多用户会误贴包含 /chat/completions 的完整 URL
+        if base_url.endswith("/chat/completions"):
+            base_url = base_url.replace("/chat/completions", "")
+            logger.info("📡 自动修正 CLOUD_LLM_BASE_URL: 移除了末尾多余的 /chat/completions")
+
         self.cloud_client = AsyncOpenAI(
             api_key=cloud_config.get("api_key", "none"),
-            base_url=cloud_config.get("base_url", "https://api.deepseek.com/v1"),
-            timeout=60,
+            base_url=base_url,
+            timeout=30,
             max_retries=1,
         )
         
@@ -71,6 +99,9 @@ class UnifiedClient:
         
         # Ollama 单 GPU 串行推理，信号量防止并发排队
         self._local_semaphore = asyncio.Semaphore(1)
+        
+        # 频率限制：NVIDIA 限制 40 RPM，我们设为 35 以保证绝对安全
+        self.rate_limiter = AsyncRateLimiter(rpm=35)
 
     @staticmethod
     def _sanitize_messages_for_ollama(messages: list[dict]) -> list[dict]:
@@ -181,31 +212,53 @@ class UnifiedClient:
         if not self.cloud_available and not self.local_available:
             raise Exception("未配置任何可用模型（云端或本地）")
 
+        # 模式路由逻辑
         if not self.cloud_available:
             order = ["LOCAL"]
         elif not self.local_available:
             order = ["CLOUD"]
-        elif tier in ("PREMIUM", "LONG_CONTEXT"):
-            order = ["CLOUD", "LOCAL"]
-        else:
-            order = ["LOCAL", "CLOUD"]
+        elif self.agent_mode == "TURBO":
+            order = ["CLOUD", "LOCAL"]  # TURBO 模式全线优先线上
+        elif self.agent_mode == "SEQUENTIAL":
+            if tier in ("PREMIUM", "LONG_CONTEXT"):
+                order = ["CLOUD", "LOCAL"]  # SEQUENTIAL 模式下特定任务仍优先线上
+            else:
+                order = ["LOCAL", "CLOUD"]  # 其他任务优先本地
+        else:  # AUTO 模式
+            if tier in ("PREMIUM", "LONG_CONTEXT"):
+                order = ["CLOUD", "LOCAL"]
+            else:
+                order = ["LOCAL", "CLOUD"]
 
 
 
         last_error = None
+        print(f"DEBUG: Mode={self.agent_mode}, Tier={tier}, Order={order}")
         for label in order:
             try:
                 if label == "LOCAL":
+                    if not self.local_available:
+                        print("DEBUG: Local skipped (not available)")
+                        continue
                     print(f"🏠 正在调用本地模型 ({self._local_model})...")
                     async with self._local_semaphore:
                         fmt = "json" if response_format and response_format.get("type") == "json_object" else None
                         return await self._call_ollama(messages, format=fmt)
                 else:
-                    if not self.cloud_available: continue
+                    if not self.cloud_available:
+                        print("DEBUG: Cloud skipped (not available)")
+                        continue
+                    print(f"☁️ 正在调用云端模型 ({self.cloud_config['model']})...")
                     kwargs = {"model": self.cloud_config["model"], "messages": messages}
                     if response_format:
                         kwargs["response_format"] = response_format
+                    
+                    # 频率控制
+                    await self.rate_limiter.wait()
+                    
+                    print(f"📡 正在向 API 发送请求 ({self.cloud_config['model']})...")
                     response = await self.cloud_client.chat.completions.create(**kwargs)
+                    print(f"✅ API 响应已接收 ({self.cloud_config['model']})")
                     return response.choices[0].message.content
             except Exception as e:
                 error_msg = f"{type(e).__name__}: {str(e)}"
@@ -226,31 +279,45 @@ class UnifiedClient:
         if not self.cloud_available and not self.local_available:
             raise Exception("未配置任何可用流式模型")
 
+        # 模式路由逻辑
         if not self.cloud_available:
             order = ["LOCAL"]
         elif not self.local_available:
             order = ["CLOUD"]
-        elif tier in ("PREMIUM", "LONG_CONTEXT"):
-            order = ["CLOUD", "LOCAL"]  # 高级任务云端优先
-        else:
-            order = ["LOCAL", "CLOUD"]  # 日常对话本地优先，省 Token
+        elif self.agent_mode == "TURBO":
+            order = ["CLOUD", "LOCAL"]
+        elif self.agent_mode == "SEQUENTIAL":
+            if tier in ("PREMIUM", "LONG_CONTEXT"):
+                order = ["CLOUD", "LOCAL"]
+            else:
+                order = ["LOCAL", "CLOUD"]
+        else:  # AUTO 模式
+            if tier in ("PREMIUM", "LONG_CONTEXT"):
+                order = ["CLOUD", "LOCAL"]
+            else:
+                order = ["LOCAL", "CLOUD"]
 
 
 
 
         last_error = None
+        print(f"DEBUG: [Stream] Mode={self.agent_mode}, Tier={tier}, Order={order}")
         for label in order:
             try:
                 if label == "LOCAL":
-                    print(f"🏠 正在并行启动本地流式模型 ({self._local_model}) @ {self._local_api_url}...")
+                    if not self.local_available:
+                        print("DEBUG: [Stream] Local skipped")
+                        continue
+                    print(f"🏠 正在并行启动本地流式模型 ({self._local_model})...")
                     async with self._local_semaphore:
-
-
                         async for chunk in self._call_ollama_stream(messages):
                             yield chunk
                         return # 成功完成则退出
                 else:
-                    if not self.cloud_available: continue
+                    if not self.cloud_available:
+                        print("DEBUG: [Stream] Cloud skipped")
+                        continue
+                    print(f"☁️ 正在并行启动云端流式模型 ({self.cloud_config['model']})...")
                     kwargs = {
                         "model": self.cloud_config["model"],
                         "messages": messages,
@@ -259,15 +326,27 @@ class UnifiedClient:
                     if tools:
                         kwargs["tools"] = tools
                     
+                    # 频率控制
+                    await self.rate_limiter.wait()
+                    
+                    print(f"📡 正在建立云端流式连接 ({self.cloud_config['model']})...")
                     response = await self.cloud_client.chat.completions.create(**kwargs)
+                    print(f"✨ 流式连接已建立，开始接收数据...")
                     async for chunk in response:
                         yield chunk
                     return
             except (Exception, asyncio.CancelledError) as e:
                 import traceback
                 error_msg = f"{type(e).__name__}: {str(e)}"
+                
+                # [FEATURE] Friendly error for RateLimit (HTTP 429)
+                if "429" in error_msg or "rate_limit" in error_msg.lower():
+                    friendly_msg = "⚠️ [API 限流] 线上模型当前请求过多（429），正在尝试降级到本地或等待重试..."
+                    logger.warning(friendly_msg)
+                    # 如果是流式，我们可以直接尝试把这个友好的信息 yield 出去让用户看到
+                    # 但在这里 yield 会破坏 current order 循环逻辑，我们还是通过 logger 记录
+                
                 logger.warning(f"流式模型 {label} 启动失败: {error_msg}，尝试降级...")
-                # logger.debug(traceback.format_exc())
                 last_error = error_msg
                 continue
         
@@ -292,7 +371,7 @@ class McpAgent:
         systemPrompt: str = "你是一个智能助手。",
         mode: str = "AUTO",
     ):
-        self.unified_client = UnifiedClient(cloud_config, local_config)
+        self.unified_client = UnifiedClient(cloud_config, local_config, agent_mode=mode)
         self.cloud_model = cloud_config["model"]
         self.local_model = local_config["model"]
         self.systemPrompt = systemPrompt
@@ -328,7 +407,8 @@ class McpAgent:
             self.memories["main"] = [{"role": "system", "content": self.systemPrompt}]
             
         self.memories["main"].append({"role": "user", "content": userInput})
-        MAX_ITERATIONS = 10
+        MAX_ITERATIONS = 20
+        call_history = [] # 用于检测死循环
         for _ in range(MAX_ITERATIONS):
             # 动态截断上下文，防止超长报错 (如 DeepSeek 128k 限制)
             self._truncate_memory("main")
@@ -350,6 +430,10 @@ class McpAgent:
 
 
             async for chunk in response:
+                # [DEFENSIVE] NVIDIA or other APIs might return empty chunks or chunks without choices
+                if not chunk or not hasattr(chunk, "choices") or not chunk.choices:
+                    continue
+                
                 delta = chunk.choices[0].delta
                 
                 # 处理文本流
@@ -388,12 +472,31 @@ class McpAgent:
             # 执行工具调用
             for tc in assistantMsg["tool_calls"]:
                 funcName = tc["function"]["name"]
-                arguments = json.loads(tc["function"]["arguments"])
-                logger.info("调用工具: %s(%s)", funcName, json.dumps(arguments, ensure_ascii=False)[:200])
+                arguments = tc["function"]["arguments"] # 已经是字符串
+                
+                # 死循环检测：如果完全一致的 (函数名, 参数) 连续出现 3 次，判定为死循环
+                call_sig = f"{funcName}:{arguments}"
+                call_history.append(call_sig)
+                if len(call_history) >= 2 and call_history.count(call_sig) >= 2:
+                    yield "⚠️ [系统提示] 检测到模型正在反复执行相同的工具调用，已强制中断。请尝试换个方式描述您的需求，或者检查搜索关键词是否过于冷门。"
+                    return
+
+                logger.info("调用工具: %s(%s)", funcName, arguments[:200])
 
                 try:
-                    result = await self.session.call_tool(funcName, arguments=arguments)
-                    resultText = str(result.content)
+                    result = await self.session.call_tool(funcName, arguments=json.loads(arguments))
+                    # [OPTIMIZATION] 不要直接用 str(result.content)，而是提取其中的 text 内容
+                    texts = []
+                    for item in result.content:
+                        if hasattr(item, "text"):
+                            texts.append(item.text)
+                        elif isinstance(item, dict) and "text" in item:
+                            texts.append(item["text"])
+                        else:
+                            texts.append(str(item))
+                    
+                    resultText = "\n".join(texts)
+                    
                     # 对工具输出进行长度保护
                     MAX_TOOL_OUTPUT = 30000
                     if len(resultText) > MAX_TOOL_OUTPUT:
@@ -565,15 +668,22 @@ class McpAgent:
 
         tier = expert_config.get("tier", "LOCAL") if expert_config else "LOCAL"
         print(f"📂 [{self.mode} | {tier}] 正在扫描仓库结构...")
-        
         try:
-            # 1. 扫描文件树 (使用 get_file_contents 读取目录)
-            tree = await self.session.call_tool("get_file_contents", arguments={
-                "owner": owner,
-                "repo": repo,
-                "path": "."
+            # 1. 扫描文件 tree (尝试递归获取更多目录信息，帮助模型判断代码分布)
+            tree = await self.session.call_tool("search_repositories", arguments={
+                "query": f"repo:{owner}/{repo} path:/",
             })
+            # 如果 search 不太好用，由于 MCP 工具限制，我们至少在 adaptive_load_data 中明确告知 LLM 根目录结构
             tree_content = str(tree.content)
+            
+            # 如果 search_repositories 返回不理想，回退到原来的 list
+            if "total_count" not in tree_content or "items" not in tree_content:
+                tree = await self.session.call_tool("get_file_contents", arguments={
+                    "owner": owner,
+                    "repo": repo,
+                    "path": "."
+                })
+                tree_content = str(tree.content)
             
             # 2. 确定待加载文件
             files_to_read = ["README.md"]
@@ -679,7 +789,11 @@ class McpAgent:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input}
         ]):
-            content = chunk.choices[0].delta.content if hasattr(chunk.choices[0].delta, "content") else ""
+            # [DEFENSIVE] Fix for list index out of range in streaming responses
+            if not chunk or not hasattr(chunk, "choices") or not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = delta.content if hasattr(delta, "content") else ""
             if content:
                 yield content
 
@@ -698,59 +812,79 @@ class McpAgent:
         yield "📂 正在扫描项目文件以提取技术栈...\n"
         context_data = await self.adaptive_load_data(repo_url, expert_config=EXPERT_REGISTRY["Deployment_Executor"])
         
-        # 2. 调用部署专家生成 Dockerfile
-        yield "🤖 部署专家正在编写专属 Dockerfile...\n"
-        dockerfile_content = await self.unified_client.generate(
-            "PREMIUM", 
-            EXPERT_REGISTRY["Deployment_Executor"]["prompt"], 
-            f"请为以下项目数据生成最优 Dockerfile：\n\n{context_data}"
-        )
+        # 2. 迭代尝试部署逻辑（含自愈）
+        MAX_RETRIES = 3
+        last_error_log = ""
+        dockerfile_content = ""
         
-        # 剥离可能的 markdown 标记
-        if "```" in dockerfile_content:
-            match = re.search(r"```(?:dockerfile)?\s*(.*?)\s*```", dockerfile_content, re.DOTALL)
-            if match:
-                dockerfile_content = match.group(1)
-        
-        # 3. 执行沙盒部署
-        yield "🐳 正在启动本地 Docker 沙盒进行构建与部署...\n"
-        
-        # 由于 deploy_in_sandbox 现在是生成器，我们需要在线程中迭代它
-        # 或者在主线程迭代，但 docker-py 的 build 是同步阻塞的
-        # 这里我们直接迭代以简化逻辑，AsyncGenerator 会确保流式输出
-        try:
-            for event in self.docker_sandbox.deploy_in_sandbox(repo, dockerfile_content, repo_url):
-                evt_type = event.get("type")
-                msg = event.get("message", "")
+        for attempt in range(1, MAX_RETRIES + 1):
+            retry_prefix = f"【第 {attempt}/{MAX_RETRIES} 次尝试】" if attempt > 1 else ""
+            
+            # 生成/修正 Dockerfile
+            if attempt == 1:
+                yield f"🤖 {retry_prefix}部署专家正在编写专属 Dockerfile...\n"
+                prompt_input = f"请为以下项目数据生成最优 Dockerfile：\n\n{context_data}"
+            else:
+                yield f"🔧 {retry_prefix}正在自愈：根据错误日志分析并修正 Dockerfile...\n"
+                prompt_input = f"上一次构建失败了。\n\n【错误日志】:\n{last_error_log}\n\n【之前生成的 Dockerfile】:\n{dockerfile_content}\n\n请针对上述错误进行分析并输出修复后的 Dockerfile。"
+
+            dockerfile_content = await self.unified_client.generate(
+                "PREMIUM", 
+                EXPERT_REGISTRY["Deployment_Executor"]["prompt"], 
+                prompt_input
+            )
+            
+            # 剥离可能的 markdown 标记
+            if "```" in dockerfile_content:
+                match = re.search(r"```(?:dockerfile)?\s*(.*?)\s*```", dockerfile_content, re.DOTALL)
+                if match:
+                    dockerfile_content = match.group(1)
+            
+            # 执行沙盒部署
+            yield f"🐳 {retry_prefix}正在启动本地 Docker 沙盒进行构建与部署...\n"
+            
+            current_attempt_failed = False
+            try:
+                for event in self.docker_sandbox.deploy_in_sandbox(repo, dockerfile_content, repo_url):
+                    evt_type = event.get("type")
+                    msg = event.get("message", "")
+                    
+                    if evt_type == "progress":
+                        yield f"  {msg}\n"
+                    elif evt_type == "log":
+                        if msg:
+                            yield f"    ┃ {msg}\n"
+                    elif evt_type == "success":
+                        ports_str = " | ".join(event.get("ports", []))
+                        self.memories["main"].append({
+                            "role": "assistant", 
+                            "content": f"【系统通知】项目已成功部署。映射端口：{ports_str} (容器ID: {event['container_id']})"
+                        })
+                        yield f"\n✅ **部署成功！**\n"
+                        yield f"- **尝试次数**: {attempt}\n"
+                        yield f"- **端口映射**: `{ports_str}`\n"
+                        yield f"- **容器 ID**: `{event['container_id']}`\n"
+                        
+                        if event.get("logs"):
+                            yield f"\n📋 **启动日志摘要 (前10行)**:\n```\n{event['logs']}\n```\n"
+                        
+                        yield "💡 温馨提示：容器仅在 Agent 运行时存活，关闭程序或使用 /clear 将自动销毁。\n\n"
+                        return # 部署成功，退出
+                    elif evt_type == "error":
+                        yield f"  ❌ 构建/部署失败: {msg}\n"
+                        last_error_log = event.get("details", msg)
+                        current_attempt_failed = True
+                        break # 跳出当前迭代的沙盒执行，进入重试
                 
-                if evt_type == "progress":
-                    yield f"  {msg}\n"
-                elif evt_type == "log":
-                    # 仅显示非空日志
-                    if msg:
-                        yield f"    ┃ {msg}\n"
-                elif evt_type == "success":
-                    ports_str = " | ".join(event.get("ports", []))
-                    # 将部署成功的信息记录到主记忆中，以便后续对话感知
-                    self.memories["main"].append({
-                        "role": "assistant", 
-                        "content": f"【系统通知】项目已成功部署。映射端口：{ports_str} (容器ID: {event['container_id']})"
-                    })
-                    yield f"\n✅ **部署成功！**\n"
-                    yield f"- **端口映射**: `{ports_str}`\n"
-                    yield f"- **容器 ID**: `{event['container_id']}`\n"
-                    yield f"- **项目名称**: {repo}\n"
-                    
-                    if event.get("logs"):
-                        yield f"\n📋 **启动日志摘要 (前10行)**:\n```\n{event['logs']}\n```\n"
-                    
-                    yield "💡 温馨提示：容器仅在 Agent 运行时存活，关闭程序或使用 /clear 将自动销毁。\n"
-                    yield "如果无法访问，请检查日志确保应用已绑定到 0.0.0.0 并正确监听端口。\n\n"
-                elif evt_type == "error":
-                    yield f"\n❌ **部署失败**\n"
-                    yield f"- 原因: {msg}\n"
-                    if event.get("details"):
-                        yield f"- 详情: \n```\n{event['details']}\n```\n"
-                    return
-        except Exception as e:
-            yield f"❌ **部署过程发生异常**: {str(e)}\n"
+                if current_attempt_failed:
+                    continue # 下一次重试
+                else:
+                    return # 正常结束
+
+            except Exception as e:
+                yield f"  ⚠️ 部署执行异常: {str(e)}\n"
+                last_error_log = str(e)
+                if attempt == MAX_RETRIES:
+                    raise e
+        
+        yield f"最后一次错误详情: \n```\n{last_error_log}\n```\n"
