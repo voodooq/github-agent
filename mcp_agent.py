@@ -3,11 +3,13 @@ MCP Agent 核心模块
 实现 ReAct 循环 + 多轮对话记忆 + MCP 工具调用。
 """
 
+import asyncio
 import json
 import logging
 from openai import OpenAI
 from mcp import ClientSession
 from tool_converter import convertMcpToolsToOpenai
+from prompts import EXPERT_PROMPTS, COORDINATOR_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -130,3 +132,51 @@ class McpAgent:
             logger.info("已从 %s 恢复 %d 条记忆", filePath, len(self.messages))
         except FileNotFoundError:
             logger.info("未找到记忆文件 %s，使用空白记忆", filePath)
+
+    async def expertReview(self, expertName: str, systemPrompt: str, projectData: str) -> dict:
+        """
+        单个专家的异步评审逻辑
+        """
+        logger.info("专家评审启动: %s", expertName)
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": systemPrompt},
+                    {"role": "user", "content": f"请评价这个项目：\n{projectData}"}
+                ],
+                response_format={"type": "json_object"}
+            )
+            resultText = response.choices[0].message.content
+            return {expertName: json.loads(resultText)}
+        except Exception as e:
+            logger.error("专家 %s 评审失败: %s", expertName, e)
+            return {expertName: {"error": str(e)}}
+
+    async def multiAgentReview(self, projectData: str) -> str:
+        """
+        多 Agent 并行评审流
+        """
+        print(f"\n🚀 评审团正在并行审计项目维度 (专家数量: {len(EXPERT_PROMPTS)})...")
+        
+        # 1. 并行启动所有专家任务
+        tasks = [
+            self.expertReview(name, prompt, projectData) 
+            for name, prompt in EXPERT_PROMPTS.items()
+        ]
+        reviews = await asyncio.gather(*tasks)
+        
+        # 2. 汇总专家意见
+        expertReviewsJson = json.dumps(reviews, ensure_ascii=False, indent=2)
+        
+        # 3. 协调员生成最终报告
+        print("✍️  正在由协调员汇总专家意见并生成最终报告...")
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=expertReviewsJson)},
+                {"role": "user", "content": "请基于以上评审意见，给出你的最终咨询建议。"}
+            ]
+        )
+        finalReport = response.choices[0].message.content
+        return finalReport

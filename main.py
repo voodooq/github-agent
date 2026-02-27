@@ -32,6 +32,7 @@ def printHelp():
     print("─" * 55)
     print("  /search <需求>    搜索匹配开源项目并排序")
     print("  /analyze <URL>    精准分析指定 GitHub 仓库")
+    print("  /review <URL>     触发 Multi-Agent 专家团深度评审")
     print("  /clear            清除对话记忆")
     print("  /tools            查看可用 MCP 工具")
     print("  /help             显示此帮助")
@@ -109,6 +110,25 @@ async def main():
                         continue
                     userInput = ANALYZE_PROMPT_TEMPLATE.format(repo_url=repoUrl)
                     print(f"📊 正在分析: {repoUrl}\n")
+                elif userInput.startswith("/review "):
+                    # 专家团评审：获取数据 -> 并行评审
+                    repoUrl = userInput[8:].strip()
+                    if not repoUrl:
+                        print("⚠️  请输入仓库地址，例如: /review https://github.com/owner/repo\n")
+                        continue
+                    print(f"📡 正在获取项目基础信息 (README/结构): {repoUrl}...")
+                    try:
+                        # 使用特殊的内部指令让 Agent 获取基础数据
+                        data_query = f"请调用工具获取仓库 {repoUrl} 的 README.md 内容和目录结构树。只需返回这些数据，不要做任何分析。"
+                        projectData = await agent.chat(data_query)
+                        
+                        # 触发专家团评审
+                        finalReport = await agent.multiAgentReview(projectData)
+                        print(f"\n🤖 专家团综合评审报告：\n{finalReport}\n")
+                    except Exception as e:
+                        logger.error("评审流程异常: %s", e)
+                        print(f"\n❌ 错误: {e}\n")
+                    continue
 
                 # Agent 对话
                 try:
