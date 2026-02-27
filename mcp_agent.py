@@ -28,12 +28,14 @@ class McpAgent:
         baseUrl: str,
         model: str,
         systemPrompt: str = "你是一个智能助手。",
+        mode: str = "TURBO",
     ):
         self.client = OpenAI(api_key=apiKey, base_url=baseUrl)
         self.model = model
         self.messages: list[dict] = [{"role": "system", "content": systemPrompt}]
         self.session: ClientSession | None = None
         self.openaiTools: list[dict] = []
+        self.mode = mode
 
     async def connect(self, session: ClientSession) -> list[str]:
         """
@@ -158,6 +160,38 @@ class McpAgent:
         except FileNotFoundError:
             logger.info("未找到记忆文件 %s，使用空白记忆", filePath)
 
+    async def adaptive_load_data(self, repo_name: str) -> str:
+        """
+        自适应数据加载：根据模式决定分析深度。
+        """
+        print(f"📂 [{self.mode} Mode] 正在获取仓库结构...")
+        try:
+            # 1. 扫描文件树
+            tree = await self.session.call_tool("list_directory", arguments={"path": "./", "repository": repo_name})
+            tree_content = str(tree.content)
+            
+            # 2. 确定待加载文件
+            files_to_read = ["README.md"]
+            if self.mode == "TURBO":
+                # Turbo 模式搜寻核心代码
+                candidates = ["requirements.txt", "package.json", "main.py", "app.py", "index.ts", "src/index.ts", "setup.py"]
+                # 简单过滤 tree 中存在的文件
+                found_files = [f for f in candidates if f in tree_content]
+                files_to_read.extend(found_files[:3]) # 最多额外读 3 个核心文件
+
+            # 3. 批量读取源码
+            print(f"🚀 正在加载核心上下文: {files_to_read}...")
+            read_tasks = [self.session.call_tool("get_file_contents", arguments={"path": f, "repository": repo_name}) for f in files_to_read]
+            file_results = await asyncio.gather(*read_tasks)
+            source_context = f"--- 文件树结构 ---\n{tree_content}\n\n"
+            for i, r in enumerate(file_results):
+                source_context += f"--- 文件内容: {files_to_read[i]} ---\n{str(r.content)}\n\n"
+            
+            return source_context
+        except Exception as e:
+            logger.error("数据加载失败: %s", e)
+            return f"数据加载部分失败: {e}"
+
     async def expertReview(self, expertName: str, systemPrompt: str, projectData: str) -> dict:
         """
         单个专家的异步评审逻辑
@@ -180,26 +214,40 @@ class McpAgent:
 
     async def multiAgentReview(self, projectData: str) -> AsyncGenerator[str, None]:
         """
-        多 Agent 并行评审流（流式合成版）
+        多 Agent 评审流：支持 TURBO (并行) 和 SEQUENTIAL (串行) 模式。
         """
-        print(f"\n🚀 评审团正在并行审计项目维度 (专家数量: {len(EXPERT_PROMPTS)})...")
-        
-        # 1. 并行启动所有专家任务
-        tasks = [
-            self.expertReview(name, prompt, projectData) 
-            for name, prompt in EXPERT_PROMPTS.items()
-        ]
-        reviews = await asyncio.gather(*tasks)
+        expert_results = []
+        expert_tasks_info = list(EXPERT_PROMPTS.items())
+
+        if self.mode == "TURBO":
+            print(f"\n🚀 [Turbo Mode] 正在并行调用 {len(expert_tasks_info)} 个专家进行深度审计...")
+            tasks = [
+                self.expertReview(name, prompt, projectData) 
+                for name, prompt in expert_tasks_info
+            ]
+            expert_results = await asyncio.gather(*tasks)
+        else:
+            print(f"\n🐢 [Sequential Mode] 正在逐一请教专家 (本地显存优化)...")
+            for name, prompt in expert_tasks_info:
+                print(f" -> {name} 正在思考...", end="", flush=True)
+                res = await self.expertReview(name, prompt, projectData)
+                expert_results.append(res)
+                print(" ✅")
         
         # 2. 汇总专家意见
-        expertReviewsJson = json.dumps(reviews, ensure_ascii=False, indent=2)
+        expertReviewsJson = json.dumps(expert_results, ensure_ascii=False, indent=2)
         
         # 3. 协调员生成最终报告
         print("✍️  正在由协调员汇总专家意见并生成最终报告...")
+        
+        # 可以在此处根据 mode 调整 coordinator prompt 的前缀
+        mode_hint = "【注意：当前为 Turbo 深度模式，已阅读源码数据。】" if self.mode == "TURBO" else "【注意：当前为 Sequential 轻量模式，仅阅读了 README 数据。】"
+        full_system_prompt = mode_hint + "\n" + COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=expertReviewsJson)
+
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=expertReviewsJson)},
+                {"role": "system", "content": full_system_prompt},
                 {"role": "user", "content": "请基于以上评审意见，给出你的最终咨询建议。"}
             ],
             stream=True

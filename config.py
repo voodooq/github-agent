@@ -28,3 +28,16 @@ if _mcp_env_raw:
 
 # Agent 配置
 MEMORY_FILE = os.getenv("MEMORY_FILE", "")
+
+# 评审模式配置: AUTO, TURBO, SEQUENTIAL
+AGENT_MODE_ENV = os.getenv("AGENT_MODE", "AUTO").upper()
+
+def resolve_agent_mode(mode_env: str, base_url: str) -> str:
+    if mode_env in ("TURBO", "SEQUENTIAL"):
+        return mode_env
+    # 自动识别: 本地模型(localhost/127.0.0.1)默认使用 SEQUENTIAL
+    if "localhost" in base_url or "127.0.0.1" in base_url:
+        return "SEQUENTIAL"
+    return "TURBO"
+
+AGENT_MODE = resolve_agent_mode(AGENT_MODE_ENV, LLM_BASE_URL)

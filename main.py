@@ -15,9 +15,9 @@ from config import (
     LLM_BASE_URL,
     LLM_MODEL,
     MCP_COMMAND,
-    MCP_ARGS,
     MCP_ENV,
     MEMORY_FILE,
+    AGENT_MODE,
 )
 from mcp_agent import McpAgent
 from prompts import GITHUB_SEARCH_PROMPT, SEARCH_PROMPT_TEMPLATE, ANALYZE_PROMPT_TEMPLATE
@@ -50,6 +50,7 @@ async def main():
         baseUrl=LLM_BASE_URL,
         model=LLM_MODEL,
         systemPrompt=SYSTEM_PROMPT,
+        mode=AGENT_MODE,
     )
 
     # 恢复历史记忆
@@ -60,7 +61,7 @@ async def main():
     env = {**os.environ, **MCP_ENV} if MCP_ENV else None
     serverParams = StdioServerParameters(command=MCP_COMMAND, args=MCP_ARGS, env=env)
 
-    print(f"\n🔍 GitHub 检索分析 Agent 已启动 (模型: {LLM_MODEL})")
+    print(f"\n🔍 GitHub 检索分析 Agent 已启动 (模型: {LLM_MODEL}, 模式: {AGENT_MODE})")
     print(f"📡 MCP 服务: {MCP_COMMAND} {' '.join(MCP_ARGS)}")
     printHelp()
 
@@ -140,13 +141,10 @@ async def main():
                     if not repoUrl:
                         print("⚠️  请输入仓库地址，例如: /review https://github.com/owner/repo\n")
                         continue
-                    print(f"📡 正在获取项目基础信息 (README/结构): {repoUrl}...")
+                    print(f"📡 [{AGENT_MODE}] 正在获取项目基础信息 (README/结构/核心源码)...")
                     try:
-                        # 使用特殊的内部指令让 Agent 获取基础数据
-                        data_query = f"请调用工具获取仓库 {repoUrl} 的 README.md 内容和目录结构树。只需返回这些数据，不要做任何分析。"
-                        projectData = ""
-                        async for chunk in agent.chat(data_query):
-                            projectData += chunk
+                        # 使用自适应加载逻辑获取项目数据
+                        projectData = await agent.adaptive_load_data(repoUrl)
                         
                         # 触发专家团评审
                         print(f"\n🤖 专家团综合评审报告：\n", end="", flush=True)
