@@ -6,6 +6,7 @@ MCP Agent 核心模块
 import asyncio
 import json
 import logging
+from typing import AsyncGenerator
 from openai import OpenAI
 from mcp import ClientSession
 from tool_converter import convertMcpToolsToOpenai
@@ -47,42 +48,67 @@ class McpAgent:
         logger.info("已加载 %d 个 MCP 工具: %s", len(toolNames), toolNames)
         return toolNames
 
-    async def chat(self, userInput: str) -> str:
+    async def chat(self, userInput: str) -> AsyncGenerator[str, None]:
         """
-        核心 ReAct 循环：接收用户输入，返回最终回复。
-        若 LLM 请求工具调用，自动通过 MCP 执行并将结果反馈给 LLM，
-        循环直到获得纯文本回复。
-        @param userInput 用户输入文本
-        @returns Agent 的最终回复文本
+        核心 ReAct 循环（流式版）：接收用户输入，产生流式回复块。
         """
         self.messages.append({"role": "user", "content": userInput})
-
-        # NOTE: 设置最大循环次数，防止工具调用死循环
         MAX_ITERATIONS = 10
 
         for _ in range(MAX_ITERATIONS):
-            # 构建请求参数：有工具时附带 tools，无工具时不附带
-            kwargs: dict = {"model": self.model, "messages": self.messages}
+            kwargs: dict = {
+                "model": self.model,
+                "messages": self.messages,
+                "stream": True,
+            }
             if self.openaiTools:
                 kwargs["tools"] = self.openaiTools
 
+            fullContent = ""
+            toolCallsDict = {}  # 用于按索引累计 tool_calls 数据
+
             response = self.client.chat.completions.create(**kwargs)
-            msg = response.choices[0].message
 
-            # 没有工具调用 → 返回最终回复
-            if not msg.tool_calls:
-                content = msg.content or ""
-                self.messages.append({"role": "assistant", "content": content})
-                return content
+            for chunk in response:
+                delta = chunk.choices[0].delta
+                
+                # 处理文本流
+                if delta.content:
+                    fullContent += delta.content
+                    yield delta.content
 
-            # 有工具调用 → 逐一执行并将结果追加到记忆
-            # NOTE: 需要将完整的 assistant message（含 tool_calls）追加到 messages
-            self.messages.append(msg.model_dump())
+                # 处理工具调用流
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in toolCallsDict:
+                            toolCallsDict[idx] = {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        if tc.id:
+                            toolCallsDict[idx]["id"] = tc.id
+                        if tc.function.name:
+                            toolCallsDict[idx]["function"]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            toolCallsDict[idx]["function"]["arguments"] += tc.function.arguments
 
-            for toolCall in msg.tool_calls:
-                funcName = toolCall.function.name
-                # NOTE: 使用 json.loads 替代 eval，更安全
-                arguments = json.loads(toolCall.function.arguments)
+            # 流完后，将最终消息存入历史
+            assistantMsg = {"role": "assistant", "content": fullContent or None}
+            if toolCallsDict:
+                assistantMsg["tool_calls"] = list(toolCallsDict.values())
+            
+            self.messages.append(assistantMsg)
+
+            # 如果没有工具调用，结束循环
+            if not toolCallsDict:
+                return
+
+            # 执行工具调用
+            for tc in assistantMsg["tool_calls"]:
+                funcName = tc["function"]["name"]
+                arguments = json.loads(tc["function"]["arguments"])
                 logger.info("调用工具: %s(%s)", funcName, json.dumps(arguments, ensure_ascii=False)[:200])
 
                 try:
@@ -95,13 +121,12 @@ class McpAgent:
                 self.messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": toolCall.id,
+                        "tool_call_id": tc["id"],
                         "content": resultText,
                     }
                 )
 
-        # 超过最大循环次数，返回兜底回复
-        return "已达到最大工具调用次数，请简化您的请求。"
+        yield "已达到最大工具调用次数，请简化您的请求。"
 
     def clearMemory(self, systemPrompt: str | None = None):
         """
@@ -153,9 +178,9 @@ class McpAgent:
             logger.error("专家 %s 评审失败: %s", expertName, e)
             return {expertName: {"error": str(e)}}
 
-    async def multiAgentReview(self, projectData: str) -> str:
+    async def multiAgentReview(self, projectData: str) -> AsyncGenerator[str, None]:
         """
-        多 Agent 并行评审流
+        多 Agent 并行评审流（流式合成版）
         """
         print(f"\n🚀 评审团正在并行审计项目维度 (专家数量: {len(EXPERT_PROMPTS)})...")
         
@@ -176,7 +201,11 @@ class McpAgent:
             messages=[
                 {"role": "system", "content": COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=expertReviewsJson)},
                 {"role": "user", "content": "请基于以上评审意见，给出你的最终咨询建议。"}
-            ]
+            ],
+            stream=True
         )
-        finalReport = response.choices[0].message.content
-        return finalReport
+        
+        for chunk in response:
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content

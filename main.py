@@ -120,11 +120,15 @@ async def main():
                     try:
                         # 使用特殊的内部指令让 Agent 获取基础数据
                         data_query = f"请调用工具获取仓库 {repoUrl} 的 README.md 内容和目录结构树。只需返回这些数据，不要做任何分析。"
-                        projectData = await agent.chat(data_query)
+                        projectData = ""
+                        async for chunk in agent.chat(data_query):
+                            projectData += chunk
                         
                         # 触发专家团评审
-                        finalReport = await agent.multiAgentReview(projectData)
-                        print(f"\n🤖 专家团综合评审报告：\n{finalReport}\n")
+                        print(f"\n🤖 专家团综合评审报告：\n", end="", flush=True)
+                        async for chunk in agent.multiAgentReview(projectData):
+                            print(chunk, end="", flush=True)
+                        print("\n")
                     except Exception as e:
                         logger.error("评审流程异常: %s", e)
                         print(f"\n❌ 错误: {e}\n")
@@ -132,8 +136,10 @@ async def main():
 
                 # Agent 对话
                 try:
-                    reply = await agent.chat(userInput)
-                    print(f"\n🤖 Agent: {reply}\n")
+                    print(f"\n🤖 Agent: ", end="", flush=True)
+                    async for chunk in agent.chat(userInput):
+                        print(chunk, end="", flush=True)
+                    print("\n")
                 except Exception as e:
                     logger.error("Agent 处理异常: %s", e)
                     print(f"\n❌ 错误: {e}\n")
