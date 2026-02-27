@@ -50,6 +50,12 @@ def printHelp():
 
 async def main():
     """主函数：初始化 Agent → 连接 MCP → 交互循环"""
+    # 彻底隔离系统代理干扰
+    import os
+    for env_key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
+        os.environ.pop(env_key, None)
+    os.environ["NO_PROXY"] = "*"
+
     agent = McpAgent(
         cloud_config={
             "api_key": CLOUD_API_KEY,
@@ -73,10 +79,14 @@ async def main():
     serverParams = StdioServerParameters(command=MCP_COMMAND, args=MCP_ARGS, env=env)
 
     print(f"\n🚀 OpenClaw Hybrid Agent 已启动 [模式: {AGENT_MODE}]")
-    print(f"☁️  线上模型: {CLOUD_MODEL}")
-    print(f"🏠 本地模型: {LOCAL_MODEL}")
+    cloud_display = CLOUD_MODEL if agent.unified_client.cloud_available else "[已禁用 (未配置)]"
+    local_display = LOCAL_MODEL if agent.unified_client.local_available else "[已禁用 (未配置)]"
+    print(f"☁️  线上模型: {cloud_display}")
+    print(f"🏠 本地模型: {local_display}")
     print(f"📡 MCP 服务: {MCP_COMMAND} {' '.join(MCP_ARGS)}")
     printHelp()
+
+
 
     async with stdio_client(serverParams) as (read, write):
         async with ClientSession(read, write) as session:

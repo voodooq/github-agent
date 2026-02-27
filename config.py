@@ -6,7 +6,7 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # 模型配置体系
 # 1. 线上模型 (Cloud)
