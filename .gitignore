@@ -7,11 +7,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
-dist/
-build/
 *.egg
-*.spec
-build-exe.ps1
 
 # IDE
 .vscode/
