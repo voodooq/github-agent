@@ -6,6 +6,8 @@ CLI 入口
 import asyncio
 import logging
 import os
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import WordCompleter
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from config import (
@@ -71,10 +73,32 @@ async def main():
                 print(f"   ...及其他 {len(toolNames) - 10} 个工具")
             print()
 
+            # 配置自动补全
+            command_completer = WordCompleter(
+                [
+                    "/search", "/analyze", "/review", "/help", "/clear", "/tools", "/exit", "/quit"
+                ],
+                meta_dict={
+                    "/search": "搜索 GitHub 项目",
+                    "/analyze": "深入分析单个项目内容",
+                    "/review": "Multi-Agent 深度评审",
+                    "/help": "显示帮助信息",
+                    "/clear": "清除上下文记忆",
+                    "/tools": "列出所有可用工具",
+                    "/exit": "退出程序",
+                    "/quit": "退出程序",
+                },
+                ignore_case=True,
+                match_middle=True,
+            )
+            prompt_session = PromptSession(completer=command_completer, complete_while_typing=True)
+
             # 交互循环
             while True:
                 try:
-                    userInput = input("👤 You: ").strip()
+                    # 使用 prompt_toolkit 异步获取输入，支持补全
+                    userInput = await prompt_session.prompt_async("👤 You: ")
+                    userInput = userInput.strip()
                 except (EOFError, KeyboardInterrupt):
                     break
 
@@ -82,7 +106,7 @@ async def main():
                     continue
 
                 # 内置命令
-                if userInput == "/quit":
+                if userInput in ("/quit", "/exit"):
                     break
                 elif userInput == "/clear":
                     agent.clearMemory()
