@@ -74,15 +74,48 @@ class UnifiedClient:
         # Ollama 单 GPU 串行推理，信号量防止并发排队
         self._local_semaphore = asyncio.Semaphore(1)
 
+    @staticmethod
+    def _sanitize_messages_for_ollama(messages: list[dict]) -> list[dict]:
+        """
+        将包含 tool 角色和 tool_calls 的消息序列转换为 Ollama 可识别的格式。
+        Ollama 原生 API 不支持 tool 角色，须将其融入 user/assistant 消息。
+        """
+        cleaned = []
+        for msg in messages:
+            role = msg.get("role", "")
+            
+            if role == "tool":
+                # 将 tool 响应转为 user 角色的信息
+                content = msg.get("content", "")
+                cleaned.append({"role": "user", "content": f"[工具返回结果]: {content[:3000]}"})
+            elif role == "assistant":
+                new_msg = {"role": "assistant", "content": msg.get("content", "") or ""}
+                # 如果有 tool_calls，把工具调用意图追加到内容中
+                if msg.get("tool_calls"):
+                    tool_desc = "; ".join(
+                        f"调用{tc.get('function', {}).get('name', '?')}" 
+                        for tc in msg["tool_calls"]
+                    )
+                    new_msg["content"] = (new_msg["content"] or "") + f" [{tool_desc}]"
+                if not new_msg["content"]:
+                    new_msg["content"] = "(正在思考...)"
+                cleaned.append(new_msg)
+            else:
+                # system / user 消息直接保留
+                cleaned.append({"role": role, "content": msg.get("content", "") or ""})
+        
+        return cleaned
+
 
     async def _call_ollama(self, messages: list[dict], format: str | None = None) -> str:
         """
         直接调用 Ollama 原生 /api/chat 端点，绕过 OpenAI 兼容层。
         """
         import httpx
+        safe_messages = self._sanitize_messages_for_ollama(messages)
         payload = {
             "model": self._local_model,
-            "messages": messages,
+            "messages": safe_messages,
             "stream": False,
         }
         if format == "json":
@@ -103,9 +136,10 @@ class UnifiedClient:
         """
         import httpx
         import json
+        safe_messages = self._sanitize_messages_for_ollama(messages)
         payload = {
             "model": self._local_model,
-            "messages": messages,
+            "messages": safe_messages,
             "stream": True,
         }
         # 使用 yield 来模拟 OpenAI 的流式输出结构
@@ -114,7 +148,8 @@ class UnifiedClient:
             async with client.stream("POST", self._local_api_url, json=payload) as resp:
 
                 if resp.status_code != 200:
-                    print(f"📡 本地流式模型连接异常 (状态码: {resp.status_code})")
+                    body = await resp.aread()
+                    print(f"📡 本地流式模型连接异常 (状态码: {resp.status_code}), 响应: {body.decode('utf-8', errors='replace')[:300]}")
                 resp.raise_for_status()
 
                 async for line in resp.aiter_lines():
@@ -187,6 +222,7 @@ class UnifiedClient:
     async def generate_stream(self, tier: str, messages: list[dict], tools: list[dict] | None = None):
         """
         流式生成，支持云端/本地降级（主要用于 Coordinator 或 Chat）。
+        tier 决定优先级：LOCAL 优先本地，PREMIUM/LONG_CONTEXT 优先云端。
         """
         # 动态决定优先级
         if not self.cloud_available and not self.local_available:
@@ -196,8 +232,11 @@ class UnifiedClient:
             order = ["LOCAL"]
         elif not self.local_available:
             order = ["CLOUD"]
+        elif tier in ("PREMIUM", "LONG_CONTEXT"):
+            order = ["CLOUD", "LOCAL"]  # 高级任务云端优先
         else:
-            order = ["CLOUD", "LOCAL"]
+            order = ["LOCAL", "CLOUD"]  # 日常对话本地优先，省 Token
+
 
 
 
@@ -280,9 +319,10 @@ class McpAgent:
         logger.info("已加载 %d 个 MCP 工具: %s", len(toolNames), toolNames)
         return toolNames
 
-    async def chat(self, userInput: str) -> AsyncGenerator[str, None]:
+    async def chat(self, userInput: str, tier: str = "LOCAL") -> AsyncGenerator[str, None]:
         """
         核心 ReAct 循环（流式版）：接收用户输入，产生流式回复块。
+        tier 决定路由策略：LOCAL=本地优先（省 Token），PREMIUM=云端优先（支持工具调用）。
         """
         if "main" not in self.memories:
             self.memories["main"] = [{"role": "system", "content": self.systemPrompt}]
@@ -290,11 +330,13 @@ class McpAgent:
         self.memories["main"].append({"role": "user", "content": userInput})
         MAX_ITERATIONS = 10
         for _ in range(MAX_ITERATIONS):
+            # 动态截断上下文，防止超长报错 (如 DeepSeek 128k 限制)
+            self._truncate_memory("main")
+            
             kwargs: dict = {
                 "messages": self.memories["main"],
             }
-            # Chat 流式对话固定走云端（generate_stream 内部决定模型）
-            tier = "PREMIUM"
+            # tier 由外部传入，决定本地/云端优先级
 
             
             fullContent = ""
@@ -352,6 +394,10 @@ class McpAgent:
                 try:
                     result = await self.session.call_tool(funcName, arguments=arguments)
                     resultText = str(result.content)
+                    # 对工具输出进行长度保护
+                    MAX_TOOL_OUTPUT = 30000
+                    if len(resultText) > MAX_TOOL_OUTPUT:
+                        resultText = resultText[:MAX_TOOL_OUTPUT] + f"\n\n...(输出过长，已截断前 {MAX_TOOL_OUTPUT} 字符数据)"
                 except Exception as e:
                     logger.error("工具调用失败: %s - %s", funcName, e)
                     resultText = f"工具调用失败: {e}"
@@ -365,6 +411,68 @@ class McpAgent:
                 )
 
         yield "已达到最大工具调用次数，请简化您的请求。"
+
+    def _truncate_memory(self, context_id: str, max_msgs: int = 30, max_chars: int = 100000):
+        """
+        截断记忆历史，并确保消息序列完整性（不产生孤儿 tool 消息）。
+        采用“块”概念：assistant 及其随后的 tool 消息必须作为一个整体保留或丢弃。
+        """
+        if context_id not in self.memories or not self.memories[context_id]:
+            return
+            
+        history = self.memories[context_id]
+        if len(history) <= 1: 
+            return
+            
+        system_msg = history[0] if history[0]["role"] == "system" else None
+        msgs_to_check = history[1:] if system_msg else history
+        
+        keep = []
+        current_len = 0
+        
+        # 从新到旧处理
+        temp_msgs = list(reversed(msgs_to_check))
+        i = 0
+        while i < len(temp_msgs):
+            msg = temp_msgs[i]
+            group = []
+            
+            # 如果是 tool 消息，尝试寻找它的源头 assistant 消息并捆绑
+            if msg.get("role") == "tool":
+                j = i
+                while j < len(temp_msgs) and temp_msgs[j].get("role") == "tool":
+                    j += 1
+                if j < len(temp_msgs) and temp_msgs[j].get("role") == "assistant":
+                    group = temp_msgs[i : j + 1] # [tool, tool, ..., assistant]
+                    i = j + 1
+                else:
+                    # 孤儿 tool 消息，丢弃
+                    i += 1
+                    continue
+            else:
+                group = [msg]
+                i += 1
+                
+            # 计算该组长度
+            group_text = "".join([str(m.get("content", "") or "") for m in group])
+            group_len = len(group_text)
+            
+            if current_len + group_len > max_chars or len(keep) + len(group) > max_msgs:
+                break
+                
+            keep.extend(group)
+            current_len += group_len
+            
+        # 恢复顺序
+        truncated = list(reversed(keep))
+        
+        # 如果什么都没剩下（比如单条消息就爆了），保底留最后一条并强行截断部分文字
+        if not truncated and msgs_to_check:
+             last_msg = msgs_to_check[-1]
+             content = str(last_msg.get("content", "") or "")
+             truncated = [{**last_msg, "content": content[:max_chars] + "\n...(内容过长强制截断)"}]
+
+        self.memories[context_id] = ([system_msg] + truncated) if system_msg else truncated
 
     def _get_memory_path(self, context_id: str) -> str:
         """获取指定上下文的记忆文件路径"""
@@ -425,8 +533,10 @@ class McpAgent:
                     data = json.load(f)
                     if isinstance(data, list):
                         self.memories[context_id] = data
-                        logger.info("🧠 已从文件恢复 [%s] 的历史记忆", context_id)
-                        return data
+                        # 主动执行一次截断与校验，确保历史记忆序列合法
+                        self._truncate_memory(context_id)
+                        logger.info("🧠 已从文件恢复 [%s] 的历史记忆并完成序列校验", context_id)
+                        return self.memories[context_id]
             except Exception as e:
                 logger.error("加载记忆失败 %s: %s", context_id, e)
         
@@ -483,7 +593,10 @@ class McpAgent:
             
             source_context = f"--- 文件树结构 ---\n{tree_content}\n\n"
             for i, r in enumerate(file_results):
-                source_context += f"--- 文件内容: {files_to_read[i]} ---\n{str(r.content)}\n\n"
+                content = str(r.content)
+                if len(content) > 15000: # 限制单文件加载大小
+                    content = content[:15000] + "\n...(文件内容过大，已截断前 15000 字符)"
+                source_context += f"--- 文件内容: {files_to_read[i]} ---\n{content}\n\n"
             
             # 4. 数据脱水逻辑 (如果专家需要且是本地模型可处理的)
             if expert_config and expert_config.get("need_preprocess", False):

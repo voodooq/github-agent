@@ -174,21 +174,41 @@ async def main():
                     printHelp()
                     continue
                 elif userInput.startswith("/search "):
-                    # 快捷搜索：将用户需求包装为搜索指令
+                    # 快捷搜索：将用户需求包装为搜索指令，强制云端（需要工具调用）
                     query = userInput[8:].strip()
                     if not query:
                         print("⚠️  请输入搜索需求，例如: /search 轻量级 Python WAF\n")
                         continue
                     userInput = SEARCH_PROMPT_TEMPLATE.format(user_query=query)
-                    print(f"🔍 正在搜索: {query}\n")
+                    print(f"🔍 正在搜索: {query} [☁️ 云端模式]\n")
+                    # 搜索需要 MCP 工具调用，必须走云端
+                    try:
+                        print(f"\n🤖 Agent: ", end="", flush=True)
+                        async for chunk in agent.chat(userInput, tier="PREMIUM"):
+                            print(chunk, end="", flush=True)
+                        print("\n")
+                    except Exception as e:
+                        logger.error("Agent 处理异常: %s", e)
+                        print(f"\n❌ 错误: {e}\n")
+                    continue
                 elif userInput.startswith("/analyze "):
-                    # 快捷分析：将 URL 包装为分析指令
+                    # 快捷分析：将 URL 包装为分析指令，强制云端（需要工具调用）
                     repoUrl = userInput[9:].strip()
                     if not repoUrl:
                         print("⚠️  请输入仓库地址，例如: /analyze https://github.com/owner/repo\n")
                         continue
                     userInput = ANALYZE_PROMPT_TEMPLATE.format(repo_url=repoUrl)
-                    print(f"📊 正在分析: {repoUrl}\n")
+                    print(f"📊 正在分析: {repoUrl} [☁️ 云端模式]\n")
+                    # 分析需要 MCP 工具调用，必须走云端
+                    try:
+                        print(f"\n🤖 Agent: ", end="", flush=True)
+                        async for chunk in agent.chat(userInput, tier="PREMIUM"):
+                            print(chunk, end="", flush=True)
+                        print("\n")
+                    except Exception as e:
+                        logger.error("Agent 处理异常: %s", e)
+                        print(f"\n❌ 错误: {e}\n")
+                    continue
                 elif userInput.startswith("/review "):
                     # 专家团评审：自适应加载 -> 混合算力评审
                     repoUrl = userInput[8:].strip()
@@ -206,10 +226,10 @@ async def main():
                         print(f"\n❌ 错误: {e}\n")
                     continue
 
-                # Agent 对话
+                # Agent 日常对话（默认本地优先，省 Token）
                 try:
                     print(f"\n🤖 Agent: ", end="", flush=True)
-                    async for chunk in agent.chat(userInput):
+                    async for chunk in agent.chat(userInput, tier="LOCAL"):
                         print(chunk, end="", flush=True)
                     print("\n")
                 except Exception as e:
