@@ -40,6 +40,8 @@ def printHelp():
     print("  /search <需求>    搜索匹配开源项目并排序")
     print("  /analyze <URL>    精准分析指定 GitHub 仓库")
     print("  /review <URL>     触发 Multi-Agent 专家团深度评审")
+    print("  /deploy <URL>     一键部署项目到 Docker 沙盒")
+    print("  /prune            手动清理 Docker 垃圾镜像/容器")
     print("  /clear            清除对话记忆")
     print("  /tools            查看可用 MCP 工具")
     print("  /help             显示此帮助")
@@ -101,11 +103,13 @@ async def main():
             from prompts import EXPERT_REGISTRY
             
             # 基础命令映射
-            commands = ["/search", "/analyze", "/review", "/help", "/clear", "/clear all", "/tools", "/exit", "/quit"]
+            commands = ["/search", "/analyze", "/review", "/deploy", "/prune", "/help", "/clear", "/clear all", "/tools", "/exit", "/quit"]
             meta = {
                 "/search": "搜索 GitHub 项目",
                 "/analyze": "深入分析单个项目内容",
                 "/review": "Multi-Agent 深度评审",
+                "/deploy": "一键部署项目到 Docker 沙盒",
+                "/prune": "清理 Docker 资源",
                 "/help": "显示帮助信息",
                 "/clear": "清除主对话记忆",
                 "/clear all": "全量清理所有 Agent 记忆文件 (核爆级)",
@@ -208,7 +212,6 @@ async def main():
                     except Exception as e:
                         logger.error("Agent 处理异常: %s", e)
                         print(f"\n❌ 错误: {e}\n")
-                    continue
                 elif userInput.startswith("/review "):
                     # 专家团评审：自适应加载 -> 混合算力评审
                     repoUrl = userInput[8:].strip()
@@ -224,6 +227,28 @@ async def main():
                     except Exception as e:
                         logger.error("评审流程异常: %s", e)
                         print(f"\n❌ 错误: {e}\n")
+                    continue
+                elif userInput.startswith("/deploy "):
+                    # 一键部署：自适应加载 -> 自动 Docker 配置 -> 沙盒运行
+                    repoUrl = userInput[8:].strip()
+                    if not repoUrl:
+                        print("⚠️  请输入仓库地址，例如: /deploy https://github.com/owner/repo\n")
+                        continue
+                    try:
+                        print(f"\n🚀 启动 Docker 沙盒部署流程：\n", end="", flush=True)
+                        async for chunk in agent.deploy_project(repoUrl):
+                            print(chunk, end="", flush=True)
+                        print("\n")
+                    except Exception as e:
+                        logger.error("部署流程异常: %s", e)
+                        print(f"\n❌ 错误: {e}\n")
+                elif userInput == "/prune":
+                    print("🧹 正在执行系统大扫除，清理所有停止的容器和悬空镜像...")
+                    try:
+                        result = agent.docker_sandbox.system_prune()
+                        print(f"{result}\n")
+                    except Exception as e:
+                        print(f"❌ 清理异常: {e}\n")
                     continue
 
                 # Agent 日常对话（默认本地优先，省 Token）

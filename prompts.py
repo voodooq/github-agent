@@ -153,7 +153,25 @@ EXPERT_REGISTRY = {
 1. **耦合度**：代码是否模块化？是否方便通过插件或 Hook 进行功能扩展？
 2. **技术栈**：是否使用了现代化的库（如 FastAPI, Pydantic, Asyncio 等）？
 3. **代码规范**：变量命名、注释质量是否符合规范（如 PEP8）？
-4. **匹配度**：评估该架构对于用户将其集成到 OpenClaw 平台中的难易程度。""" + JSON_FORMAT_INSTRUCTION
+4. **匹配度**：评估该架构对于用户将其集成到 OpenClaw platform 中的难易程度。""" + JSON_FORMAT_INSTRUCTION
+    },
+    "Deployment_Executor": {
+        "tier": "PREMIUM",
+        "need_preprocess": False,
+        "prompt": """你是一个资深云原生自动化部署架构师。
+    
+你的任务是将用户选定的开源项目转化为【一键运行的 Docker 沙盒环境】。
+    
+【执行逻辑】：
+1. 扫描项目文件树，精准识别其技术栈（Python/Next.js/C++/Flutter等）。
+2. 如果该项目原本没有提供可靠的 Dockerfile，或者依赖极其繁杂，你必须为其编写一个定制化的、高度精简的 Dockerfile。
+3. Dockerfile 要求：
+   - 基础镜像必须轻量（如 alpine, slim-buster）。
+   - 必须包含所有必要的依赖安装指令（如 pip install, npm install）。
+   - 必须包含明确的 CMD 或 ENTRYPOINT 启动命令。
+   - EXPOSE 正确的端口（优先使用 80, 8080, 或 3000）。
+    
+请直接输出可以写入 Dockerfile 的代码内容。不要包含任何 Markdown 格式。"""
     }
 }
 

@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 from mcp import ClientSession
 from tool_converter import convertMcpToolsToOpenai
 from prompts import EXPERT_REGISTRY, COORDINATOR_SYSTEM_PROMPT
+from docker_sandbox import DockerSandboxAgent
 
 # 强制清除环境中的所有代理配置，确保本地通信没有任何干扰
 for env_key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
@@ -305,6 +306,8 @@ class McpAgent:
         os.makedirs(self.memory_dir, exist_ok=True)
         # 运行时缓存 (context_id -> messages)
         self.memories: dict[str, list[dict]] = {}
+        # Docker 沙盒代理
+        self.docker_sandbox = DockerSandboxAgent()
         
     async def connect(self, session: ClientSession) -> list[str]:
         """
@@ -515,9 +518,12 @@ class McpAgent:
         logger.debug("💾 记忆已保存: %s", context_id)
 
     def saveAllMemories(self):
-        """保存当前所有已加载的上下文记忆"""
-        for ctx_id in self.memories.keys():
-            self.saveMemory(ctx_id)
+        """保存当前所有已加载的上下文记忆，并清理沙盒"""
+        for context_id in list(self.memories.keys()):
+            self.saveMemory(context_id)
+        # 退出清理 Docker 沙盒
+        if hasattr(self, "docker_sandbox"):
+            self.docker_sandbox.cleanup_all()
         logger.info("💾 所有 Agent 记忆已持久化到 %s/", self.memory_dir)
 
     def loadMemory(self, context_id: str = "main", system_prompt: str | None = None) -> list[dict]:
@@ -645,43 +651,98 @@ class McpAgent:
         """
         print(f"\n🚀 [Hybrid Mode: {self.mode}] 启动 OpenClaw 多专家联合评审团...")
         
-        expert_results = []
-        # 将注册表转换为任务列表
-        expert_items = list(EXPERT_REGISTRY.items())
-
-        # 1. 专家任务分发
-        async def _run_expert_task(name, cfg):
-            # NOTE: 传入完整 URL，由 adaptive_load_data 内部解析 owner/repo
-            context = await self.adaptive_load_data(repo_url, cfg)
-            # 执行评审
-            return await self.expertReview(name, cfg, context)
-
-        if self.mode != "SEQUENTIAL":
-            # 并发模式 (Turbo / Auto)
-            tasks = [_run_expert_task(name, cfg) for name, cfg in expert_items]
-            expert_results = await asyncio.gather(*tasks)
-        else:
-            # 串行模式 (本地保护)
-            for name, cfg in expert_items:
-                print(f" -> {name} 正在工作...", end="", flush=True)
-                res = await _run_expert_task(name, cfg)
-                expert_results.append(res)
-                print(" ✅")
+        # 1. 自适应加载数据 (基础扫描)
+        project_data = await self.adaptive_load_data(repo_url)
         
-        # 2. 汇总专家意见
-        expertReviewsJson = json.dumps(expert_results, ensure_ascii=False, indent=2)
+        # 2. 调度专家评审 (AUTO/TURBO 模式并发)
+        experts = list(EXPERT_REGISTRY.keys())
+        if "Deployment_Executor" in experts:
+            # 评审时不包含部署专家，它只在 /deploy 时显式调用
+            experts.remove("Deployment_Executor")
+            
+        tasks = []
+        for name in experts:
+            tasks.append(self.expertReview(name, EXPERT_REGISTRY[name], project_data))
+            
+        print(f"🕵️  正在调度 {len(tasks)} 位专家进行综合评审...")
+        results = await asyncio.gather(*tasks)
         
-        # 3. 协调员生成最终报告
-        print("✍️  正在由首席协调员汇总报告...")
-        full_system_prompt = COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=expertReviewsJson)
-
-        response = self.unified_client.generate_stream("PREMIUM", [
-            {"role": "system", "content": full_system_prompt},
-            {"role": "user", "content": "请基于以上各领域专家的深度审计，给出你作为产品经理的最终投资/选型建议。"}
+        # 3. 汇总报告 (Coordinator)
+        reviews_summary = "\n\n".join([
+            f"--- {r.get('dimension', '专家')} (得分: {r.get('score', '?')}) ---\n"
+            f"观察: {', '.join(r.get('key_observations', []))}\n"
+            f"总结: {r.get('summary', '')}" 
+            for r in results if r
         ])
-
         
-        async for chunk in response:
-            content = chunk.choices[0].delta.content
+        system_prompt = COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=reviews_summary)
+        user_input = f"请为项目 {repo_url} 生成最终的专家团综合评审报告。"
+        
+        async for chunk in self.unified_client.generate_stream("PREMIUM", [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input}
+        ]):
+            content = chunk.choices[0].delta.content if hasattr(chunk.choices[0].delta, "content") else ""
             if content:
                 yield content
+
+    async def deploy_project(self, repo_url: str) -> AsyncGenerator[str, None]:
+        """
+        一键部署项目到 Docker 沙盒
+        """
+        owner, repo = self._parse_github_url(repo_url)
+        if not owner:
+            yield f"❌ 无效的 GitHub URL: {repo_url}"
+            return
+
+        yield f"🔍 正在初始化 [{repo}] 的部署流程...\n"
+        
+        # 1. 加载部署上下文
+        yield "📂 正在扫描项目文件以提取技术栈...\n"
+        context_data = await self.adaptive_load_data(repo_url, expert_config=EXPERT_REGISTRY["Deployment_Executor"])
+        
+        # 2. 调用部署专家生成 Dockerfile
+        yield "🤖 部署专家正在编写专属 Dockerfile...\n"
+        dockerfile_content = await self.unified_client.generate(
+            "PREMIUM", 
+            EXPERT_REGISTRY["Deployment_Executor"]["prompt"], 
+            f"请为以下项目数据生成最优 Dockerfile：\n\n{context_data}"
+        )
+        
+        # 剥离可能的 markdown 标记
+        if "```" in dockerfile_content:
+            match = re.search(r"```(?:dockerfile)?\s*(.*?)\s*```", dockerfile_content, re.DOTALL)
+            if match:
+                dockerfile_content = match.group(1)
+        
+        # 3. 执行沙盒部署
+        yield "🐳 正在启动本地 Docker 沙盒进行构建与部署...\n"
+        
+        # 由于 deploy_in_sandbox 现在是生成器，我们需要在线程中迭代它
+        # 或者在主线程迭代，但 docker-py 的 build 是同步阻塞的
+        # 这里我们直接迭代以简化逻辑，AsyncGenerator 会确保流式输出
+        try:
+            for event in self.docker_sandbox.deploy_in_sandbox(repo, dockerfile_content, repo_url):
+                evt_type = event.get("type")
+                msg = event.get("message", "")
+                
+                if evt_type == "progress":
+                    yield f"  {msg}\n"
+                elif evt_type == "log":
+                    # 仅显示非空日志
+                    if msg:
+                        yield f"    ┃ {msg}\n"
+                elif evt_type == "success":
+                    yield f"\n✅ **部署成功！**\n"
+                    yield f"- **访问地址**: {event['access_url']}\n"
+                    yield f"- **容器 ID**: `{event['container_id']}`\n"
+                    yield f"- **项目名称**: {repo}\n\n"
+                    yield "💡 温馨提示：容器仅在 Agent 运行时存活，关闭程序或使用 /clear 将自动销毁。\n"
+                elif evt_type == "error":
+                    yield f"\n❌ **部署失败**\n"
+                    yield f"- 原因: {msg}\n"
+                    if event.get("details"):
+                        yield f"- 详情: \n```\n{event['details']}\n```\n"
+                    return
+        except Exception as e:
+            yield f"❌ **部署过程发生异常**: {str(e)}\n"
