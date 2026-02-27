@@ -1,14 +1,9 @@
-"""
-MCP Agent 核心模块
-实现 ReAct 循环 + 多轮对话记忆 + MCP 工具调用。
-"""
-
 import asyncio
 import json
 import logging
 import os
 from typing import AsyncGenerator
-from openai import OpenAI
+from openai import AsyncOpenAI
 from mcp import ClientSession
 from tool_converter import convertMcpToolsToOpenai
 from prompts import EXPERT_REGISTRY, COORDINATOR_SYSTEM_PROMPT
@@ -24,8 +19,8 @@ class UnifiedClient:
     def __init__(self, cloud_config: dict, local_config: dict):
         self.cloud_config = cloud_config
         self.local_config = local_config
-        self.cloud_client = OpenAI(api_key=cloud_config["api_key"], base_url=cloud_config["base_url"])
-        self.local_client = OpenAI(api_key=local_config["api_key"], base_url=local_config["base_url"])
+        self.cloud_client = AsyncOpenAI(api_key=cloud_config["api_key"], base_url=cloud_config["base_url"])
+        self.local_client = AsyncOpenAI(api_key=local_config["api_key"], base_url=local_config["base_url"])
 
     async def generate(self, tier: str, system_prompt: str, user_content: str, response_format: dict | None = None) -> str:
         """
@@ -58,9 +53,8 @@ class UnifiedClient:
                 if response_format:
                     kwargs["response_format"] = response_format
 
-                # OpenAI client is synchronous, but we can wrap it or use it as is if not hitting event loop issues.
-                # In this simple agent, we use it directly.
-                response = client.chat.completions.create(**kwargs)
+                # AsyncOpenAI client is asynchronous
+                response = await client.chat.completions.create(**kwargs)
                 return response.choices[0].message.content
             except Exception as e:
                 logger.warning(f"模型 {label}({model}) 调用失败: {e}，正在尝试降级...")
@@ -69,7 +63,7 @@ class UnifiedClient:
         
         raise Exception(f"所有算力层级均调用失败: {last_error}")
 
-    def generate_stream(self, tier: str, messages: list[dict]):
+    async def generate_stream(self, tier: str, messages: list[dict], tools: list[dict] | None = None):
         """
         流式生成，主要用于 Coordinator 或 Chat。
         """
@@ -77,11 +71,15 @@ class UnifiedClient:
         client = self.cloud_client if self.cloud_config["api_key"] else self.local_client
         model = self.cloud_config["model"] if self.cloud_config["api_key"] else self.local_config["model"]
         
-        return client.chat.completions.create(
-            model=model,
-            messages=messages,
-            stream=True
-        )
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "stream": True
+        }
+        if tools:
+            kwargs["tools"] = tools
+
+        return await client.chat.completions.create(**kwargs)
 
 
 class McpAgent:
@@ -140,15 +138,20 @@ class McpAgent:
             model = self.cloud_model if self.unified_client.cloud_config["api_key"] else self.local_model
             client = self.unified_client.cloud_client if self.unified_client.cloud_config["api_key"] else self.unified_client.local_client
 
-            if self.openaiTools:
-                kwargs["tools"] = self.openaiTools
-
+            # Chat 模式下模型选择，这里统一使用 UnifiedClient 的 generate_stream
+            # tier 暂时固定为 PREMIUM，后续可根据 mode 或其他逻辑调整
+            tier = "PREMIUM" # Or "LOCAL" based on self.mode or other logic
+            
             fullContent = ""
             toolCallsDict = {}  # 用于按索引累计 tool_calls 数据
 
-            response = client.chat.completions.create(model=model, stream=True, **kwargs)
+            response = await self.unified_client.generate_stream(
+                tier=tier,
+                messages=self.memories["main"],
+                tools=self.openaiTools if self.openaiTools else None
+            )
 
-            for chunk in response:
+            async for chunk in response:
                 delta = chunk.choices[0].delta
                 
                 # 处理文本流
@@ -224,6 +227,18 @@ class McpAgent:
             os.remove(path)
         logger.info("🗑️ 已清理并重置记忆: %s", context_id)
 
+    def clearAllMemories(self):
+        """
+        核爆式清理：删除 memories/ 目录下所有文件并重置内存
+        """
+        if os.path.exists(self.memory_dir):
+            for filename in os.listdir(self.memory_dir):
+                file_path = os.path.join(self.memory_dir, filename)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+        self.memories = {}
+        logger.info("💥 已清理所有 Agent 的记忆文件，系统重置为出厂状态。")
+
     def saveMemory(self, context_id: str = "main"):
         """
         持久化指定上下文的记忆
@@ -264,16 +279,31 @@ class McpAgent:
         self.memories[context_id] = initial_msg
         return initial_msg
 
-    async def adaptive_load_data(self, repo_name: str, expert_config: dict | None = None) -> str:
+    def _parse_github_url(self, url: str) -> tuple[str, str]:
+        """从 GitHub URL 中解析 owner 和 repo"""
+        parts = url.rstrip("/").split("/")
+        if len(parts) >= 2:
+            return parts[-2], parts[-1]
+        return "", ""
+
+    async def adaptive_load_data(self, repo_url: str, expert_config: dict | None = None) -> str:
         """
         自适应数据加载：根据专家算力层级决定分析深度。
         """
+        owner, repo = self._parse_github_url(repo_url)
+        if not owner or not repo:
+            raise ValueError(f"无法解析 GitHub URL: {repo_url}")
+
         tier = expert_config.get("tier", "LOCAL") if expert_config else "LOCAL"
         print(f"📂 [{self.mode} | {tier}] 正在扫描仓库结构...")
         
         try:
-            # 1. 扫描文件树
-            tree = await self.session.list_directory(arguments={"path": "./", "repository": repo_name})
+            # 1. 扫描文件树 (使用 get_file_contents 读取目录)
+            tree = await self.session.call_tool("get_file_contents", arguments={
+                "owner": owner,
+                "repo": repo,
+                "path": "."
+            })
             tree_content = str(tree.content)
             
             # 2. 确定待加载文件
@@ -288,7 +318,11 @@ class McpAgent:
 
             # 3. 批量读取源码
             print(f"🚀 正在加载上下文文件: {files_to_read}...")
-            read_tasks = [self.session.call_tool("get_file_contents", arguments={"path": f, "repository": repo_name}) for f in files_to_read]
+            read_tasks = [self.session.call_tool("get_file_contents", arguments={
+                "owner": owner, 
+                "repo": repo, 
+                "path": f
+            }) for f in files_to_read]
             file_results = await asyncio.gather(*read_tasks)
             
             source_context = f"--- 文件树结构 ---\n{tree_content}\n\n"
@@ -348,9 +382,8 @@ class McpAgent:
 
         # 1. 专家任务分发
         async def _run_expert_task(name, cfg):
-            # 自适应加载每个专家所需的数据
-            repo_name = repo_url.split("/")[-1]
-            context = await self.adaptive_load_data(repo_name, cfg)
+            # NOTE: 传入完整 URL，由 adaptive_load_data 内部解析 owner/repo
+            context = await self.adaptive_load_data(repo_url, cfg)
             # 执行评审
             return await self.expertReview(name, cfg, context)
 
@@ -373,12 +406,12 @@ class McpAgent:
         print("✍️  正在由首席协调员汇总报告...")
         full_system_prompt = COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=expertReviewsJson)
 
-        response = self.unified_client.generate_stream("PREMIUM", [
+        response = await self.unified_client.generate_stream("PREMIUM", [
             {"role": "system", "content": full_system_prompt},
             {"role": "user", "content": "请基于以上各领域专家的深度审计，给出你作为产品经理的最终投资/选型建议。"}
         ])
         
-        for chunk in response:
+        async for chunk in response:
             content = chunk.choices[0].delta.content
             if content:
                 yield content

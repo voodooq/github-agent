@@ -6,6 +6,7 @@ CLI 入口
 import asyncio
 import logging
 import os
+import re
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter, Completer
 from mcp import ClientSession, StdioServerParameters
@@ -87,22 +88,37 @@ async def main():
             print()
 
             # 配置自动补全
+            from prompts import EXPERT_REGISTRY
+            
+            # 基础命令映射
+            commands = ["/search", "/analyze", "/review", "/help", "/clear", "/clear all", "/tools", "/exit", "/quit"]
+            meta = {
+                "/search": "搜索 GitHub 项目",
+                "/analyze": "深入分析单个项目内容",
+                "/review": "Multi-Agent 深度评审",
+                "/help": "显示帮助信息",
+                "/clear": "清除主对话记忆",
+                "/clear all": "全量清理所有 Agent 记忆文件 (核爆级)",
+                "/tools": "列出所有可用工具",
+                "/exit": "退出程序",
+                "/quit": "退出程序",
+            }
+            
+            # 动态添加每个 Agent 的清理命令提示
+            for agent_id in EXPERT_REGISTRY:
+                cmd = f"/clear {agent_id}"
+                commands.append(cmd)
+                # 简单从 prompt 提取第一句作为描述
+                desc = EXPERT_REGISTRY[agent_id]["prompt"].split('。')[0].split('：')[0].replace("你是一个", "")
+                meta[cmd] = f"清理【{desc}】的独立记忆"
+
             word_completer = WordCompleter(
-                [
-                    "/search", "/analyze", "/review", "/help", "/clear", "/tools", "/exit", "/quit"
-                ],
-                meta_dict={
-                    "/search": "搜索 GitHub 项目",
-                    "/analyze": "深入分析单个项目内容",
-                    "/review": "Multi-Agent 深度评审",
-                    "/help": "显示帮助信息",
-                    "/clear": "清除上下文记忆",
-                    "/tools": "列出所有可用工具",
-                    "/exit": "退出程序",
-                    "/quit": "退出程序",
-                },
+                commands,
+                meta_dict=meta,
                 ignore_case=True,
                 match_middle=True,
+                sentence=True,
+                pattern=re.compile(r"(/[a-zA-Z0-9_ ]*)"),  # 允许空格
             )
 
             class SlashCommandCompleter(Completer):
@@ -131,6 +147,10 @@ async def main():
                 elif userInput == "/clear":
                     agent.clearMemory("main")
                     print("🧹 主对话记忆已清除\n")
+                    continue
+                elif userInput == "/clear all":
+                    agent.clearAllMemories()
+                    print("💥 所有 Agent 记忆已全量清除 (含文件)\n")
                     continue
                 elif userInput.startswith("/clear "):
                     ctx_id = userInput[7:].strip()

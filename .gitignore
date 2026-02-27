@@ -1,6 +1,7 @@
-# 环境配置（含敏感信息）
+# 环境配置与记忆（含敏感信息）
 .env
 memory.json
+memories/
 
 # Python
 __pycache__/
