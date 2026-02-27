@@ -64,9 +64,8 @@ async def main():
         mode=AGENT_MODE,
     )
 
-    # 恢复历史记忆
-    if MEMORY_FILE and os.path.exists(MEMORY_FILE):
-        agent.loadMemory(MEMORY_FILE)
+    # 加载主对话记忆
+    agent.loadMemory("main")
 
     # 构建 MCP 服务端参数，合并环境变量
     env = {**os.environ, **MCP_ENV} if MCP_ENV else None
@@ -130,8 +129,13 @@ async def main():
                 if userInput in ("/quit", "/exit"):
                     break
                 elif userInput == "/clear":
-                    agent.clearMemory()
-                    print("🗑️  记忆已清除\n")
+                    agent.clearMemory("main")
+                    print("🧹 主对话记忆已清除\n")
+                    continue
+                elif userInput.startswith("/clear "):
+                    ctx_id = userInput[7:].strip()
+                    agent.clearMemory(ctx_id)
+                    print(f"🧹 专家记忆 [{ctx_id}] 已清除\n")
                     continue
                 elif userInput == "/tools":
                     print(f"🔧 可用工具: {', '.join(toolNames)}\n")
@@ -182,10 +186,8 @@ async def main():
                     logger.error("Agent 处理异常: %s", e)
                     print(f"\n❌ 错误: {e}\n")
 
-    # 退出前保存记忆
-    if MEMORY_FILE:
-        agent.saveMemory(MEMORY_FILE)
-        print(f"💾 记忆已保存到 {MEMORY_FILE}")
+    # 退出前保存所有记忆
+    agent.saveAllMemories()
 
     print("👋 再见！")
 

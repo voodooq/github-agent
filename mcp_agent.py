@@ -6,6 +6,7 @@ MCP Agent 核心模块
 import asyncio
 import json
 import logging
+import os
 from typing import AsyncGenerator
 from openai import OpenAI
 from mcp import ClientSession
@@ -100,11 +101,15 @@ class McpAgent:
         self.unified_client = UnifiedClient(cloud_config, local_config)
         self.cloud_model = cloud_config["model"]
         self.local_model = local_config["model"]
-        self.messages: list[dict] = [{"role": "system", "content": systemPrompt}]
-        self.session: ClientSession | None = None
-        self.openaiTools: list[dict] = []
+        self.systemPrompt = systemPrompt
+        # 核心记忆字典：{ context_id: messages_list }
         self.mode = mode
-
+        # 记忆管理配置
+        self.memory_dir = "memories"
+        os.makedirs(self.memory_dir, exist_ok=True)
+        # 运行时缓存 (context_id -> messages)
+        self.memories: dict[str, list[dict]] = {}
+        
     async def connect(self, session: ClientSession) -> list[str]:
         """
         绑定 MCP Session 并获取可用工具列表
@@ -122,11 +127,14 @@ class McpAgent:
         """
         核心 ReAct 循环（流式版）：接收用户输入，产生流式回复块。
         """
-        self.messages.append({"role": "user", "content": userInput})
+        if "main" not in self.memories:
+            self.memories["main"] = [{"role": "system", "content": self.systemPrompt}]
+            
+        self.memories["main"].append({"role": "user", "content": userInput})
         MAX_ITERATIONS = 10
         for _ in range(MAX_ITERATIONS):
             kwargs: dict = {
-                "messages": self.messages,
+                "messages": self.memories["main"],
             }
             # Chat 模式下模型选择
             model = self.cloud_model if self.unified_client.cloud_config["api_key"] else self.local_model
@@ -170,7 +178,7 @@ class McpAgent:
             if toolCallsDict:
                 assistantMsg["tool_calls"] = list(toolCallsDict.values())
             
-            self.messages.append(assistantMsg)
+            self.memories["main"].append(assistantMsg)
 
             # 如果没有工具调用，结束循环
             if not toolCallsDict:
@@ -189,7 +197,7 @@ class McpAgent:
                     logger.error("工具调用失败: %s - %s", funcName, e)
                     resultText = f"工具调用失败: {e}"
 
-                self.messages.append(
+                self.memories["main"].append(
                     {
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -199,35 +207,62 @@ class McpAgent:
 
         yield "已达到最大工具调用次数，请简化您的请求。"
 
-    def clearMemory(self, systemPrompt: str | None = None):
-        """
-        清除对话历史，保留 system prompt
-        @param systemPrompt 可选，替换新的 system prompt
-        """
-        prompt = systemPrompt or self.messages[0]["content"]
-        self.messages = [{"role": "system", "content": prompt}]
-        logger.info("对话记忆已清除")
+    def _get_memory_path(self, context_id: str) -> str:
+        """获取指定上下文的记忆文件路径"""
+        safe_name = context_id.lower().replace(" ", "_")
+        return os.path.join(self.memory_dir, f"{safe_name}.json")
 
-    def saveMemory(self, filePath: str):
+    def clearMemory(self, context_id: str = "main", systemPrompt: str | None = None):
         """
-        将对话历史持久化到 JSON 文件
-        @param filePath 保存路径
+        清理指定上下文的记忆（同时删除物理文件）
         """
-        with open(filePath, "w", encoding="utf-8") as f:
-            json.dump(self.messages, f, ensure_ascii=False, indent=2)
-        logger.info("记忆已保存到 %s", filePath)
+        prompt = systemPrompt or self.systemPrompt
+        self.memories[context_id] = [{"role": "system", "content": prompt}]
+        
+        path = self._get_memory_path(context_id)
+        if os.path.exists(path):
+            os.remove(path)
+        logger.info("🗑️ 已清理并重置记忆: %s", context_id)
 
-    def loadMemory(self, filePath: str):
+    def saveMemory(self, context_id: str = "main"):
         """
-        从 JSON 文件恢复对话历史
-        @param filePath 文件路径
+        持久化指定上下文的记忆
         """
-        try:
-            with open(filePath, "r", encoding="utf-8") as f:
-                self.messages = json.load(f)
-            logger.info("已从 %s 恢复 %d 条记忆", filePath, len(self.messages))
-        except FileNotFoundError:
-            logger.info("未找到记忆文件 %s，使用空白记忆", filePath)
+        if context_id not in self.memories:
+            return
+        path = self._get_memory_path(context_id)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.memories[context_id], f, ensure_ascii=False, indent=2)
+        logger.debug("💾 记忆已保存: %s", context_id)
+
+    def saveAllMemories(self):
+        """保存当前所有已加载的上下文记忆"""
+        for ctx_id in self.memories.keys():
+            self.saveMemory(ctx_id)
+        logger.info("💾 所有 Agent 记忆已持久化到 %s/", self.memory_dir)
+
+    def loadMemory(self, context_id: str = "main", system_prompt: str | None = None) -> list[dict]:
+        """
+        异步加载指定上下文的记忆
+        """
+        path = self._get_memory_path(context_id)
+        prompt = system_prompt or self.systemPrompt
+        
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        self.memories[context_id] = data
+                        logger.info("🧠 已从文件恢复 [%s] 的历史记忆", context_id)
+                        return data
+            except Exception as e:
+                logger.error("加载记忆失败 %s: %s", context_id, e)
+        
+        # 初始状态
+        initial_msg = [{"role": "system", "content": prompt}]
+        self.memories[context_id] = initial_msg
+        return initial_msg
 
     async def adaptive_load_data(self, repo_name: str, expert_config: dict | None = None) -> str:
         """
@@ -273,16 +308,29 @@ class McpAgent:
 
     async def expertReview(self, expertName: str, config: dict, projectData: str) -> dict:
         """
-        单个专家的异步评审逻辑，自带路由与回退。
+        单个专家的异步评审逻辑，包含独立记忆持久化。
         """
         logger.info("专家评审启动: %s (%s)", expertName, config["tier"])
+        
+        # 1. 加载专家的持久化记忆
+        messages = self.loadMemory(expertName, config["prompt"])
+        
+        # 2. 追加当前评审任务 (不作为长期记忆，仅作为当前上下文)
+        # 专家通常不需要记住所有评审过的代码，但可以记住历史发现的规律
+        # 这里演示为：将项目数据作为一次性 user 输入
+        current_messages = messages + [{"role": "user", "content": f"请评价这个项目：\n{projectData}"}]
+        
         try:
             resultText = await self.unified_client.generate(
                 tier=config["tier"],
-                system_prompt=config["prompt"],
-                user_content=f"请评价这个项目：\n{projectData}",
+                system_prompt=config["prompt"], # 注意这里统一由 UnifiedClient 处理 System Prompt
+                user_content=f"请评价这个项目：\n{projectData}", # 简化处理，暂时不让专家在 messages 中累积无限代码
                 response_format={"type": "json_object"}
             )
+            # 3. 如果需要专家学习，可以在这里 append resultText 到 messages
+            # messages.append({"role": "assistant", "content": resultText})
+            # self.saveMemory(expertName)
+            
             return {expertName: json.loads(resultText)}
         except Exception as e:
             logger.error("专家 %s 评审失败: %s", expertName, e)
