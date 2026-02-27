@@ -52,12 +52,6 @@ def printHelp():
 
 async def main():
     """主函数：初始化 Agent → 连接 MCP → 交互循环"""
-    # 彻底隔离系统代理干扰
-    import os
-    for env_key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
-        os.environ.pop(env_key, None)
-    os.environ["NO_PROXY"] = "*"
-
     agent = McpAgent(
         cloud_config={
             "api_key": CLOUD_API_KEY,
@@ -212,6 +206,7 @@ async def main():
                     except Exception as e:
                         logger.error("Agent 处理异常: %s", e)
                         print(f"\n❌ 错误: {e}\n")
+                    continue
                 elif userInput.startswith("/review "):
                     # 专家团评审：自适应加载 -> 混合算力评审
                     repoUrl = userInput[8:].strip()
@@ -242,6 +237,7 @@ async def main():
                     except Exception as e:
                         logger.error("部署流程异常: %s", e)
                         print(f"\n❌ 错误: {e}\n")
+                    continue
                 elif userInput == "/prune":
                     print("🧹 正在执行系统大扫除，清理所有停止的容器和悬空镜像...")
                     try:

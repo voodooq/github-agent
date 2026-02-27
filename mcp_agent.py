@@ -10,11 +10,8 @@ from tool_converter import convertMcpToolsToOpenai
 from prompts import EXPERT_REGISTRY, COORDINATOR_SYSTEM_PROMPT
 from docker_sandbox import DockerSandboxAgent
 
-# 强制清除环境中的所有代理配置，确保本地通信没有任何干扰
-for env_key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
-    if env_key in os.environ:
-        del os.environ[env_key]
-os.environ["NO_PROXY"] = "*"  # 全量禁用代理探测
+# Logger configuration
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -733,11 +730,22 @@ class McpAgent:
                     if msg:
                         yield f"    ┃ {msg}\n"
                 elif evt_type == "success":
+                    ports_str = " | ".join(event.get("ports", []))
+                    # 将部署成功的信息记录到主记忆中，以便后续对话感知
+                    self.memories["main"].append({
+                        "role": "assistant", 
+                        "content": f"【系统通知】项目已成功部署。映射端口：{ports_str} (容器ID: {event['container_id']})"
+                    })
                     yield f"\n✅ **部署成功！**\n"
-                    yield f"- **访问地址**: {event['access_url']}\n"
+                    yield f"- **端口映射**: `{ports_str}`\n"
                     yield f"- **容器 ID**: `{event['container_id']}`\n"
-                    yield f"- **项目名称**: {repo}\n\n"
+                    yield f"- **项目名称**: {repo}\n"
+                    
+                    if event.get("logs"):
+                        yield f"\n📋 **启动日志摘要 (前10行)**:\n```\n{event['logs']}\n```\n"
+                    
                     yield "💡 温馨提示：容器仅在 Agent 运行时存活，关闭程序或使用 /clear 将自动销毁。\n"
+                    yield "如果无法访问，请检查日志确保应用已绑定到 0.0.0.0 并正确监听端口。\n\n"
                 elif evt_type == "error":
                     yield f"\n❌ **部署失败**\n"
                     yield f"- 原因: {msg}\n"

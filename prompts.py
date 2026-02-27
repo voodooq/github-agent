@@ -169,6 +169,7 @@ EXPERT_REGISTRY = {
    - 基础镜像必须轻量（如 alpine, slim-buster）。
    - 必须包含所有必要的依赖安装指令（如 pip install, npm install）。
    - 必须包含明确的 CMD 或 ENTRYPOINT 启动命令。
+   - 【核心】必须确保应用绑定到 0.0.0.0 而非 127.0.0.1 (例如 python -m flask run --host=0.0.0.0)。
    - EXPOSE 正确的端口（优先使用 80, 8080, 或 3000）。
     
 请直接输出可以写入 Dockerfile 的代码内容。不要包含任何 Markdown 格式。"""
