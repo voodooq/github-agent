@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import AsyncGenerator
 from openai import AsyncOpenAI
 from mcp import ClientSession
@@ -19,6 +20,8 @@ def extract_json(text: str) -> dict:
     """
     从模型输出中稳健地提取 JSON 对象。支持 markdown 自动剥离。
     """
+    if not text or not text.strip():
+        raise ValueError("模型返回了空文本，无法提取 JSON")
     text = text.strip()
     # 尝试匹配 ```json ... ``` 或 ``` ... ```
     markdown_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -51,11 +54,51 @@ class AsyncRateLimiter:
             elapsed = now - self.last_called
             if elapsed < self.interval:
                 wait_time = self.interval - elapsed
-                print(f"⏳ [频率控制] 保护中... 需等待 {wait_time:.2f}s 以遵循 NVIDIA 40 RPM 限制")
+                print(f"⏳ [频率控制] 保护中... 需等待 {wait_time:.2f}s 以遵循 40 RPM 限制")
                 await asyncio.sleep(wait_time)
                 self.last_called = asyncio.get_event_loop().time()
             else:
                 self.last_called = now
+
+
+class TokenBudget:
+    """
+    Token 预算管理器：跟踪单任务累计 Token 消耗。
+    当消耗超过阈值时挂起操作，防止无限循环烧光 API 额度。
+    """
+
+    def __init__(self, max_tokens: int = 20000):
+        self.max_tokens = max_tokens
+        self.consumed = 0
+        self.exceeded = False
+
+    def consume(self, tokens: int) -> bool:
+        """
+        消耗 Token 并检查是否超限。
+        @returns True 如果仍在预算内，False 如果已超限
+        """
+        self.consumed += tokens
+        if self.consumed >= self.max_tokens:
+            self.exceeded = True
+            print(f"🚨 [预算墙] Token 消耗已达 {self.consumed}/{self.max_tokens}，任务已挂起！")
+            return False
+        return True
+
+    def estimate_tokens(self, text: str) -> int:
+        """粗略估算 Token 数（中文约 2 字符/Token，英文约 4 字符/Token）"""
+        return max(len(text) // 3, 1)
+
+    def reset(self):
+        """重置预算计数器（新任务开始时调用）"""
+        self.consumed = 0
+        self.exceeded = False
+
+    @property
+    def remaining(self) -> int:
+        return max(self.max_tokens - self.consumed, 0)
+
+    def __repr__(self) -> str:
+        return f"TokenBudget({self.consumed}/{self.max_tokens}, exceeded={self.exceeded})"
 
 
 class UnifiedClient:
@@ -74,6 +117,7 @@ class UnifiedClient:
         self.local_available = bool(local_config.get("model") and local_config.get("base_url"))
         
         # 内部诊断：打印加载情况（非敏感信息）
+        import time
         print(f"DEBUG: Cloud Available={self.cloud_available}, Local Available={self.local_available}")
         print(f"DEBUG: Local Model='{local_config.get('model')}', BaseURL='{local_config.get('base_url')}'")
 
@@ -88,9 +132,13 @@ class UnifiedClient:
         self.cloud_client = AsyncOpenAI(
             api_key=cloud_config.get("api_key", "none"),
             base_url=base_url,
-            timeout=30,
+            timeout=15,  # [AOS 2.1] 降低超时到 15s，减少重试等待感
             max_retries=1,
         )
+        
+        # [AOS 2.1] 熔断机制：防止线上 API 抽风导致系统假死
+        self._cloud_circuit_broken_until = 0.0
+        self._consecutive_cloud_failures = 0
         
         # 初始化本地端参数
         local_base = local_config.get("base_url", "http://localhost:11434/v1").replace("/v1", "").rstrip("/")
@@ -155,9 +203,11 @@ class UnifiedClient:
             print(f"📡 本地模型响应状态: {resp.status_code}")
             resp.raise_for_status()
 
-
             data = resp.json()
-            return data["message"]["content"]
+            content = data.get("message", {}).get("content", "")
+            if not content.strip():
+                logger.warning("⚠️  本地模型返回了空内容，这可能导致后续解析失败")
+            return content
 
     async def _call_ollama_stream(self, messages: list[dict]):
         """
@@ -203,6 +253,7 @@ class UnifiedClient:
         """
         根据层级决定调用哪个模型，支持回退。
         """
+        import time
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
@@ -234,6 +285,14 @@ class UnifiedClient:
 
         last_error = None
         print(f"DEBUG: Mode={self.agent_mode}, Tier={tier}, Order={order}")
+        
+        # [AOS 2.1] 进度心跳：每 10 秒提示一次，防止用户认为假死
+        async def heartbeat():
+            count = 1
+            while True:
+                await asyncio.sleep(10)
+                print(f"⏳ ... 正在生成中 (已运行 {count*10}s) ...")
+                count += 1
         for label in order:
             try:
                 if label == "LOCAL":
@@ -243,11 +302,23 @@ class UnifiedClient:
                     print(f"🏠 正在调用本地模型 ({self._local_model})...")
                     async with self._local_semaphore:
                         fmt = "json" if response_format and response_format.get("type") == "json_object" else None
-                        return await self._call_ollama(messages, format=fmt)
+                        
+                        # 启动心跳
+                        hb_task = asyncio.create_task(heartbeat())
+                        try:
+                            result = await self._call_ollama(messages, format=fmt)
+                        finally:
+                            hb_task.cancel()
+                            
+                        return result
                 else:
                     if not self.cloud_available:
                         print("DEBUG: Cloud skipped (not available)")
                         continue
+                    if self._cloud_circuit_broken_until > time.time():
+                        print(f"❄️  [熔断] 云端模型目前不可用，跳过...")
+                        continue
+
                     print(f"☁️ 正在调用云端模型 ({self.cloud_config['model']})...")
                     kwargs = {"model": self.cloud_config["model"], "messages": messages}
                     if response_format:
@@ -257,12 +328,30 @@ class UnifiedClient:
                     await self.rate_limiter.wait()
                     
                     print(f"📡 正在向 API 发送请求 ({self.cloud_config['model']})...")
-                    response = await self.cloud_client.chat.completions.create(**kwargs)
+                    
+                    # 启动心跳
+                    hb_task = asyncio.create_task(heartbeat())
+                    try:
+                        response = await self.cloud_client.chat.completions.create(**kwargs)
+                    finally:
+                        hb_task.cancel()
+                        
                     print(f"✅ API 响应已接收 ({self.cloud_config['model']})")
+                    
+                    # 成功则重置失败计数
+                    self._consecutive_cloud_failures = 0
                     return response.choices[0].message.content
             except Exception as e:
                 error_msg = f"{type(e).__name__}: {str(e)}"
                 logger.warning(f"模型 {label}({self._local_model if label == 'LOCAL' else self.cloud_config['model']}) 调用失败: {error_msg}，正在尝试降级...")
+                
+                # [AOS 2.1] 更新熔断逻辑
+                if label == "CLOUD":
+                    self._consecutive_cloud_failures += 1
+                    if self._consecutive_cloud_failures >= 2:
+                        self._cloud_circuit_broken_until = time.time() + 180  # 熔断 3 分钟
+                        logger.error("🚫 [熔断] 云端 API 连续失败 %d 次，已进入 3 分钟熔断期", self._consecutive_cloud_failures)
+                
                 last_error = error_msg
                 continue
         
@@ -355,13 +444,19 @@ class UnifiedClient:
 
 
 
+import glob
+from config import TOKEN_BUDGET as TOKEN_BUDGET_LIMIT
+from skill_manager import SkillManager
+from blackboard import Blackboard
+from orchestrator import Orchestrator
+from scheduler import Scheduler
+from economy import EconomyEngine
 
 
 class McpAgent:
     """
-    极简 MCP Agent
-    通过 OpenAI 兼容接口调用 LLM，通过 MCP Session 调用工具，
-    使用 messages 列表维护多轮对话记忆。
+    AOS 2.0 自主操作系统 Agent
+    支持动态技能挂载、黑板共享记忆、子专家召唤与 Token 预算控制。
     """
 
     def __init__(
@@ -384,6 +479,19 @@ class McpAgent:
         self.memories: dict[str, list[dict]] = {}
         # Docker 沙盒代理
         self.docker_sandbox = DockerSandboxAgent()
+        # AOS: 技能目录（Markdown 手册）
+        self.skills_dir = os.path.join(os.path.dirname(__file__), ".agents", "skills")
+        # AOS: Token 预算管理器
+        self.token_budget = TokenBudget(max_tokens=TOKEN_BUDGET_LIMIT)
+        # AOS 2.0: 动态技能管理器
+        self.skill_manager = SkillManager()
+        # AOS 2.0: 黑板共享上下文
+        self.blackboard = Blackboard()
+        # AOS Phase 3: Cron 守护进程调度器
+        self.scheduler = Scheduler()
+        # AOS AEA: 经济与生存引擎 (CFO Agent)
+        self.economy = EconomyEngine()
+
         
     async def connect(self, session: ClientSession) -> list[str]:
         """
@@ -395,21 +503,428 @@ class McpAgent:
         mcpTools = await session.list_tools()
         self.openaiTools = convertMcpToolsToOpenai(mcpTools.tools)
         toolNames = [t.name for t in mcpTools.tools]
-        logger.info("已加载 %d 个 MCP 工具: %s", len(toolNames), toolNames)
+
+        # AOS: 注册内部工具（技能系统、子专家）到 openai tool schema
+        aos_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_skills",
+                    "description": "搜索本地技能库（.agents/skills/）以获取排错指南或方法论。当遇到 Docker 错误、代码分析等问题时使用。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "搜索关键词，如 'docker', '代码分析'"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_skill",
+                    "description": "读取指定技能文件的完整内容。先用 search_skills 找到文件名，再用此工具读取。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "技能文件名，如 'docker_troubleshooting.md'"}
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "spawn_expert",
+                    "description": "召唤无状态子专家来解决特定子任务。子专家独立工作，完成后立即销毁，不继承对话历史。适用于需要深度分析、安全审计等场景。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string", "description": "专家角色，如 '架构师', '安全审计员', 'Docker调试专家'"},
+                            "task": {"type": "string", "description": "具体任务描述"},
+                            "context_summary": {"type": "string", "description": "≤500字的背景信息摘要，禁止传递完整对话"}
+                        },
+                        "required": ["role", "task"]
+                    }
+                }
+            },
+        ]
+        self.openaiTools.extend(aos_tools)
+        toolNames.extend(["search_skills", "read_skill", "spawn_expert"])
+
+        # AOS 2.0: 动态技能管理 + 黑板共享
+        aos2_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "load_skill",
+                    "description": "动态加载一个 MCP 技能服务。加载后该技能的所有工具将可用。使用前先用 list_skills 查看可用技能。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "技能名称，如 'sqlite_analyzer', 'browser'"}
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "unload_skill",
+                    "description": "卸载已加载的 MCP 技能服务，释放系统资源。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "要卸载的技能名称"}
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_skills",
+                    "description": "列出所有可用的 MCP 技能及其加载状态。当你发现现有工具无法解决问题时使用。",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_blackboard",
+                    "description": "向全局黑板写入客观事实，供其他专家和后续任务参考。写入重要发现（如端口号、技术栈、部署状态）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string", "description": "事实标识，如 'service_port', 'tech_stack'"},
+                            "value": {"type": "string", "description": "事实内容"},
+                            "author": {"type": "string", "description": "写入者名称"}
+                        },
+                        "required": ["key", "value"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_blackboard",
+                    "description": "读取全局黑板上所有共享事实。查看其他专家写入的发现和项目状态。",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            },
+        ]
+        self.openaiTools.extend(aos2_tools)
+        toolNames.extend(["load_skill", "unload_skill", "list_skills", "write_blackboard", "read_blackboard"])
+
+        # AOS Phase 3: 调度器 + 技能发现
+        phase3_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add_scheduled_task",
+                    "description": "添加定时任务。支持每天定时(08:30)、周期执行(*/5=每5分钟)、cron表达式(0 8 * * *)。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type": "string", "description": "任务唯一标识，如 'med_reminder'"},
+                            "description": {"type": "string", "description": "任务描述"},
+                            "cron_expr": {"type": "string", "description": "触发时间，如 '08:30' 或 '*/5' 或 '0 8 * * *'"},
+                            "action": {"type": "string", "description": "动作类型: print/webhook/wechat"},
+                            "payload": {"type": "string", "description": "消息内容或 URL"}
+                        },
+                        "required": ["task_id", "description", "cron_expr"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_scheduled_tasks",
+                    "description": "列出所有定时任务及其下次触发时间。",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "cancel_scheduled_task",
+                    "description": "取消指定的定时任务。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type": "string", "description": "要取消的任务 ID"}
+                        },
+                        "required": ["task_id"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "discover_and_install_skill",
+                    "description": "当现有工具无法解决问题时，自动从 GitHub 搜索、评分并安装最佳 MCP 技能。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "搜索关键词，如 'sqlite database' 或 'browser automation'"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+        ]
+        self.openaiTools.extend(phase3_tools)
+        toolNames.extend(["add_scheduled_task", "list_scheduled_tasks", "cancel_scheduled_task", "discover_and_install_skill"])
+
+        # 启动后台调度器心跳
+        self.scheduler.start()
+
+        # AOS AEA: CFO 经济工具
+        aea_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "cfo_report",
+                    "description": "获取 CFO 财务简报：余额、燃烧率、剩余跑道天数、生存模式。",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "inject_funds",
+                    "description": "向 Agent 钱包注资（充值），模拟收入或老板打款。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "amount": {"type": "number", "description": "注资金额 ($)"},
+                            "description": {"type": "string", "description": "注资说明"}
+                        },
+                        "required": ["amount"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "cfo_approve",
+                    "description": "让 CFO 评估一次云端 API 调用的 ROI，决定是否批准执行。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "estimated_cost": {"type": "number", "description": "预估消耗 ($)"},
+                            "expected_value": {"type": "number", "description": "预期收益 ($)，无直接收益填 0"}
+                        },
+                        "required": ["estimated_cost"]
+                    }
+                }
+            },
+        ]
+        self.openaiTools.extend(aea_tools)
+        toolNames.extend(["cfo_report", "inject_funds", "cfo_approve"])
+
+        # 同步经济指标到黑板
+        for key, val in self.economy.get_blackboard_facts().items():
+            self.blackboard.write(key, val, author="CFO")
+
+        total_aos = len(aos_tools) + len(aos2_tools) + len(phase3_tools) + len(aea_tools)
+        logger.info("已加载 %d 个工具 (MCP %d + AOS %d): %s", len(toolNames), len(mcpTools.tools), total_aos, toolNames)
         return toolNames
+
+    # ========== AOS: 技能系统 ==========
+
+    def search_skills(self, query: str) -> list[dict]:
+        """
+        搜索 .agents/skills/ 目录下的技能文件。
+        基于文件名和内容关键词匹配（轻量级，无需向量化）。
+        """
+        results = []
+        if not os.path.exists(self.skills_dir):
+            return results
+        for filepath in glob.glob(os.path.join(self.skills_dir, "*.md")):
+            filename = os.path.basename(filepath)
+            # 读取前 500 字符进行关键词匹配
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    preview = f.read(500)
+            except Exception:
+                preview = ""
+            # 简单关键词匹配
+            if query.lower() in filename.lower() or query.lower() in preview.lower():
+                results.append({"name": filename, "preview": preview[:200]})
+        return results
+
+    def read_skill(self, name: str) -> str:
+        """读取指定技能文件的完整内容"""
+        filepath = os.path.join(self.skills_dir, name)
+        if not os.path.exists(filepath):
+            # 尝试补全 .md 后缀
+            filepath = os.path.join(self.skills_dir, f"{name}.md")
+        if not os.path.exists(filepath):
+            return f"技能文件未找到: {name}"
+        with open(filepath, "r", encoding="utf-8") as f:
+            return f.read()
+
+    # ========== AOS: 子专家工厂 ==========
+
+    async def spawn_expert(self, role: str, task_description: str, context_summary: str = "") -> str:
+        """
+        召唤无状态子专家：独立完成一个细分任务后立即销毁。
+        上下文修剪：context_summary 必须 ≤500 字，禁止传递完整对话栈。
+        """
+        # 强制上下文修剪
+        if len(context_summary) > 500:
+            context_summary = context_summary[:500] + "...(已截断)"
+            logger.warning("⚠️ 子专家上下文已被强制修剪至 500 字符")
+
+        expert_prompt = f"""你是一个 {role} 专家。你的任务是独立完成以下工作，直接输出结果，不需要额外对话。
+
+【背景信息】
+{context_summary}
+
+【任务】
+{task_description}"""
+
+        print(f"🧬 [AOS] 正在召唤子专家: {role}...")
+        try:
+            result = await self.unified_client.generate(
+                tier="PREMIUM",
+                system_prompt=f"你是一个专注的 {role} 专家。简洁、精准地完成指定任务。",
+                user_content=expert_prompt,
+            )
+            # 跟踪 Token 消耗
+            self.token_budget.consume(self.token_budget.estimate_tokens(result))
+            print(f"✅ [AOS] 子专家 [{role}] 已完成任务并销毁")
+            return result
+        except Exception as e:
+            logger.error("子专家 [%s] 执行失败: %s", role, e)
+            return f"子专家执行失败: {e}"
+
+    # ========== AOS: 内部工具调度器 ==========
+
+    async def _handle_internal_tool(self, func_name: str, arguments: dict) -> str | None:
+        """
+        处理 AOS 内部工具调用（非 MCP 工具）。
+        返回 None 表示不是内部工具，应交由 MCP 或 SkillManager 处理。
+        """
+        # AOS 1.0: 技能手册
+        if func_name == "search_skills":
+            query = arguments.get("query", "")
+            results = self.search_skills(query)
+            if results:
+                return "\n".join([f"📚 {r['name']}: {r['preview']}" for r in results])
+            return "未找到匹配的技能文件"
+
+        elif func_name == "read_skill":
+            name = arguments.get("name", "")
+            return self.read_skill(name)
+
+        elif func_name == "spawn_expert":
+            role = arguments.get("role", "通用")
+            task = arguments.get("task", "")
+            context = arguments.get("context_summary", "")
+            # AOS 2.0: 自动注入黑板快照作为额外上下文
+            bb_context = self.blackboard.read_all()
+            if bb_context and "黑板为空" not in bb_context:
+                context = f"{context}\n\n{bb_context}"
+            return await self.spawn_expert(role, task, context)
+
+        # AOS 2.0: 动态技能管理
+        elif func_name == "load_skill":
+            name = arguments.get("name", "")
+            result = await self.skill_manager.load_skill(name)
+            return json.dumps(result, ensure_ascii=False)
+
+        elif func_name == "unload_skill":
+            name = arguments.get("name", "")
+            result = await self.skill_manager.unload_skill(name)
+            return json.dumps(result, ensure_ascii=False)
+
+        elif func_name == "list_skills":
+            skills = self.skill_manager.list_available()
+            return json.dumps(skills, ensure_ascii=False, indent=2)
+
+        # AOS 2.0: 黑板读写
+        elif func_name == "write_blackboard":
+            key = arguments.get("key", "")
+            value = arguments.get("value", "")
+            author = arguments.get("author", "Agent")
+            self.blackboard.write(key, value, author)
+            return f"已写入黑板: {key} = {value}"
+
+        elif func_name == "read_blackboard":
+            return self.blackboard.read_all()
+
+        # AOS Phase 3: 定时任务调度
+        elif func_name == "add_scheduled_task":
+            result = self.scheduler.add_task(
+                task_id=arguments.get("task_id", ""),
+                description=arguments.get("description", ""),
+                cron_expr=arguments.get("cron_expr", ""),
+                action=arguments.get("action", "print"),
+                payload=arguments.get("payload", ""),
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        elif func_name == "list_scheduled_tasks":
+            tasks = self.scheduler.list_tasks()
+            return json.dumps(tasks, ensure_ascii=False, indent=2)
+
+        elif func_name == "cancel_scheduled_task":
+            result = self.scheduler.cancel_task(arguments.get("task_id", ""))
+            return json.dumps(result, ensure_ascii=False)
+
+        # AOS Phase 3: 技能自动发现与安装
+        elif func_name == "discover_and_install_skill":
+            query = arguments.get("query", "")
+            result = await self.skill_manager.auto_install(query, session=self.session)
+            return json.dumps(result, ensure_ascii=False)
+
+        # AOS AEA: CFO 经济工具
+        elif func_name == "cfo_report":
+            return self.economy.get_financial_report()
+
+        elif func_name == "inject_funds":
+            amount = arguments.get("amount", 0)
+            desc = arguments.get("description", "收入")
+            self.economy.earn(amount, desc)
+            # 同步到黑板
+            for key, val in self.economy.get_blackboard_facts().items():
+                self.blackboard.write(key, val, author="CFO")
+            return self.economy.get_financial_report()
+
+        elif func_name == "cfo_approve":
+            cost = arguments.get("estimated_cost", 0)
+            value = arguments.get("expected_value", 0)
+            result = self.economy.should_approve_cloud_call(cost, value)
+            return json.dumps(result, ensure_ascii=False)
+
+        return None  # 非内部工具
 
     async def chat(self, userInput: str, tier: str = "LOCAL") -> AsyncGenerator[str, None]:
         """
-        核心 ReAct 循环（流式版）：接收用户输入，产生流式回复块。
-        tier 决定路由策略：LOCAL=本地优先（省 Token），PREMIUM=云端优先（支持工具调用）。
+        AOS 核心 ReAct 循环（流式版）。
+        支持目标驱动、自动反思、技能加载、子专家召唤与 Token 预算控制。
         """
         if "main" not in self.memories:
             self.memories["main"] = [{"role": "system", "content": self.systemPrompt}]
-            
+
         self.memories["main"].append({"role": "user", "content": userInput})
-        MAX_ITERATIONS = 20
-        call_history = [] # 用于检测死循环
-        for _ in range(MAX_ITERATIONS):
+        # AOS: 每次新的用户交互重置 Token 预算
+        self.token_budget.reset()
+
+        MAX_ITERATIONS = 50
+        call_history = []  # 死循环检测
+        for iteration in range(MAX_ITERATIONS):
+            # Token 预算墙检查
+            if self.token_budget.exceeded:
+                yield f"\n🚨 [预算墙] 本次任务已消耗约 {self.token_budget.consumed} Tokens，超过预算上限 {self.token_budget.max_tokens}。任务已暂停，请确认是否继续。"
+                return
+
             # 动态截断上下文，防止超长报错 (如 DeepSeek 128k 限制)
             self._truncate_memory("main")
             
@@ -467,13 +982,15 @@ class McpAgent:
 
             # 如果没有工具调用，结束循环
             if not toolCallsDict:
+                # 跟踪 Token 消耗
+                self.token_budget.consume(self.token_budget.estimate_tokens(fullContent))
                 return
 
             # 执行工具调用
             for tc in assistantMsg["tool_calls"]:
                 funcName = tc["function"]["name"]
-                arguments = tc["function"]["arguments"] # 已经是字符串
-                
+                arguments = tc["function"]["arguments"]  # 已经是字符串
+
                 # 死循环检测：如果完全一致的 (函数名, 参数) 连续出现 3 次，判定为死循环
                 call_sig = f"{funcName}:{arguments}"
                 call_history.append(call_sig)
@@ -484,23 +1001,38 @@ class McpAgent:
                 logger.info("调用工具: %s(%s)", funcName, arguments[:200])
 
                 try:
-                    result = await self.session.call_tool(funcName, arguments=json.loads(arguments))
-                    # [OPTIMIZATION] 不要直接用 str(result.content)，而是提取其中的 text 内容
-                    texts = []
-                    for item in result.content:
-                        if hasattr(item, "text"):
-                            texts.append(item.text)
-                        elif isinstance(item, dict) and "text" in item:
-                            texts.append(item["text"])
+                    parsed_args = json.loads(arguments)
+
+                    # AOS: 优先尝试内部工具（技能、子专家、黑板）
+                    internal_result = await self._handle_internal_tool(funcName, parsed_args)
+                    if internal_result is not None:
+                        resultText = internal_result
+                    else:
+                        # AOS 2.0: 尝试从动态加载的技能中调用
+                        skill_result = await self.skill_manager.call_tool(funcName, parsed_args)
+                        if skill_result is not None:
+                            resultText = skill_result
                         else:
-                            texts.append(str(item))
-                    
-                    resultText = "\n".join(texts)
-                    
+                            # 最终回退：主 MCP 会话
+                            result = await self.session.call_tool(funcName, arguments=parsed_args)
+                            texts = []
+                            for item in result.content:
+                                if hasattr(item, "text"):
+                                    texts.append(item.text)
+                                elif isinstance(item, dict) and "text" in item:
+                                    texts.append(item["text"])
+                                else:
+                                    texts.append(str(item))
+                            resultText = "\n".join(texts)
+
                     # 对工具输出进行长度保护
                     MAX_TOOL_OUTPUT = 30000
                     if len(resultText) > MAX_TOOL_OUTPUT:
                         resultText = resultText[:MAX_TOOL_OUTPUT] + f"\n\n...(输出过长，已截断前 {MAX_TOOL_OUTPUT} 字符数据)"
+
+                    # 跟踪 Token 消耗
+                    self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
+
                 except Exception as e:
                     logger.error("工具调用失败: %s - %s", funcName, e)
                     resultText = f"工具调用失败: {e}"
@@ -513,7 +1045,14 @@ class McpAgent:
                     }
                 )
 
-        yield "已达到最大工具调用次数，请简化您的请求。"
+            # AOS: 每 10 轮强制自我反思，防止无效循环
+            if iteration > 0 and iteration % 10 == 0:
+                reflection_msg = f"[系统提示] 你已经执行了 {iteration} 轮工具调用。请反思：当前目标是否接近达成？是否需要改变策略？如果陷入困境，考虑使用 search_skills 查找相关技能或 spawn_expert 召唤子专家。Token 预算剩余: {self.token_budget.remaining}"
+                self.memories["main"].append({"role": "user", "content": reflection_msg})
+                yield f"\n💭 [自我反思 - 第 {iteration} 轮] 检查进度与策略...\n"
+
+        yield f"已达到最大工具调用次数 ({MAX_ITERATIONS})。Token 消耗: {self.token_budget.consumed}。请简化您的请求。"
+
 
     def _truncate_memory(self, context_id: str, max_msgs: int = 30, max_chars: int = 100000):
         """
@@ -617,14 +1156,154 @@ class McpAgent:
             json.dump(self.memories[context_id], f, ensure_ascii=False, indent=2)
         logger.debug("💾 记忆已保存: %s", context_id)
 
-    def saveAllMemories(self):
-        """保存当前所有已加载的上下文记忆，并清理沙盒"""
+    async def saveAllMemories(self):
+        """保存所有记忆、清理沙盒、安全卸载技能、停止调度器"""
         for context_id in list(self.memories.keys()):
             self.saveMemory(context_id)
+        # AOS Phase 3: 停止后台调度器
+        if hasattr(self, "scheduler"):
+            await self.scheduler.stop()
+        # AOS 2.0: 安全卸载所有动态技能（防僵尸进程）
+        if hasattr(self, "skill_manager"):
+            await self.skill_manager.unload_all()
         # 退出清理 Docker 沙盒
         if hasattr(self, "docker_sandbox"):
             self.docker_sandbox.cleanup_all()
         logger.info("💾 所有 Agent 记忆已持久化到 %s/", self.memory_dir)
+
+    # ========== AOS 2.0: 自治编排引擎 ==========
+
+    async def autonomous_execute(self, user_demand: str) -> AsyncGenerator[str, None]:
+        """
+        /auto 命令入口：启动全自治任务循环。
+        动态招聘子 Agent -> 黑板协作 -> AI 裁判验收 -> 多轮自愈。
+        """
+        orchestrator = Orchestrator(
+            unified_client=self.unified_client,
+            skill_manager=self.skill_manager,
+            blackboard=self.blackboard,
+            agent=self, # AOS 2.1: 传递当前 Agent 实例以便执行工具调用
+        )
+        async for chunk in orchestrator.run_mission(
+            user_demand=user_demand,
+            primary_session=self.session,
+            max_rounds=3,
+        ):
+            yield chunk
+
+    async def execute_with_tools(
+        self,
+        system_prompt: str,
+        user_content: str,
+        tier: str = "PREMIUM",
+        context_id: str = "internal_task"
+    ) -> str:
+        """
+        AOS 核心 ReAct 循环（非流式交互版）。
+        适用于子专家、Orchestrator 子任务等需要自主执行工具的场景。
+        @returns 最终的任务输出摘要
+        """
+        # 初始化或恢复针对该任务的记忆
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
+        self.memories[context_id] = messages
+        
+        # 针对该任务重置预算
+        self.token_budget.reset()
+        
+        MAX_ITERATIONS = 15 # 子任务通常较短
+        call_history = []
+        
+        for iteration in range(MAX_ITERATIONS):
+            if self.token_budget.exceeded:
+                return f"🚨 [预算限制] 任务已停止 (消耗 {self.token_budget.consumed} tokens)"
+
+            self._truncate_memory(context_id)
+            
+            fullContent = ""
+            toolCallsDict = {}
+            
+            # 使用流式生成并累积结果（复用流量控制与模型降级逻辑）
+            response_stream = self.unified_client.generate_stream(
+                tier=tier,
+                messages=self.memories[context_id],
+                tools=self.openaiTools if self.openaiTools else None
+            )
+            
+            async for chunk in response_stream:
+                if not chunk or not hasattr(chunk, "choices") or not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    fullContent += delta.content
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in toolCallsDict:
+                            toolCallsDict[idx] = {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        if tc.id: toolCallsDict[idx]["id"] = tc.id
+                        if tc.function.name: toolCallsDict[idx]["function"]["name"] += tc.function.name
+                        if tc.function.arguments: toolCallsDict[idx]["function"]["arguments"] += tc.function.arguments
+
+            # 保存对话记录
+            assistantMsg = {"role": "assistant", "content": fullContent or None}
+            if toolCallsDict:
+                assistantMsg["tool_calls"] = list(toolCallsDict.values())
+            self.memories[context_id].append(assistantMsg)
+            
+            # 如果没有工具调用，说明任务执行到阶段性终点
+            if not toolCallsDict:
+                self.token_budget.consume(self.token_budget.estimate_tokens(fullContent))
+                return fullContent
+                
+            # 执行工具调用 (ReAct Action)
+            for tc in assistantMsg["tool_calls"]:
+                funcName = tc["function"]["name"]
+                arguments = tc["function"]["arguments"]
+                
+                # 死循环防护
+                call_sig = f"{funcName}:{arguments}"
+                call_history.append(call_sig)
+                if call_history.count(call_sig) >= 3:
+                    return f"⚠️ [死循环中断] 任务已停止以防无限循环调用 {funcName}"
+
+                logger.info("[%s] 正在执行子任务工具: %s", context_id, funcName)
+                
+                try:
+                    parsed_args = json.loads(arguments)
+                    # 按照优先级处理工具：内部 -> 技能 -> MCP
+                    resultText = await self._handle_internal_tool(funcName, parsed_args)
+                    if resultText is None:
+                        resultText = await self.skill_manager.call_tool(funcName, parsed_args)
+                    if resultText is None:
+                        result = await self.session.call_tool(funcName, arguments=parsed_args)
+                        resultText = "\n".join([
+                            (item.text if hasattr(item, "text") else str(item))
+                            for item in result.content
+                        ])
+                    
+                    # 保护处理
+                    if len(resultText) > 20000:
+                        resultText = resultText[:20000] + "...(数据截断)"
+                    self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
+                    
+                except Exception as e:
+                    logger.error("子任务工具调用失败: %s - %s", funcName, e)
+                    resultText = f"工具执行错误: {str(e)}"
+
+                self.memories[context_id].append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": resultText,
+                })
+        
+        return fullContent # 到达最大迭代次数时的返回结果
 
     def loadMemory(self, context_id: str = "main", system_prompt: str | None = None) -> list[dict]:
         """
@@ -799,7 +1478,7 @@ class McpAgent:
 
     async def deploy_project(self, repo_url: str) -> AsyncGenerator[str, None]:
         """
-        一键部署项目到 Docker 沙盒
+        AOS 增强型一键部署：支持 5 次自愈、状态回滚、健康探针。
         """
         owner, repo = self._parse_github_url(repo_url)
         if not owner:
@@ -807,48 +1486,67 @@ class McpAgent:
             return
 
         yield f"🔍 正在初始化 [{repo}] 的部署流程...\n"
-        
+
         # 1. 加载部署上下文
-        yield "📂 正在扫描项目文件以提取技术栈...\n"
+        yield "🏁 [里程碑] 正在扫描项目文件以提取技术栈...\n"
         context_data = await self.adaptive_load_data(repo_url, expert_config=EXPERT_REGISTRY["Deployment_Executor"])
-        
-        # 2. 迭代尝试部署逻辑（含自愈）
-        MAX_RETRIES = 3
+
+        # 2. 迭代尝试部署（含自愈与状态回滚）
+        MAX_RETRIES = 5
         last_error_log = ""
         dockerfile_content = ""
-        
+        # AOS: 状态回滚 - 保存每次 Dockerfile 快照
+        dockerfile_history: list[str] = []
+
         for attempt in range(1, MAX_RETRIES + 1):
             retry_prefix = f"【第 {attempt}/{MAX_RETRIES} 次尝试】" if attempt > 1 else ""
-            
+
             # 生成/修正 Dockerfile
             if attempt == 1:
                 yield f"🤖 {retry_prefix}部署专家正在编写专属 Dockerfile...\n"
                 prompt_input = f"请为以下项目数据生成最优 Dockerfile：\n\n{context_data}"
-            else:
+            elif attempt <= 3:
                 yield f"🔧 {retry_prefix}正在自愈：根据错误日志分析并修正 Dockerfile...\n"
                 prompt_input = f"上一次构建失败了。\n\n【错误日志】:\n{last_error_log}\n\n【之前生成的 Dockerfile】:\n{dockerfile_content}\n\n请针对上述错误进行分析并输出修复后的 Dockerfile。"
+            else:
+                # AOS: 第 4-5 次尝试使用"部署调试器"子专家 + 尝试回滚到历史最优版本
+                yield f"🧬 {retry_prefix}启用部署调试专家进行深度诊断...\n"
+                # 尝试回滚到第一个版本（往往是最干净的）
+                rollback_df = dockerfile_history[0] if dockerfile_history else dockerfile_content
+                debug_context = f"Dockerfile 版本历史数量: {len(dockerfile_history)}。最近错误: {last_error_log[:300]}"
+                expert_analysis = await self.spawn_expert(
+                    "Docker 部署调试专家",
+                    f"分析以下构建错误并修复 Dockerfile:\n\n【错误日志】:\n{last_error_log}\n\n【原始 Dockerfile】:\n{rollback_df}\n\n请直接输出完整的修复后 Dockerfile，不要包含 Markdown。",
+                    debug_context
+                )
+                prompt_input = None
+                dockerfile_content = expert_analysis
 
-            dockerfile_content = await self.unified_client.generate(
-                "PREMIUM", 
-                EXPERT_REGISTRY["Deployment_Executor"]["prompt"], 
-                prompt_input
-            )
-            
+            if prompt_input:
+                dockerfile_content = await self.unified_client.generate(
+                    "PREMIUM",
+                    EXPERT_REGISTRY["Deployment_Executor"]["prompt"],
+                    prompt_input
+                )
+
             # 剥离可能的 markdown 标记
             if "```" in dockerfile_content:
                 match = re.search(r"```(?:dockerfile)?\s*(.*?)\s*```", dockerfile_content, re.DOTALL)
                 if match:
                     dockerfile_content = match.group(1)
-            
+
+            # AOS: 保存 Dockerfile 快照用于回滚
+            dockerfile_history.append(dockerfile_content)
+
             # 执行沙盒部署
             yield f"🐳 {retry_prefix}正在启动本地 Docker 沙盒进行构建与部署...\n"
-            
+
             current_attempt_failed = False
             try:
                 for event in self.docker_sandbox.deploy_in_sandbox(repo, dockerfile_content, repo_url):
                     evt_type = event.get("type")
                     msg = event.get("message", "")
-                    
+
                     if evt_type == "progress":
                         yield f"  {msg}\n"
                     elif evt_type == "log":
@@ -856,35 +1554,58 @@ class McpAgent:
                             yield f"    ┃ {msg}\n"
                     elif evt_type == "success":
                         ports_str = " | ".join(event.get("ports", []))
+                        container_id = event['container_id']
+
+                        yield f"\n🏁 [里程碑] 容器启动成功，正在执行健康检查...\n"
+
+                        # AOS: 健康探针
+                        import time
+                        time.sleep(3)  # 等待服务启动
+                        health = self.docker_sandbox.check_health(container_id)
+
                         self.memories["main"].append({
-                            "role": "assistant", 
-                            "content": f"【系统通知】项目已成功部署。映射端口：{ports_str} (容器ID: {event['container_id']})"
+                            "role": "assistant",
+                            "content": f"【系统通知】项目已成功部署。映射端口：{ports_str} (容器ID: {container_id})"
                         })
                         yield f"\n✅ **部署成功！**\n"
                         yield f"- **尝试次数**: {attempt}\n"
                         yield f"- **端口映射**: `{ports_str}`\n"
-                        yield f"- **容器 ID**: `{event['container_id']}`\n"
-                        
+                        yield f"- **容器 ID**: `{container_id}`\n"
+
+                        # 健康检查结果
+                        if health.get("healthy"):
+                            yield f"- **健康状态**: 🟢 正常\n"
+                        else:
+                            yield f"- **健康状态**: 🟡 服务可能未完全就绪\n"
+                        for probe in health.get("probes", []):
+                            status = probe.get("status_code", "N/A")
+                            yield f"  - 端口 {probe.get('port')}: HTTP {status}\n"
+                            if probe.get("diagnosis"):
+                                yield f"    ⚠️ {probe['diagnosis']}\n"
+
                         if event.get("logs"):
                             yield f"\n📋 **启动日志摘要 (前10行)**:\n```\n{event['logs']}\n```\n"
-                        
+
                         yield "💡 温馨提示：容器仅在 Agent 运行时存活，关闭程序或使用 /clear 将自动销毁。\n\n"
-                        return # 部署成功，退出
+                        return
                     elif evt_type == "error":
                         yield f"  ❌ 构建/部署失败: {msg}\n"
                         last_error_log = event.get("details", msg)
                         current_attempt_failed = True
-                        break # 跳出当前迭代的沙盒执行，进入重试
-                
+                        break
+
                 if current_attempt_failed:
-                    continue # 下一次重试
+                    continue
                 else:
-                    return # 正常结束
+                    return
 
             except Exception as e:
                 yield f"  ⚠️ 部署执行异常: {str(e)}\n"
                 last_error_log = str(e)
                 if attempt == MAX_RETRIES:
                     raise e
-        
-        yield f"最后一次错误详情: \n```\n{last_error_log}\n```\n"
+
+        # AOS: 熔断 - 所有重试均失败
+        yield f"\n🚨 [熔断] 自愈失败。已尝试 {MAX_RETRIES} 种方案，请人类接管。\n"
+        yield f"最后一次错误详情:\n```\n{last_error_log}\n```\n"
+

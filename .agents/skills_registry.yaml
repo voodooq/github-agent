@@ -1,0 +1,31 @@
+# AOS 2.0 动态技能注册表
+# Agent 按需加载/卸载 MCP 服务，无需硬编码到 .env
+
+skills:
+  # 默认始终加载的核心技能
+  - name: "github"
+    description: "GitHub API 操作：搜索仓库、读取文件、创建 Issue/PR 等"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
+    always_loaded: true
+
+  # 按需加载的扩展技能
+  - name: "sqlite_analyzer"
+    description: "本地 SQLite 数据库连接与 SQL 查询分析"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-sqlite", "./data.db"]
+    always_loaded: false
+
+  - name: "filesystem"
+    description: "本地文件系统读写操作"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    always_loaded: false
+
+  - name: "browser"
+    description: "无头浏览器自动化：打开网页、抓取动态渲染内容"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-puppeteer"]
+    always_loaded: false

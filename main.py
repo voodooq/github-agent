@@ -23,6 +23,7 @@ from config import (
     MCP_ENV,
     MEMORY_FILE,
     AGENT_MODE,
+    TOKEN_BUDGET,
 )
 from mcp_agent import McpAgent
 from prompts import GITHUB_SEARCH_PROMPT, SEARCH_PROMPT_TEMPLATE, ANALYZE_PROMPT_TEMPLATE
@@ -41,7 +42,13 @@ def printHelp():
     print("  /analyze <URL>    精准分析指定 GitHub 仓库")
     print("  /review <URL>     触发 Multi-Agent 专家团深度评审")
     print("  /deploy <URL>     一键部署项目到 Docker 沙盒")
+    print("  /auto <需求>      🧠 全自治模式：AI 自主拆解、招聘、执行、验收")
+    print("  /skills           查看动态技能注册表状态")
+    print("  /schedule         📅 查看所有定时任务")
+    print("  /wallet           💰 查看 CFO 财务简报（余额/燃烧率/生存模式）")
+    print("  /inject <金额>     💵 向 Agent 钱包注资")
     print("  /prune            手动清理 Docker 垃圾镜像/容器")
+    print("  /bb               📖 查看黑板报告 (任务事实/执行结果/时间轴)")
     print("  /clear            清除对话记忆")
     print("  /tools            查看可用 MCP 工具")
     print("  /help             显示此帮助")
@@ -97,12 +104,17 @@ async def main():
             from prompts import EXPERT_REGISTRY
             
             # 基础命令映射
-            commands = ["/search", "/analyze", "/review", "/deploy", "/prune", "/help", "/clear", "/clear all", "/tools", "/exit", "/quit"]
+            commands = ["/search", "/analyze", "/review", "/deploy", "/auto", "/skills", "/schedule", "/wallet", "/inject", "/prune", "/help", "/clear", "/clear all", "/tools", "/exit", "/quit"]
             meta = {
                 "/search": "搜索 GitHub 项目",
                 "/analyze": "深入分析单个项目内容",
                 "/review": "Multi-Agent 深度评审",
                 "/deploy": "一键部署项目到 Docker 沙盒",
+                "/auto": "🧠 全自治模式",
+                "/skills": "查看动态技能注册表状态",
+                "/schedule": "📅 查看定时任务",
+                "/wallet": "💰 CFO 财务简报",
+                "/inject": "💵 向 Agent 钱包注资",
                 "/prune": "清理 Docker 资源",
                 "/help": "显示帮助信息",
                 "/clear": "清除主对话记忆",
@@ -238,8 +250,75 @@ async def main():
                         logger.error("部署流程异常: %s", e)
                         print(f"\n❌ 错误: {e}\n")
                     continue
+                elif userInput == "/bb":
+                    # AOS 2.1: 查看黑板报告
+                    print("\n📖 [黑板报告] 当前任务事实:")
+                    print("─" * 50)
+                    print(agent.blackboard.read_all())
+                    print("─" * 50)
+                    print(agent.blackboard.get_timeline())
+                    print()
+                    continue
+                elif userInput.startswith("/auto "):
+                    # AOS 2.0: 全自治模式
+                    demand = userInput[6:].strip()
+                    if not demand:
+                        print("⚠️  请输入任务需求，例如: /auto 找到最火的 3 个 Python 量化框架\n")
+                        continue
+                    try:
+                        async for chunk in agent.autonomous_execute(demand):
+                            print(chunk, end="", flush=True)
+                        print("\n")
+                    except Exception as e:
+                        logger.error("自治模式异常: %s", e)
+                        print(f"\n❌ 自治任务执行失败: {e}\n")
+                    continue
+                elif userInput == "/skills":
+                    # AOS 2.0: 查看技能状态
+                    skills = agent.skill_manager.list_available()
+                    print("\n📦 动态技能注册表:")
+                    for s in skills:
+                        icon = "🟢" if s["loaded"] else ("🟡" if s["always_loaded"] else "⚪")
+                        print(f"  {icon} {s['name']}: {s['description']}")
+                    print(f"  ───")
+                    print(f"  🟢 已加载  🟡 自动加载  ⚪ 按需加载\n")
+                    continue
+                elif userInput == "/schedule":
+                    # AOS Phase 3: 查看定时任务
+                    tasks = agent.scheduler.list_tasks()
+                    if not tasks:
+                        print("\n📅 暂无定时任务。可以自然语言对话创建，例如: '每天早上8点提醒我吃药'\n")
+                    else:
+                        print(f"\n📅 定时任务 ({len(tasks)} 个):")
+                        for t in tasks:
+                            print(f"  ⏰ {t['task_id']}: {t['description']} | {t['cron']} | 下次: {t['next_trigger']} | 已执行: {t['run_count']}次")
+                        print()
+                    continue
+                elif userInput == "/wallet":
+                    # AOS AEA: CFO 财务简报
+                    print(agent.economy.get_financial_report())
+                    # 最近交易
+                    txs = agent.economy.get_recent_transactions(5)
+                    if txs:
+                        print("📜 最近交易:")
+                        for tx in txs:
+                            print(f"  {tx['time']} | {tx['type']:>7} | {tx['amount']:>10} | {tx['description']}")
+                    print()
+                    continue
+                elif userInput.startswith("/inject "):
+                    # AOS AEA: 注资
+                    try:
+                        amount = float(userInput[8:].strip())
+                        agent.economy.inject_funds(amount)
+                        # 同步到黑板
+                        for key, val in agent.economy.get_blackboard_facts().items():
+                            agent.blackboard.write(key, val, author="CFO")
+                        print(agent.economy.get_financial_report() + "\n")
+                    except ValueError:
+                        print("⚠️  请输入有效金额，例如: /inject 5.00\n")
+                    continue
                 elif userInput == "/prune":
-                    print("🧹 正在执行系统大扫除，清理所有停止的容器和悬空镜像...")
+                    print("🧹 正在清理 Docker 资源...")
                     try:
                         result = agent.docker_sandbox.system_prune()
                         print(f"{result}\n")
@@ -247,10 +326,12 @@ async def main():
                         print(f"❌ 清理异常: {e}\n")
                     continue
 
-                # Agent 日常对话（默认本地优先，省 Token）
+                # Agent 日常对话：根据 AGENT_MODE 决定路由策略
+                # TURBO 模式下日常对话也走云端（支持工具调用）
+                chat_tier = "PREMIUM" if AGENT_MODE == "TURBO" else "LOCAL"
                 try:
                     print(f"\n🤖 Agent: ", end="", flush=True)
-                    async for chunk in agent.chat(userInput, tier="LOCAL"):
+                    async for chunk in agent.chat(userInput, tier=chat_tier):
                         print(chunk, end="", flush=True)
                     print("\n")
                 except Exception as e:
@@ -258,7 +339,7 @@ async def main():
                     print(f"\n❌ 错误: {e}\n")
 
     # 退出前保存所有记忆
-    agent.saveAllMemories()
+    await agent.saveAllMemories()
 
     print("👋 再见！")
 

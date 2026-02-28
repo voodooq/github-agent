@@ -5,6 +5,8 @@ import subprocess
 import shutil
 import logging
 import stat
+import urllib.request
+import urllib.error
 
 logger = logging.getLogger("mcp-agent")
 
@@ -111,7 +113,9 @@ class DockerSandboxAgent:
             container = self.client.containers.run(
                 image_tag,
                 detach=True,
-                mem_limit="1g",
+                mem_limit="512m",
+                cpu_period=100000,
+                cpu_quota=50000,
                 ports=port_bindings,
                 name=container_name
             )
@@ -144,6 +148,47 @@ class DockerSandboxAgent:
         except Exception as e:
             logger.error(f"沙盒部署异常: {e}")
             yield {"type": "error", "message": "沙盒部署异常", "details": str(e)}
+
+    def check_health(self, container_id: str, timeout: int = 10) -> dict:
+        """
+        对运行中的容器执行 HTTP 健康探针。
+        检查所有映射端口的 HTTP 状态码和响应体预览。
+        """
+        results = {"healthy": False, "probes": []}
+        try:
+            container = self.client.containers.get(container_id)
+            container.reload()
+            assigned_ports = container.ports or {}
+
+            for container_port, host_bindings in assigned_ports.items():
+                if not host_bindings:
+                    continue
+                host_port = host_bindings[0]['HostPort']
+                url = f"http://localhost:{host_port}/"
+                probe = {"port": host_port, "url": url}
+                try:
+                    req = urllib.request.Request(url, method="GET")
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        probe["status_code"] = resp.status
+                        body = resp.read(200).decode('utf-8', errors='replace')
+                        probe["body_preview"] = body
+                        # 200 或 404（前端未挂载但后端活了）都算健康
+                        if resp.status in (200, 404):
+                            results["healthy"] = True
+                except urllib.error.HTTPError as e:
+                    probe["status_code"] = e.code
+                    probe["body_preview"] = e.read(200).decode('utf-8', errors='replace') if e.fp else ""
+                    # 500 说明应用启动了但内部有错（数据库等）
+                    if e.code in (500, 502, 503):
+                        probe["diagnosis"] = "应用已启动但内部报错，可能是数据库连接等问题"
+                except Exception as e:
+                    probe["error"] = str(e)
+
+                results["probes"].append(probe)
+        except Exception as e:
+            results["error"] = str(e)
+
+        return results
 
     def destroy_sandbox(self, container_id, project_name):
         """
