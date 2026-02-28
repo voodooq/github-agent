@@ -63,25 +63,25 @@ DOD_GENERATOR_PROMPT = """你是一个极其严格的需求分析师。
 
 不要输出任何解释文字，只输出 JSON 数组。"""
 
-VERIFIER_PROMPT = """你是一个无情的 QA 裁判。你的唯一职责是"找茬"。
-你会收到两样东西：
-1. 【验收标准 (DoD)】— 任务必须达到的条件
-2. 【执行结果】— Agent 实际产出的内容（包含各角色的工具调用总结）
+VERIFIER_PROMPT = """你是一个极其严苛、具有「反幻觉」倾向公的 AOS (自治操作系统) 首席审计官。
+你的唯一任务是：基于各子 Agent 提交的【执行结果】和【黑板快照 (Blackboard Snapshot)】，核对【验收标准 (DoD)】。
 
-请逐条对照验收标准，严格判定每条是否通过。
-
-【反幻觉特别红线 (AOS 2.3)】:
-- 你必须索要"物理级工作量证明 (Proof of Work)"：
-  1. 如果创建了文件，执行结果中必须包含通过 `write_file` 或 `read_file` 工具获取的真实物理绝对路径。
-  2. 如果获取了数据，必须看到原始的工具返回日志或内容片段，而不是 Agent 的口头总结。
-- 绝不信任：任何以 "我已完成..."、"我已经创建..." 开头的口头陈述，除非伴随着物理工具的输出记录。
-- 严禁容忍任何"模拟执行"、"假设成功"或"编造剧本"的行为。一旦发现，严词判定为 FAIL。
+### 核心判定逻辑 (CRITICAL):
+1. **黑板证据优先 (Truth in Blackboard)**: 
+   - 如果【客观预检报告】显示通过，或者【黑板快照】中确实存在对应的 Key/Value，这属于物理级证明。
+   - 即使子 Agent 的文字描述简略，只要黑板中有对应数据或文件系统中有路径证据，即视为该项 PASS。
+2. **反幻觉审查 (Anti-Hallucination)**: 
+   - 严禁轻信子 Agent 口头声称的“我完成了”，你必须寻找具体的【物理证据】，如：
+     - 工具调用产生的原始输出（如文件路径、生成的 JSON 片段）。
+     - 黑板中持久化的具体字段。
+3. **拒绝幻觉**: 如果子 Agent 仅用自然语言描述过程而无任何物理证据，且黑板中也无记录，必须判定为 FAIL。
+4. **容错性**: 如果任务因为「预算挂起」停止，但关键成果已经在黑板或文件系统中生成，可以判定为 PASS。
 
 输出格式（纯 JSON）:
 {
   "overall": "PASS" 或 "FAIL",
   "details": [
-    {"criterion": "标准内容", "result": "PASS/FAIL", "reason": "判定理由，必须引用物理证据"}
+    {"criterion": "标准内容", "result": "PASS/FAIL", "reason": "判定理由，需引用物理证据"}
   ],
   "correction_hint": "如果 FAIL，给出具体的修正方向（一句话）"
 }
@@ -126,6 +126,56 @@ RECRUITER_PROMPT = """你是一个数字公司的"项目经理"。
 - 明确指定黑板读写字段名
 - 没有依赖关系的角色会并发执行
 - 最多 5 个子 Agent（控制开销）"""
+
+
+META_PROMPT_TEMPLATE = """你是 AOS (自治操作系统) 的「核心经验抽象专家」。
+你的唯一职责是：将刚刚成功执行的【具象化任务指令】及其【执行计划】，提炼成【泛化的 SOP 模板】。
+
+### 抽象规则 (CRITICAL)
+1. 识别变量：找出用户指令中可能发生变化的参数（如：文件名、URL、技术栈名称、搜索关键字、路径等）。
+2. 生成正则 (Regex)：将这些变量替换为 Python 命名的正则表达式捕获组，格式为 `(?P<变量名>.*?)`。保留原始句子中的动词和结构词。
+3. 替换占位符：将原执行计划和 DoD 中的对应实体，替换为 `{{variable_name}}` 占位符。
+4. 正则转义：请确保非变量部分的特殊符号（如 . / ? 等）被正确转义。
+
+### 示例展示
+【输入指令】："在桌面创建一个名为 app.py 的文件并写入 hello"
+【输出 JSON】
+{{
+  "pattern": "^在桌面创建一个名为 (?P<filename>.*?) 的文件并写入 (?P<content>.*?)$",
+  "variables": ["filename", "content"],
+  "generalized_plan": {{
+    "plan_summary": "在桌面创建文件 {{filename}} 并写入内容",
+    "sub_agents": [
+      {{
+        "role_id": "file_executor",
+        "expertise": "文件操作专家",
+        "task_description": "在桌面创建文件 {{filename}}，并将以下内容写入：{{content}}",
+        "depends_on": [],
+        "required_skills": ["filesystem"]
+      }}
+    ]
+  }}
+}}
+
+### 当前输入
+【用户原始指令】：{user_demand}
+【成功的招聘计划】：{successful_plan}
+
+请严格按上述 JSON 格式输出，禁止包含任何 Markdown 代码块或额外解释说明！
+"""
+
+
+def inject_variables(plan: dict, var_map: dict) -> dict:
+    """递归替换 plan 中的 {{var}} 占位符"""
+    if not var_map: return plan
+    plan_str = json.dumps(plan, ensure_ascii=False)
+    for k, v in var_map.items():
+        plan_str = plan_str.replace(f"{{{{{k}}}}}", str(v))
+    try:
+        return json.loads(plan_str)
+    except Exception as e:
+        logger.error("变量注入后 JSON 解析失败: %s", e)
+        return plan
 
 
 class Orchestrator:
@@ -367,7 +417,7 @@ class Orchestrator:
         # 阶段 2: AI 语义验证
         print("⚖️ [阶段二] AI 语义验证...")
 
-        # 格式化 DoD 为字符串（兼容新旧格式）
+        # 格式化 DoD 为字符串
         dod_text = []
         for item in dod:
             if isinstance(item, dict):
@@ -375,15 +425,22 @@ class Orchestrator:
             else:
                 dod_text.append(str(item))
 
+        # [AOS 2.6] 注入黑板快照作为物理证据
+        blackboard_snapshot = self.blackboard.read_all()
+        
+        # [AOS 2.6] 扩大上下文到 4000 字符，保留更多工具日志
         results_text = "\n\n".join([
-            f"--- {role} 的执行结果 ---\n{text[:1500]}"
+            f"--- {role} 的执行结果 ---\n{text[:4000]}"
             for role, text in results.items()
         ])
 
         verification_input = (
             f"【验收标准 (DoD)】:\n"
             + "\n".join(f"- {d}" for d in dod_text)
-            + f"\n\n【各 Agent 执行结果】:\n{results_text}"
+            + f"\n\n【客观预检状态】:\n"
+            + "\n".join(f"- {r['criterion']}: {r['result']} ({r['reason']})" for r in pre_check_results)
+            + f"\n\n【黑板物理快照 (Ground Truth)】:\n{blackboard_snapshot}"
+            + f"\n\n【各 Agent 执行过程细节】:\n{results_text}"
         )
 
         result = await self.client.generate(
@@ -409,6 +466,48 @@ class Orchestrator:
         except (json.JSONDecodeError, TypeError):
             logger.warning("裁判结果解析失败，视为 PASS")
             return {"overall": "PASS", "details": [], "correction_hint": ""}
+
+    async def distill_and_save_experience(self, user_demand: str, successful_plan: dict):
+        """
+        经验蒸馏器：异步将成功案例抽象为泛化模板。
+        """
+        print("🧪 [经验蒸馏] 正在提炼泛化肌肉记忆...")
+        
+        prompt = META_PROMPT_TEMPLATE.format(
+            user_demand=user_demand,
+            successful_plan=json.dumps(successful_plan, ensure_ascii=False)
+        )
+        
+        # 使用 LOCAL Tier 进行廉价蒸馏
+        response_text = await self.client.generate(
+            tier="LOCAL",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        try:
+            from mcp_agent import extract_json
+            distilled_data = extract_json(response_text)
+            
+            if not isinstance(distilled_data, dict) or "pattern" not in distilled_data:
+                raise ValueError("蒸馏结果格式不正确")
+                
+            # 校验正则是否可用
+            import re
+            pattern = distilled_data["pattern"]
+            if not re.search(pattern, user_demand, re.IGNORECASE):
+                logger.warning("⚠️ [经验蒸馏] 校验失败：生成的正则无法匹配原始指令。")
+                return
+
+            # 持久化
+            self.exp_engine.record_success(
+                demand=user_demand,
+                plan=distilled_data["generalized_plan"],
+                pattern=pattern
+            )
+            print(f"✅ [经验蒸馏] 成功掌握新技能模式: {pattern}")
+            
+        except Exception as e:
+            logger.error("经验蒸馏失败: %s", e)
 
     async def run_mission(
         self,
@@ -447,21 +546,25 @@ class Orchestrator:
 
             # 2. 生成招聘计划 (AOS 2.4+: 优先尝试从经验库复用，并过 CFO 海关)
             is_fast_path = False
-            plan = self.exp_engine.match_plan(user_demand)
+            match_result = self.exp_engine.match_plan(user_demand)
             
-            if plan:
-                yield f"✨ [Experience] 命中快路径！正在请求 CFO 财务授权...\n"
+            if match_result:
+                plan_template, var_map = match_result
+                yield f"✨ [Experience] 命中快路径！检测到变量: {var_map}\n"
+                
+                # 注入变量
+                plan = inject_variables(plan_template, var_map)
+                
+                yield f"正在请求 CFO 财务授权...\n"
                 
                 # AOS 2.4+: 即使是快路径，也要过 CFO 海关
-                # 预估成本：假设每个子 Agent 消耗 $0.005
                 sub_agent_count = len(plan.get("sub_agents", []))
                 est_cost = sub_agent_count * 0.005
                 
                 if self.agent:
-                    # 调用真实的 CFO 审批逻辑
                     cfo_result_json = await self.agent._handle_internal_tool("cfo_approve", {
                         "estimated_cost": est_cost,
-                        "expected_value": 0.05 # 假设基础任务价值
+                        "expected_value": 0.05
                     })
                     cfo_data = json.loads(cfo_result_json) if cfo_result_json else {}
                     
@@ -513,8 +616,8 @@ class Orchestrator:
             verdict = await self.verify_results(dod, agent_results)
 
             if verdict.get("overall") == "PASS":
-                # AOS 2.4: 记录为成功经验，以便下次复用
-                self.exp_engine.record_success(user_demand, plan)
+                # AOS 2.4+: 触发后台经验蒸馏
+                asyncio.create_task(self.distill_and_save_experience(user_demand, plan))
                 
                 yield "\n✅ [裁判判定] 所有验收标准通过！\n"
                 # 汇总最终结果

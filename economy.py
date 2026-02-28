@@ -49,8 +49,10 @@ class EconomyEngine:
         self,
         db_path: str = ECONOMY_DB_PATH,
         initial_balance: float | None = None,
+        blackboard = None
     ):
         self.db_path = db_path
+        self.blackboard = blackboard
         self._init_db()
 
         # 加载或初始化余额
@@ -60,27 +62,40 @@ class EconomyEngine:
         last_initial = self._get_stored_initial()
         existing_balance = self._get_balance()
 
-        # 如果 .env 中的初始值发生了变化，或者数据库为空，则更新余额
-        if last_initial is None or abs(last_initial - env_bal) > 0.0001:
+        # [AOS 2.5] 种子资金逻辑：只有在完全没数据，或者老板明确改了 .env 初始值时才覆盖
+        if last_initial is None:
+            # 第一次启动，发放天使轮
             self.balance = env_bal
             self._set_balance(env_bal)
             self._set_stored_initial(env_bal)
-            if last_initial is not None:
-                logger.info("🔄 [CFO] 检测到 .env 初始金额变更 (%s -> %s)，已重置余额", last_initial, env_bal)
-        elif existing_balance is not None:
-            self.balance = existing_balance
-        else:
+            self._record_transaction("revenue", env_bal, "天使轮种子资金注入")
+            logger.info("💰 [CFO] 首次启动，注入种子资金: $%.2f", env_bal)
+        elif abs(last_initial - env_bal) > 0.0001:
+            # 老板手动改了初始值，视为追加或重置
             self.balance = env_bal
             self._set_balance(env_bal)
+            self._set_stored_initial(env_bal)
+            self._record_transaction("inject", env_bal, "手动重置初始资金")
+            logger.info("🔄 [CFO] 检测到初始金额变更，已重置余额为: $%.2f", env_bal)
+        else:
+            # 正常重启，继承数据库里的真实余额
+            self.balance = existing_balance if existing_balance is not None else env_bal
+            logger.info("💾 [CFO] 继承持久化余额: $%.4f", self.balance)
 
         # 当日消费追踪
         self.today_spend = self._get_today_spend()
         self.today_revenue = self._get_today_revenue()
+        
+        # 同步一次黑板
+        self.sync_blackboard()
 
-        logger.info(
-            "💰 [CFO] 经济引擎启动 | 余额: $%.2f | 今日消耗: $%.4f | 模式: %s",
-            self.balance, self.today_spend, self.get_survival_mode(),
-        )
+    def sync_blackboard(self):
+        """将最新余额与状态推送到黑板"""
+        if self.blackboard:
+            for key, val in self.get_blackboard_facts().items():
+                self.blackboard.write(key, val, author="CFO")
+
+    # ========== SQLite 持久化 ==========
 
     # ========== SQLite 持久化 ==========
 
@@ -184,6 +199,7 @@ class EconomyEngine:
         self.today_spend += amount
         self._set_balance(self.balance)
         self._record_transaction("spend", -amount, description)
+        self.sync_blackboard()
         return True
 
     def earn(self, amount: float, description: str = "收入") -> None:
@@ -194,6 +210,7 @@ class EconomyEngine:
         self.today_revenue += amount
         self._set_balance(self.balance)
         self._record_transaction("revenue", amount, description)
+        self.sync_blackboard()
         print(f"💵 [CFO] 收入 +${amount:.2f}: {description} | 余额: ${self.balance:.2f}")
 
     def inject_funds(self, amount: float) -> None:
@@ -201,6 +218,7 @@ class EconomyEngine:
         self.balance += amount
         self._set_balance(self.balance)
         self._record_transaction("inject", amount, "老板注资")
+        self.sync_blackboard()
         print(f"💰 [CFO] 老板注资 +${amount:.2f} | 新余额: ${self.balance:.2f}")
 
     # ========== Token 成本估算 ==========

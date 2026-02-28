@@ -107,10 +107,11 @@ class UnifiedClient:
     云端使用 AsyncOpenAI SDK，本地使用 Ollama 原生 HTTP API（绕过兼容层 bug）。
     """
 
-    def __init__(self, cloud_config: dict, local_config: dict, agent_mode: str = "AUTO"):
+    def __init__(self, cloud_config: dict, local_config: dict, agent_mode: str = "AUTO", economy = None):
         self.cloud_config = cloud_config
         self.local_config = local_config
         self.agent_mode = agent_mode.upper()
+        self.economy = economy
         
         # 检测可用性
         self.cloud_available = bool(cloud_config.get("api_key") and cloud_config.get("model"))
@@ -340,6 +341,16 @@ class UnifiedClient:
                     
                     # 成功则重置失败计数
                     self._consecutive_cloud_failures = 0
+                    
+                    # [AOS 2.5] 财务扣费拦截器
+                    if self.economy:
+                        usage = response.usage
+                        self.economy.track_api_call(
+                            usage.prompt_tokens, 
+                            usage.completion_tokens,
+                            is_local=False
+                        )
+                        
                     return response.choices[0].message.content
             except Exception as e:
                 error_msg = f"{type(e).__name__}: {str(e)}"
@@ -410,7 +421,8 @@ class UnifiedClient:
                     kwargs = {
                         "model": self.cloud_config["model"],
                         "messages": messages,
-                        "stream": True
+                        "stream": True,
+                        "stream_options": {"include_usage": True}
                     }
                     if tools:
                         kwargs["tools"] = tools
@@ -421,8 +433,34 @@ class UnifiedClient:
                     print(f"📡 正在建立云端流式连接 ({self.cloud_config['model']})...")
                     response = await self.cloud_client.chat.completions.create(**kwargs)
                     print(f"✨ 流式连接已建立，开始接收数据...")
+                    full_content = ""
+                    usage_found = False
                     async for chunk in response:
+                        if chunk.choices and len(chunk.choices) > 0:
+                            delta = chunk.choices[0].delta.content or ""
+                            full_content += delta
                         yield chunk
+                        
+                        # [AOS 2.5] 捕获流式输出最后一个 chunk 里的 usage 数据
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            usage_found = True
+                            if self.economy:
+                                self.economy.track_api_call(
+                                    chunk.usage.prompt_tokens, 
+                                    chunk.usage.completion_tokens,
+                                    is_local=False
+                                )
+                    
+                    # [AOS 2.5] 仅在未获得官方 usage 时进行保守估算
+                    if not usage_found and self.economy:
+                        try:
+                            # 估算输入：messages 长度
+                            input_text = json.dumps(messages, ensure_ascii=False)
+                            in_tokens = len(input_text) // 2
+                            out_tokens = len(full_content) // 2
+                            self.economy.track_api_call(in_tokens, out_tokens, is_local=False)
+                        except:
+                            pass
                     return
             except (Exception, asyncio.CancelledError) as e:
                 import traceback
@@ -467,12 +505,22 @@ class McpAgent:
         systemPrompt: str = "你是一个智能助手。",
         mode: str = "AUTO",
     ):
-        self.unified_client = UnifiedClient(cloud_config, local_config, agent_mode=mode)
+        # AOS 2.0: 黑板共享上下文
+        self.blackboard = Blackboard()
+        # AOS AEA: 经济与生存引擎 (CFO Agent)
+        self.economy = EconomyEngine(blackboard=self.blackboard)
+        # AOS 2.4: 进阶经验引擎
+        self.exp_engine = ExperienceEngine()
+        # AOS Phase 3: Cron 守护进程调度器
+        self.scheduler = Scheduler()
+        
+        self.unified_client = UnifiedClient(cloud_config, local_config, agent_mode=mode, economy=self.economy)
         self.cloud_model = cloud_config["model"]
         self.local_model = local_config["model"]
         self.systemPrompt = systemPrompt
         # 核心记忆字典：{ context_id: messages_list }
         self.mode = mode
+        
         # 记忆管理配置
         self.memory_dir = "memories"
         os.makedirs(self.memory_dir, exist_ok=True)
@@ -486,14 +534,6 @@ class McpAgent:
         self.token_budget = TokenBudget(max_tokens=TOKEN_BUDGET_LIMIT)
         # AOS 2.0: 动态技能管理器
         self.skill_manager = SkillManager()
-        # AOS 2.0: 黑板共享上下文
-        self.blackboard = Blackboard()
-        # AOS 2.4: 进阶经验引擎
-        self.exp_engine = ExperienceEngine()
-        # AOS Phase 3: Cron 守护进程调度器
-        self.scheduler = Scheduler()
-        # AOS AEA: 经济与生存引擎 (CFO Agent)
-        self.economy = EconomyEngine()
 
         
     async def connect(self, session: ClientSession) -> list[str]:
