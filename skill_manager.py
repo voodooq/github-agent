@@ -99,29 +99,42 @@ class SkillManager:
                 else:
                     env_config[key] = val
 
+            # [AOS 2.3] 路径纠偏：如果 filesystem 技能使用 "."，自动转为绝对路径防止偏移
+            args = config.get("args", [])
+            if name == "filesystem":
+                new_args = []
+                for arg in args:
+                    if arg == ".":
+                        new_args.append(os.path.abspath("."))
+                    else:
+                        new_args.append(arg)
+                args = new_args
+
             server_params = StdioServerParameters(
                 command=config["command"],
-                args=config.get("args", []),
+                args=args,
                 env=env_config if env_config else None,
             )
 
-            # [AOS 2.1] 超时保护：防止因下载环境（如 Puppeteer/Chromium）导致无限卡死
-            # 我们将整个连接与初始化过程限制在 60s 内
-            async def _do_init():
-                # NOTE: 启动 MCP 进程并建立会话
-                # 使用 stdio_client 上下文管理器
-                ctx = stdio_client(server_params)
-                streams = await ctx.__aenter__()
-                session = ClientSession(*streams)
-                await session.__aenter__()
-                await session.initialize()
-                return ctx, session
+            # [AOS 2.2] 修复 stability：手动维护上下文生命周期，避免 Nested wait_for 导致的 anyio 作用域崩溃
+            ctx = stdio_client(server_params)
+            streams = await ctx.__aenter__()
+            
+            session = ClientSession(*streams)
+            await session.__aenter__()
 
             try:
-                ctx, session = await asyncio.wait_for(_do_init(), timeout=60.0)
+                # 仅在初始化阶段应用超时，这是最可能因为环境问题挂起的地方
+                await asyncio.wait_for(session.initialize(), timeout=60.0)
             except asyncio.TimeoutError:
-                logger.error("🚫 技能 '%s' 加载超时 (60s)，可能正在下载依赖或环境不兼容", name)
-                return {"status": "error", "message": f"技能 '{name}' 加载超时，请确认依赖（如 Chromium）是否已安装"}
+                logger.error("🚫 技能 '%s' 初始化超时 (60s)", name)
+                await session.__aexit__(None, None, None)
+                await ctx.__aexit__(None, None, None)
+                return {"status": "error", "message": f"技能 '{name}' 加载超时，请确认依赖是否已安装"}
+            except Exception as e:
+                await session.__aexit__(None, None, None)
+                await ctx.__aexit__(None, None, None)
+                raise e
 
             # 获取工具列表
             mcp_tools = await session.list_tools()
@@ -139,7 +152,7 @@ class SkillManager:
             return {"status": "loaded", "tools": tool_names}
 
         except Exception as e:
-            logger.error("技能 '%s' 加载失败: %s", name, e)
+            logger.error("技能 '%s' 加载过程中出现异常: %s", name, e)
             return {"status": "error", "message": str(e)}
 
     async def unload_skill(self, name: str) -> dict:

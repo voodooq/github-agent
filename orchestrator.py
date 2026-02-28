@@ -16,6 +16,7 @@ import time
 from datetime import datetime
 from blackboard import Blackboard
 from skill_manager import SkillManager
+from experience_engine import ExperienceEngine
 
 logger = logging.getLogger(__name__)
 
@@ -65,21 +66,22 @@ DOD_GENERATOR_PROMPT = """你是一个极其严格的需求分析师。
 VERIFIER_PROMPT = """你是一个无情的 QA 裁判。你的唯一职责是"找茬"。
 你会收到两样东西：
 1. 【验收标准 (DoD)】— 任务必须达到的条件
-2. 【执行结果】— Agent 实际产出的内容
+2. 【执行结果】— Agent 实际产出的内容（包含各角色的工具调用总结）
 
 请逐条对照验收标准，严格判定每条是否通过。
 
-【反幻觉特别红线】:
-- 你必须索要"工作量证明 (Proof of Work)"。
-- 如果 Agent 声称创建了文件，你必须在执行结果中看到该文件内容的真实片段或由读取工具返回的确认。
-- 如果 Agent 声称抓取了网页，必须看到真实提取到的数据内容，而非逼真的假数据。
+【反幻觉特别红线 (AOS 2.3)】:
+- 你必须索要"物理级工作量证明 (Proof of Work)"：
+  1. 如果创建了文件，执行结果中必须包含通过 `write_file` 或 `read_file` 工具获取的真实物理绝对路径。
+  2. 如果获取了数据，必须看到原始的工具返回日志或内容片段，而不是 Agent 的口头总结。
+- 绝不信任：任何以 "我已完成..."、"我已经创建..." 开头的口头陈述，除非伴随着物理工具的输出记录。
 - 严禁容忍任何"模拟执行"、"假设成功"或"编造剧本"的行为。一旦发现，严词判定为 FAIL。
 
 输出格式（纯 JSON）:
 {
   "overall": "PASS" 或 "FAIL",
   "details": [
-    {"criterion": "标准1原文", "result": "PASS/FAIL", "reason": "判定理由"}
+    {"criterion": "标准内容", "result": "PASS/FAIL", "reason": "判定理由，必须引用物理证据"}
   ],
   "correction_hint": "如果 FAIL，给出具体的修正方向（一句话）"
 }
@@ -90,7 +92,9 @@ SYSTEM_GUARDRAIL = """
 ⚠️【最高优先级生存红线】⚠️
 1. 你被绝对禁止“模拟”、“假设”或“编造”任何执行过程与数据。
 2. 面对需要获取外部信息、操作文件或浏览网页的任务，你【必须且只能】通过发出真实的 Tool Call (工具调用) 来真实执行！
-3. 如果系统不给你返回真实的 Tool Observation (工具执行结果日志)，你绝对不能自己捏造任务成功的报告。违者将被系统抹杀。
+3. 如果系统不给你返回真实的 Tool Observation (工具执行结果日志)，你绝对不能自己捏造任务成功的报告。
+4. 【黑板写入铁律】：向黑板 (write_blackboard) 写入状态时，必须写入极简的客观数据（如绝对路径字符串、布尔值、数字），绝对禁止写入 Markdown 格式的执行摘要或任何“小作文”！违者将被系统抹杀。
+5. 【本地与云端物理区隔】：如果你需要创建或修改本地硬盘（如当前项目目录、Windows 桌面）的文件，你【必须且只能】使用 filesystem 技能中的 write_file 工具，绝对禁止使用 github 技能中的 create_or_update_file 工具（那是给云端仓库用的）。
 """
 
 RECRUITER_PROMPT = """你是一个数字公司的"项目经理"。
@@ -129,11 +133,12 @@ class Orchestrator:
     自治编排引擎：接收用户需求，自动拆解、招聘、协调、验收。
     """
 
-    def __init__(self, unified_client, skill_manager: SkillManager, blackboard: Blackboard, agent=None):
+    def __init__(self, unified_client, skill_manager: SkillManager, blackboard: Blackboard, agent=None, exp_engine=None):
         self.client = unified_client
         self.skill_manager = skill_manager
         self.blackboard = blackboard
         self.agent = agent # AOS 2.1: 完整 Agent 引用
+        self.exp_engine = exp_engine or ExperienceEngine() # AOS 2.4: 经验引擎
 
     async def generate_dod(self, user_demand: str) -> list[str]:
         """
@@ -174,8 +179,11 @@ class Orchestrator:
     async def generate_recruiting_plan(self, user_demand: str, dod: list[str]) -> dict:
         """
         根据需求和 DoD 生成动态"招聘计划"。
+        AOS 2.4+: 注入负面模式以避坑。
         """
         print("👔 [项目经理] 正在制定招聘计划...")
+
+        negatives = self.exp_engine.get_negative_patterns() if hasattr(self, "exp_engine") else ""
 
         # 收集当前可用工具信息
         tool_names = self.skill_manager.get_tool_names()
@@ -188,6 +196,9 @@ class Orchestrator:
             available_tools=tools_info,
             blackboard_state=bb_state,
         )
+        if negatives:
+            prompt += f"\n\n{negatives}"
+
         result = await self.client.generate(
             "PREMIUM",
             prompt,
@@ -434,8 +445,37 @@ class Orchestrator:
             # 清理上一轮的任务状态（保留事实）
             self.blackboard.task_progress.clear()
 
-            # 2. 生成招聘计划
-            plan = await self.generate_recruiting_plan(user_demand, dod)
+            # 2. 生成招聘计划 (AOS 2.4+: 优先尝试从经验库复用，并过 CFO 海关)
+            is_fast_path = False
+            plan = self.exp_engine.match_plan(user_demand)
+            
+            if plan:
+                yield f"✨ [Experience] 命中快路径！正在请求 CFO 财务授权...\n"
+                
+                # AOS 2.4+: 即使是快路径，也要过 CFO 海关
+                # 预估成本：假设每个子 Agent 消耗 $0.005
+                sub_agent_count = len(plan.get("sub_agents", []))
+                est_cost = sub_agent_count * 0.005
+                
+                if self.agent:
+                    # 调用真实的 CFO 审批逻辑
+                    cfo_result_json = await self.agent._handle_internal_tool("cfo_approve", {
+                        "estimated_cost": est_cost,
+                        "expected_value": 0.05 # 假设基础任务价值
+                    })
+                    cfo_data = json.loads(cfo_result_json) if cfo_result_json else {}
+                    
+                    if not cfo_data.get("approved", True):
+                        yield f"⚠️ [CFO 拦截] 余额不足或 ROI 过低，拒绝执行历史方案。尝试降级规划...\n"
+                        plan = await self.generate_recruiting_plan(user_demand, dod)
+                    else:
+                        yield f"✅ [CFO 授权] 财务通过。复用方案预估开销: ${est_cost:.3f}\n"
+                        is_fast_path = True
+                else:
+                    is_fast_path = True
+            else:
+                plan = await self.generate_recruiting_plan(user_demand, dod)
+                
             yield f"\n👔 招聘计划: {plan.get('plan_summary', '')}\n"
             sub_agents = plan.get("sub_agents", [])
             for agent in sub_agents:
@@ -473,6 +513,9 @@ class Orchestrator:
             verdict = await self.verify_results(dod, agent_results)
 
             if verdict.get("overall") == "PASS":
+                # AOS 2.4: 记录为成功经验，以便下次复用
+                self.exp_engine.record_success(user_demand, plan)
+                
                 yield "\n✅ [裁判判定] 所有验收标准通过！\n"
                 # 汇总最终结果
                 yield "\n📊 最终交付结果:\n"
@@ -480,10 +523,15 @@ class Orchestrator:
                 for role, text in agent_results.items():
                     yield f"\n【{role}】:\n{text[:2000]}\n"
                 yield "─" * 50 + "\n"
-                yield f"\n🏁 任务圆满完成。数字团队已解散。\n"
+                yield f"\n🏁 任务圆满完成。数字团队已解散。方案已存入长期经验库。\n"
                 return
 
-            # 验收失败，准备下一轮
+            # 验收失败
+            if is_fast_path:
+                yield f"⚠️ [经验失效] 历史方案未能通过当前环境验证，执行经验衰减并回退到冷启动...\n"
+                self.exp_engine.record_failure(user_demand)
+            
+            # 准备下一轮
             hint = verdict.get("correction_hint", "")
             yield f"\n❌ [裁判判定] 未通过验收\n"
             yield f"📌 修正提示: {hint}\n"

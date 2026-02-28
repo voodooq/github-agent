@@ -451,6 +451,7 @@ from blackboard import Blackboard
 from orchestrator import Orchestrator
 from scheduler import Scheduler
 from economy import EconomyEngine
+from experience_engine import ExperienceEngine
 
 
 class McpAgent:
@@ -487,6 +488,8 @@ class McpAgent:
         self.skill_manager = SkillManager()
         # AOS 2.0: 黑板共享上下文
         self.blackboard = Blackboard()
+        # AOS 2.4: 进阶经验引擎
+        self.exp_engine = ExperienceEngine()
         # AOS Phase 3: Cron 守护进程调度器
         self.scheduler = Scheduler()
         # AOS AEA: 经济与生存引擎 (CFO Agent)
@@ -905,6 +908,18 @@ class McpAgent:
 
         return None  # 非内部工具
 
+    def _get_combined_tools(self) -> list[dict]:
+        """获取静态工具与动态技能工具的合集 (AOS 2.3)"""
+        all_tools = list(self.openaiTools) if self.openaiTools else []
+        skill_tools = self.skill_manager.get_all_tools()
+        if skill_tools:
+            # 过滤重复项（按名称）
+            existing_names = set(t["function"]["name"] for t in all_tools)
+            for st in skill_tools:
+                if st["function"]["name"] not in existing_names:
+                    all_tools.append(st)
+        return all_tools if all_tools else None
+
     async def chat(self, userInput: str, tier: str = "LOCAL") -> AsyncGenerator[str, None]:
         """
         AOS 核心 ReAct 循环（流式版）。
@@ -937,10 +952,13 @@ class McpAgent:
             fullContent = ""
             toolCallsDict = {}  # 用于按索引累计 tool_calls 数据
 
+            # AOS 2.3: 动态合并当前已加载的所有工具（含动态技能）
+            current_tools = self._get_combined_tools()
+            
             response = self.unified_client.generate_stream(
                 tier=tier,
                 messages=self.memories["main"],
-                tools=self.openaiTools if self.openaiTools else None
+                tools=current_tools
             )
 
 
@@ -1183,6 +1201,7 @@ class McpAgent:
             skill_manager=self.skill_manager,
             blackboard=self.blackboard,
             agent=self, # AOS 2.1: 传递当前 Agent 实例以便执行工具调用
+            exp_engine=self.exp_engine, # AOS 2.4+: 共享经验引擎实例
         )
         async for chunk in orchestrator.run_mission(
             user_demand=user_demand,
@@ -1225,11 +1244,14 @@ class McpAgent:
             fullContent = ""
             toolCallsDict = {}
             
+            # AOS 2.3: 动态合并当前已加载的所有工具（保证子 Agent 能看见 filesystem 等工具）
+            current_tools = self._get_combined_tools()
+            
             # 使用流式生成并累积结果（复用流量控制与模型降级逻辑）
             response_stream = self.unified_client.generate_stream(
                 tier=tier,
                 messages=self.memories[context_id],
-                tools=self.openaiTools if self.openaiTools else None
+                tools=current_tools
             )
             
             async for chunk in response_stream:

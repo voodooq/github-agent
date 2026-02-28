@@ -49,6 +49,7 @@ def printHelp():
     print("  /inject <金额>     💵 向 Agent 钱包注资")
     print("  /prune            手动清理 Docker 垃圾镜像/容器")
     print("  /bb               📖 查看黑板报告 (任务事实/执行结果/时间轴)")
+    print("  /exp              🧠 查看已积累的执行经验 (AOS 2.4)")
     print("  /clear            清除对话记忆")
     print("  /tools            查看可用 MCP 工具")
     print("  /help             显示此帮助")
@@ -257,6 +258,16 @@ async def main():
                     print(agent.blackboard.read_all())
                     print("─" * 50)
                     print(agent.blackboard.get_timeline())
+                    print()
+                    continue
+                elif userInput == "/exp":
+                    # AOS 2.4: 查看经验库
+                    exps = agent.exp_engine.list_experiences()
+                    print("\n🧠 [经验引擎] 当前已学习的执行模式:")
+                    if not exps:
+                        print("  (暂无成功经验，请先运行 /auto 任务)")
+                    for e in exps:
+                        print(f"  ⭐ {e['status']} | 置信度: {e['rate']} | 复用: {e['matches']}次 | 任务: {e['id']}")
                     print()
                     continue
                 elif userInput.startswith("/auto "):
