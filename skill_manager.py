@@ -21,12 +21,13 @@ REGISTRY_PATH = os.path.join(os.path.dirname(__file__), ".agents", "skills_regis
 class LoadedSkill:
     """已加载的技能实例，封装 MCP 进程和会话"""
 
-    def __init__(self, name: str, session: ClientSession, tools: list, context_manager=None):
+    def __init__(self, name: str, session: ClientSession, tools: list, runner_task: asyncio.Task, stop_event: asyncio.Event, last_args: list = None):
         self.name = name
         self.session = session
         self.tools = tools
-        # 保留上下文管理器引用以便安全关闭
-        self._context_manager = context_manager
+        self.runner_task = runner_task
+        self.stop_event = stop_event
+        self.last_args = last_args or []
 
 
 class SkillManager:
@@ -75,13 +76,54 @@ class SkillManager:
                 return skill
         return None
 
-    async def load_skill(self, name: str) -> dict:
+    async def _skill_runner(self, name: str, server_params: StdioServerParameters, session_future: asyncio.Future, stop_event: asyncio.Event):
+        """
+        [AOS 2.7] 核心改进：隔离的技能运行器。
+        确保 stdio_client 的 __aenter__ 和 __aexit__ 都在同一个 Task 中执行，彻底解决 anyio task-mismatch 报错。
+        """
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    # 1. 初始化
+                    await asyncio.wait_for(session.initialize(), timeout=60.0)
+                    
+                    # 2. 获取工具列表并传回主逻辑
+                    mcp_tools = await session.list_tools()
+                    session_future.set_result((session, mcp_tools.tools))
+                    
+                    # 3. 阻塞，直到收到卸载信号
+                    await stop_event.wait()
+                    
+                    # 4. 退出上下文（会自动触发 session 和 stdio_client 的 __aexit__）
+                    logger.debug("🔌 [技能运行器] 收到停止信号，正在释放技能: %s", name)
+        except asyncio.CancelledError:
+            logger.debug("🔌 [技能运行器] 任务被显式取消: %s", name)
+        except Exception as e:
+            if not session_future.done():
+                session_future.set_exception(e)
+            else:
+                logger.error("🚫 [技能运行器] 运行时异常 (%s): %s", name, e)
+        finally:
+            logger.debug("🔌 [技能运行器] 任务已终结: %s", name)
+
+    async def load_skill(self, name: str, workspace_path: str | None = None) -> dict:
         """
         动态加载指定技能的 MCP 服务。
-        返回加载结果（包含工具列表）。
+        [AOS 2.7] 支持 workspace_path 硬约束：如果是 filesystem 技能，强制锁死其目录。
         """
         if name in self.loaded_skills:
-            return {"status": "already_loaded", "tools": len(self.loaded_skills[name].tools)}
+            # AOS 2.8.4: 路径校验逻辑。如果当前已加载技能的路径与请求的 workspace_path 不符，强制重载。
+            # 这是为了处理 always_loaded 技能（如 filesystem）在任务切换时需要重新锚定沙箱的问题。
+            current_args = getattr(self.loaded_skills[name], "last_args", [])
+            if name == "filesystem" and workspace_path:
+                target_abs = os.path.abspath(workspace_path)
+                if not current_args or current_args[0] != target_abs:
+                    logger.info("🔄 [AOS 2.8.4] 检测到工作区变更，正在为技能 '%s' 重新锚定物理路径...", name)
+                    await self.unload_skill(name)
+                else:
+                    return {"status": "already_loaded", "tools": len(self.loaded_skills[name].tools)}
+            else:
+                return {"status": "already_loaded", "tools": len(self.loaded_skills[name].tools)}
 
         config = self.get_skill_config(name)
         if not config:
@@ -90,7 +132,7 @@ class SkillManager:
         print(f"🔌 [技能管理器] 正在加载技能: {name}...")
 
         try:
-            # 解析环境变量（支持 ${VAR} 占位符替换）
+            # 环境与路径处理
             env_config = {}
             for key, val in config.get("env", {}).items():
                 if isinstance(val, str) and val.startswith("${") and val.endswith("}"):
@@ -99,9 +141,16 @@ class SkillManager:
                 else:
                     env_config[key] = val
 
-            # [AOS 2.3] 路径纠偏：如果 filesystem 技能使用 "."，自动转为绝对路径防止偏移
             args = config.get("args", [])
-            if name == "filesystem":
+            
+            # [AOS 2.7+] 硬约束隔离：强制重定向 filesystem 技能的根目录
+            if name == "filesystem" and workspace_path:
+                # filesystem server 通常接受路径作为参数
+                # 我们将配置中的 "." 或缺省路径替换为物理隔离的工作区
+                args = [os.path.abspath(workspace_path)]
+                logger.info("📁 [隔离] 已将 filesystem 技能物理锁死在工作区: %s", workspace_path)
+            elif name == "filesystem":
+                # 回退：如果没有提供 workspace_path，默认使用当前目录（绝对路径锚定）
                 new_args = []
                 for arg in args:
                     if arg == ".":
@@ -116,36 +165,32 @@ class SkillManager:
                 env=env_config if env_config else None,
             )
 
-            # [AOS 2.2] 修复 stability：手动维护上下文生命周期，避免 Nested wait_for 导致的 anyio 作用域崩溃
-            ctx = stdio_client(server_params)
-            streams = await ctx.__aenter__()
-            
-            session = ClientSession(*streams)
-            await session.__aenter__()
+            # 启动隔离的 Runner Task
+            session_future = asyncio.get_event_loop().create_future()
+            stop_event = asyncio.Event()
+            runner_task = asyncio.create_task(
+                self._skill_runner(name, server_params, session_future, stop_event),
+                name=f"SkillRunner-{name}"
+            )
 
+            # 等待初始化完成并获取成果
             try:
-                # 仅在初始化阶段应用超时，这是最可能因为环境问题挂起的地方
-                await asyncio.wait_for(session.initialize(), timeout=60.0)
-            except asyncio.TimeoutError:
-                logger.error("🚫 技能 '%s' 初始化超时 (60s)", name)
-                await session.__aexit__(None, None, None)
-                await ctx.__aexit__(None, None, None)
-                return {"status": "error", "message": f"技能 '{name}' 加载超时，请确认依赖是否已安装"}
+                session, raw_tools = await session_future
             except Exception as e:
-                await session.__aexit__(None, None, None)
-                await ctx.__aexit__(None, None, None)
+                runner_task.cancel()
                 raise e
 
-            # 获取工具列表
-            mcp_tools = await session.list_tools()
-            openai_tools = convertMcpToolsToOpenai(mcp_tools.tools)
-            tool_names = [t.name for t in mcp_tools.tools]
+            openai_tools = convertMcpToolsToOpenai(raw_tools)
+            tool_names = [t.name for t in raw_tools]
 
+            # 注册到内存
             self.loaded_skills[name] = LoadedSkill(
                 name=name,
                 session=session,
                 tools=openai_tools,
-                context_manager=ctx,
+                runner_task=runner_task,
+                stop_event=stop_event,
+                last_args=args # 保存本次启动的参数，供下次校验使用
             )
 
             print(f"✅ [技能管理器] 技能 '{name}' 已加载，提供 {len(tool_names)} 个工具: {tool_names}")
@@ -157,25 +202,27 @@ class SkillManager:
 
     async def unload_skill(self, name: str) -> dict:
         """
-        安全卸载指定技能（关闭 MCP 进程，防止僵尸进程）。
-        使用 try/finally 确保资源释放。
+        安全卸载指定技能。
+        [AOS 2.7] 通过信号通知隔离任务优雅结束，确保 anyio 作用域正确闭合。
         """
         if name not in self.loaded_skills:
             return {"status": "not_loaded", "message": f"技能 '{name}' 未加载"}
 
         skill = self.loaded_skills[name]
         try:
-            # 关闭 MCP 会话
-            await skill.session.__aexit__(None, None, None)
-            # 关闭底层进程
-            if skill._context_manager:
-                await skill._context_manager.__aexit__(None, None, None)
+            # 发送停止信号并等待任务结束
+            skill.stop_event.set()
+            # 给予一定缓冲时间
+            await asyncio.wait_for(skill.runner_task, timeout=10.0)
             print(f"🔌 [技能管理器] 技能 '{name}' 已安全卸载")
+        except asyncio.TimeoutError:
+            logger.warning("技能 '%s' 卸载超时，强制取消任务", name)
+            skill.runner_task.cancel()
         except Exception as e:
-            logger.warning("技能 '%s' 卸载时出现警告: %s", name, e)
+            logger.warning("技能 '%s' 卸载时出现异常: %s", name, e)
         finally:
-            # 无论如何都从已加载列表中移除
-            del self.loaded_skills[name]
+            if name in self.loaded_skills:
+                del self.loaded_skills[name]
 
         return {"status": "unloaded"}
 

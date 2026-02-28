@@ -1,10 +1,10 @@
 skills:
-- always_loaded: true
+- always_loaded: false
   args:
   - -y
   - '@modelcontextprotocol/server-github'
   command: npx
-  description: GitHub API 操作：搜索仓库、读取文件、创建 Issue/PR 等
+  description: GitHub API 操作：搜索仓库、读取文件等
   env:
     GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
   name: github
@@ -16,13 +16,13 @@ skills:
   command: npx
   description: 本地 SQLite 数据库连接与 SQL 查询分析
   name: sqlite_analyzer
-- always_loaded: false
+- always_loaded: true
   args:
   - -y
   - '@modelcontextprotocol/server-filesystem'
   - .
   command: npx
-  description: 本地文件系统读写操作
+  description: 本地文件系统读写操作（道子的生存根基）
   name: filesystem
 - always_loaded: false
   args:
@@ -38,3 +38,10 @@ skills:
   command: npx
   description: ''
   name: vecmath
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-write'
+  command: npx
+  description: ''
+  name: write

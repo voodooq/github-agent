@@ -250,15 +250,16 @@ class UnifiedClient:
                         })
 
 
-    async def generate(self, tier: str, system_prompt: str, user_content: str, response_format: dict | None = None) -> str:
+    async def generate(self, tier: str, system_prompt: str = None, user_content: str = None, messages: list[dict] = None, response_format: dict | None = None) -> str:
         """
         根据层级决定调用哪个模型，支持回退。
         """
         import time
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ]
+        if messages is None:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ]
 
         # 动态决定优先级
         if not self.cloud_available and not self.local_available:
@@ -534,6 +535,8 @@ class McpAgent:
         self.token_budget = TokenBudget(max_tokens=TOKEN_BUDGET_LIMIT)
         # AOS 2.0: 动态技能管理器
         self.skill_manager = SkillManager()
+        # AOS 2.7+: 任务隔离区路径
+        self.workspace_path = None
 
         
     async def connect(self, session: ClientSession) -> list[str]:
@@ -879,7 +882,8 @@ class McpAgent:
         # AOS 2.0: 动态技能管理
         elif func_name == "load_skill":
             name = arguments.get("name", "")
-            result = await self.skill_manager.load_skill(name)
+            # [AOS 2.7+] 继承当前 Agent 的工作区约束
+            result = await self.skill_manager.load_skill(name, workspace_path=self.workspace_path)
             return json.dumps(result, ensure_ascii=False)
 
         elif func_name == "unload_skill":
@@ -1216,17 +1220,39 @@ class McpAgent:
 
     async def saveAllMemories(self):
         """保存所有记忆、清理沙盒、安全卸载技能、停止调度器"""
-        for context_id in list(self.memories.keys()):
-            self.saveMemory(context_id)
-        # AOS Phase 3: 停止后台调度器
+        print("\n💾 [AOS] 正在启动安全关闭序列...")
+        
+        # 1. 保存对话记忆
+        try:
+            for context_id in list(self.memories.keys()):
+                self.saveMemory(context_id)
+            logger.info("💾 所有对话记忆已持久化")
+        except Exception as e:
+            logger.error("🚫 记忆保存失败: %s", e)
+
+        # 2. 停止定时任务调度器
         if hasattr(self, "scheduler"):
-            await self.scheduler.stop()
-        # AOS 2.0: 安全卸载所有动态技能（防僵尸进程）
+            try:
+                await self.scheduler.stop()
+            except Exception as e:
+                logger.error("🚫 调度器停止失败: %s", e)
+
+        # 3. 卸载所有动态技能 (AOS 2.7 隔离卸载)
         if hasattr(self, "skill_manager"):
-            await self.skill_manager.unload_all()
-        # 退出清理 Docker 沙盒
+            try:
+                await self.skill_manager.unload_all()
+            except Exception as e:
+                logger.error("🚫 技能卸载失败: %s", e)
+
+        # 4. 清理 Docker 沙盒
         if hasattr(self, "docker_sandbox"):
-            self.docker_sandbox.cleanup_all()
+            try:
+                self.docker_sandbox.cleanup_all()
+                logger.info("🐳 Docker 沙盒已清理")
+            except Exception as e:
+                logger.error("🚫 Docker 清理失败: %s", e)
+
+        print("✨ [AOS] 关闭序列完成，资源已释放。\n")
         logger.info("💾 所有 Agent 记忆已持久化到 %s/", self.memory_dir)
 
     # ========== AOS 2.0: 自治编排引擎 ==========
