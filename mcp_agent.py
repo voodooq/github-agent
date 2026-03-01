@@ -1723,6 +1723,10 @@ class McpAgent:
         if workspace_path:
             self.workspace_path = workspace_path
             
+        # [AOS 4.8] 如果是 LOCAL 模式，强制 M2M 协议以减少模型冗余输出
+        if tier == "LOCAL":
+            self.unified_client.force_m2m_protocol = True
+            
         # 初始化或恢复针对该任务的记忆
         final_system_prompt = system_prompt
         if tier == "LOCAL":
