@@ -232,7 +232,25 @@ class Orchestrator:
 
     async def generate_dod(self, user_demand: str) -> list[str]:
         """
-        从用户需求自动生成可量化验收标准 (Definition of Done)。
+        # [AOS 5.0] 单兵作战模式 (Single-Agent Self-Maintenance)
+        # 针对系统维护类任务，直接由主 Agent 物理碾压，禁止 PM 开废会
+        maintenance_keywords = ["schedule", "task", "定时任务", "skill", "技能", "economy", "财务", "钱包", "balance", "curator", "安装"]
+        is_maintenance = any(kw in user_demand.lower() for kw in maintenance_keywords)
+        
+        if is_maintenance:
+            print(f"⚡ [AOS 5.0] 极速闭环：识别到系统维护任务，启动‘单兵作战’模式 (Bypass PM)...")
+            final_report = await self.agent.execute_with_tools(
+                system_prompt="你现在是系统主控官。直接调用工具完成任务，不准废话，不准招聘。完成后直接在黑板写结果。",
+                user_demand=user_demand,
+                tier="PREMIUM", # 维护任务通常重要，给足算力
+                context_id="maintenance_direct"
+            )
+            # Note: The original instruction had `yield` here, but `generate_dod` is not a generator.
+            # Assuming it should return a DoD list, or the maintenance task is self-contained.
+            # For now, we'll just return a simple DoD indicating the maintenance task was handled.
+            return [{"criterion": f"系统维护任务 '{user_demand}' 已完成", "assertion": {"type": "key_exists", "key": "maintenance_task_result"}}]
+
+        # 1. 拆解需求为 DoD (Definition of Done)
         使用 PREMIUM 模型确保分析质量。
         """
         print("📝 [项目经理] 正在生成验收标准 (DoD)...")
@@ -289,6 +307,28 @@ class Orchestrator:
         )
         if negatives:
             prompt += f"\n\n{negatives}"
+            # [AOS 5.0] Anti-Mocking：分析文本语义，防止“体面地摆烂”
+        # The following block seems to belong to a verifier/evaluator function, not generate_recruiting_plan.
+        # It's placed here as per instruction, but it will cause a NameError for `evidence_path` and incorrect return type.
+        # Assuming `evidence_path` would be passed in a real verifier context.
+        # For now, commenting it out or adapting it to fit `generate_recruiting_plan` is not feasible without more context.
+        # I will place the comment as requested, but the code block itself cannot be inserted here meaningfully.
+        # negative_keywords = ["无法", "失败", "报错", "error", "failed", "cannot", "could not", "找不到"]
+        # # 如果报告文件存在，但内容全是失败描述
+        # if evidence_path and os.path.exists(evidence_path): # evidence_path is not defined here
+        #     try:
+        #         with open(evidence_path, "r", encoding="utf-8") as f:
+        #             content = f.read(2000).lower()
+        #             if any(kw in content for kw in negative_keywords):
+        #                 return { # This return type is not compatible with generate_recruiting_plan
+        #                     "success": False,
+        #                     "reason": f"报告内容显示核心逻辑失败（物理演戏拦截）：{content[:100]}",
+        #                     "score": 0
+        #                 }
+        #     except:
+        #         pass
+
+        # analyze_prompt = f"""你是一个严苛的 AI 裁判。 # This line also seems out of place here.
 
         result = await self.client.generate(
             "PREMIUM", # [AOS 2.9] 规划环节：坚持云端精英，防止招聘幻觉
