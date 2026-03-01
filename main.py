@@ -56,7 +56,48 @@ def printHelp():
     print("  /help             显示此帮助")
     print("  /quit             退出并保存记忆")
     print("─" * 55)
-    print("  也可以直接输入自然语言对话\n")
+    print("  【AOS 7.0 冷热隔离协议】")
+    print("  - 直接输入: 闲聊/头脑风暴 (Cold Mode) - 🔒 禁用所有执行工具")
+    print("  - /auto <需求>: 启动自治任务 (Hot Mode) - 🚀 开启完整执行权限")
+    print("─" * 55)
+    print("\n")
+
+
+def extract_github_urls(text: str) -> list[str]:
+    """
+    從文本中提取所有 GitHub 倉庫地址
+    """
+    import re
+    pattern = r"https://github\.com/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+"
+    urls = re.findall(pattern, text)
+    # 去重並清洗（去除末尾的 .git 或斜槓）
+    seen = set()
+    cleaned_urls = []
+    for url in urls:
+        u = url.rstrip("/").replace(".git", "")
+        if u not in seen:
+            seen.add(u)
+            cleaned_urls.append(u)
+    return cleaned_urls
+
+
+def find_files_in_text(text: str) -> list[str]:
+    """
+    從文本中提取所有有效的本地文件路徑
+    """
+    import re
+    # 支持帶空格的路徑（通常用引號包裹），以及常見分隔符
+    # 先嘗試匹配被引號包裹的
+    quoted = re.findall(r'["\'](.*?\.md)["\']', text)
+    # 再按常見分隔符切分
+    parts = re.split(r'[\s,，;；]+', text)
+    
+    valid_files = []
+    for p in set(quoted + parts):
+        p = p.strip().strip('"\'')
+        if p and os.path.isfile(p):
+            valid_files.append(os.path.abspath(p))
+    return list(set(valid_files))
 
 
 async def main():
@@ -83,7 +124,8 @@ async def main():
     env = {**os.environ, **MCP_ENV} if MCP_ENV else None
     serverParams = StdioServerParameters(command=MCP_COMMAND, args=MCP_ARGS, env=env)
 
-    print(f"\n🚀 OpenClaw Hybrid Agent 已启动 [模式: {AGENT_MODE}]")
+    print(f"\n🚀 OpenClaw Hybrid Agent [AOS 7.0] 已启动 [模式: {AGENT_MODE}]")
+    print(f"🛡️  隔离协议: 已激活 (非 /auto 输入将锁定工具权限)")
     cloud_display = CLOUD_MODEL if agent.unified_client.cloud_available else "[已禁用 (未配置)]"
     local_display = LOCAL_MODEL if agent.unified_client.local_available else "[已禁用 (未配置)]"
     print(f"☁️  线上模型: {cloud_display}")
@@ -173,7 +215,10 @@ async def main():
                     continue
                 elif userInput == "/clear all":
                     agent.clearAllMemories()
-                    print("💥 所有 Agent 记忆已全量清除 (含文件)\n")
+                    # AOS 7.0: 物理级逻辑净空
+                    agent.blackboard.clear()
+                    agent.exp_engine.clear()
+                    print("💥 [物理重启] 所有记忆、黑板事实与经验库已全量清除 (含文件)\n")
                     continue
                 elif userInput.startswith("/clear "):
                     ctx_id = userInput[7:].strip()
@@ -192,51 +237,179 @@ async def main():
                     if not query:
                         print("⚠️  请输入搜索需求，例如: /search 轻量级 Python WAF\n")
                         continue
+                    
+                    # [AOS 7.1] 激活隔离工作区
+                    wsp = agent._setup_action_workspace("search")
+                    print(f"📁 [隔离] 已分配搜索沙盒: {wsp}\n")
+                    
+                    # [AOS 7.2] CFO 授權與 ROI 評估
+                    print("💰 [CFO] 正在評估搜索任務 ROI...")
+                    await asyncio.sleep(0.8)
+                    mode = agent.economy.get_survival_mode()
+                    tier = agent.economy.get_recommended_tier()
+                    print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.05 預算。")
+                    
                     userInput = SEARCH_PROMPT_TEMPLATE.format(user_query=query)
-                    print(f"🔍 正在搜索: {query} [☁️ 云端模式]\n")
+                    print(f"🔍 正在搜索: {query} [🧠 {tier} 模式]\n")
+                    
                     # 搜索需要 MCP 工具调用，必须走云端
                     try:
                         print(f"\n🤖 Agent: ", end="", flush=True)
+                        full_report = ""
                         async for chunk in agent.chat(userInput, tier="PREMIUM"):
                             print(chunk, end="", flush=True)
+                            full_report += chunk
                         print("\n")
+                        
+                        # [AOS 7.2] 提取結構化 JSON 數據
+                        try:
+                            import json
+                            json_match = re.search(r"```json\s*(\[.*?\])\s*```", full_report, re.DOTALL)
+                            if json_match:
+                                json_data = json_match.group(1)
+                                ranking_path = os.path.join(wsp, "ranking_data.json")
+                                with open(ranking_path, "w", encoding="utf-8") as f:
+                                    f.write(json_data)
+                                print(f"📊 [數據] 結構化排名已導出: {ranking_path}")
+                        except Exception as e:
+                            logger.error("JSON 提取失敗: %s", e)
+
+                        # [AOS 7.1] 物理归档报告
+                        try:
+                            report_path = os.path.join(wsp, "search_report.md")
+                            with open(report_path, "w", encoding="utf-8") as f:
+                                f.write(full_report)
+                            print(f"💾 完整報告已自動保存到: {report_path}\n")
+                        except: pass
+                        
                     except Exception as e:
                         logger.error("Agent 处理异常: %s", e)
                         print(f"\n❌ 错误: {e}\n")
                     continue
                 elif userInput.startswith("/analyze "):
-                    # 快捷分析：将 URL 包装为分析指令，强制云端（需要工具调用）
-                    repoUrl = userInput[9:].strip()
-                    if not repoUrl:
-                        print("⚠️  请输入仓库地址，例如: /analyze https://github.com/owner/repo\n")
+                    # 快捷分析：支持 URL、本地文件路徑或混合文本
+                    original_input = userInput[9:].strip()
+                    if not original_input:
+                        print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
                         continue
-                    userInput = ANALYZE_PROMPT_TEMPLATE.format(repo_url=repoUrl)
-                    print(f"📊 正在分析: {repoUrl} [☁️ 云端模式]\n")
-                    # 分析需要 MCP 工具调用，必须走云端
-                    try:
-                        print(f"\n🤖 Agent: ", end="", flush=True)
-                        async for chunk in agent.chat(userInput, tier="PREMIUM"):
+                    
+                    # 1. 提取直接給出的 URL
+                    target_urls = extract_github_urls(original_input)
+                    
+                    # 2. 尋找文件並提取其中的 URL
+                    found_files = find_files_in_text(original_input)
+                    if found_files:
+                        print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
+                        for fpath in found_files:
+                            try:
+                                with open(fpath, "r", encoding="utf-8") as f:
+                                    content = f.read()
+                                f_urls = extract_github_urls(content)
+                                target_urls.extend(f_urls)
+                                print(f"  ✅ {os.path.basename(fpath)}: 找到 {len(f_urls)} 個地址")
+                            except Exception as e:
+                                print(f"  ❌ 讀取 {fpath} 失敗: {e}")
+                    
+                    # 去重
+                    target_urls = list(dict.fromkeys(target_urls))
+                    
+                    if not target_urls:
+                        print(f"⚠️  未找到任何有效的 GitHub 地址。輸入內容: \"{original_input[:50]}...\"\n")
+                        continue
+
+                    print(f"🚀 開始準備分析 {len(target_urls)} 個項目...\n")
+
+                    # [AOS 7.1] 激活隔離工作區
+                    wsp = agent._setup_action_workspace("analyze")
+                    print(f"📁 [隔離] 已分配分析沙盒: {wsp}\n")
+                    
+                    all_reports = []
+                    for url in target_urls:
+                        print(f"📊 正在分析: {url} [☁️ 雲端模式]\n")
+                        prompt = ANALYZE_PROMPT_TEMPLATE.format(repo_url=url)
+                        try:
+                            print(f"\n🤖 Agent ({url}): ", end="", flush=True)
+                            repo_report = f"## Analysis for {url}\n"
+                            async for chunk in agent.chat(prompt, tier="PREMIUM"):
+                                print(chunk, end="", flush=True)
+                                repo_report += chunk
+                            all_reports.append(repo_report)
+                            print("\n" + "-"*30)
+                        except Exception as e:
+                            logger.error(f"分析 {url} 異常: {e}")
+                            print(f"\n❌ 錯誤: {e}\n")
+
+                    # 如果有多個報告，嘗試生成一個對比總結
+                    if len(all_reports) > 1:
+                        print("\n⚖️ 正在生成多項目對比總結...")
+                        comparison_prompt = f"請對以下多個項目的分析結果進行縱向對比，列出它們的異同點、各自優劣勢，並給出選型建議：\n\n" + "\n\n".join(all_reports)
+                        full_content = ""
+                        async for chunk in agent.chat(comparison_prompt, tier="PREMIUM", no_tools=True):
                             print(chunk, end="", flush=True)
-                        print("\n")
-                    except Exception as e:
-                        logger.error("Agent 处理异常: %s", e)
-                        print(f"\n❌ 错误: {e}\n")
+                            full_content += chunk
+                        final_report = comparison_prompt + "\n\n# 對比總結\n" + full_content
+                    else:
+                        final_report = all_reports[0] if all_reports else ""
+
+                    # [AOS 7.1] 物理歸檔
+                    try:
+                        report_path = os.path.join(wsp, "analyze_report.md")
+                        with open(report_path, "w", encoding="utf-8") as f:
+                            f.write(final_report)
+                        print(f"\n💾 完整的分析報告已自動保存到: {report_path}\n")
+                    except: pass
                     continue
                 elif userInput.startswith("/review "):
-                    # 专家团评审：自适应加载 -> 混合算力评审
-                    repoUrl = userInput[8:].strip()
-                    if not repoUrl:
-                        print("⚠️  请输入仓库地址，例如: /review https://github.com/owner/repo\n")
+                    # 專家團評審：支持 URL、本地文件或混合文本
+                    original_input = userInput[8:].strip()
+                    if not original_input:
+                        print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
                         continue
+                    
+                    # 1. 直接提取 URL
+                    target_urls = extract_github_urls(original_input)
+                    
+                    # 2. 尋找文件並提取 URL
+                    found_files = find_files_in_text(original_input)
+                    if found_files:
+                        print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
+                        for fpath in found_files:
+                            try:
+                                with open(fpath, "r", encoding="utf-8") as f:
+                                    content = f.read()
+                                f_urls = extract_github_urls(content)
+                                target_urls.extend(f_urls)
+                                print(f"  ✅ {os.path.basename(fpath)}: 找到 {len(f_urls)} 個地址")
+                            except Exception as e:
+                                print(f"  ❌ 讀取 {fpath} 失敗: {e}")
+
+                    # 去重
+                    target_urls = list(dict.fromkeys(target_urls))
+
+                    if not target_urls:
+                        print(f"⚠️  未找到任何有效的 GitHub 地址。\n")
+                        continue
+
                     try:
-                        # 触发混合算力专家团评审 (内部包含数据加载与脱水)
-                        print(f"\n🤖 专家团综合评审报告：\n", end="", flush=True)
-                        async for chunk in agent.multiAgentReview(repoUrl):
+                        # 觸發混合算力專家團評審 (支持單個或多個地址)
+                        print(f"\n🤖 專家團綜合評審報告 (共 {len(target_urls)} 個項目)：\n", end="", flush=True)
+                        full_report = ""
+                        async for chunk in agent.multiAgentReview(target_urls):
                             print(chunk, end="", flush=True)
+                            full_report += chunk
                         print("\n")
+                        
+                        # [AOS 7.1] 物理歸檔報告
+                        try:
+                            report_path = os.path.join(agent.workspace_path, "review_report.md")
+                            with open(report_path, "w", encoding="utf-8") as f:
+                                f.write(full_report)
+                            print(f"💾 評審報告已自動保存到: {report_path}\n")
+                        except: pass
+                        
                     except Exception as e:
-                        logger.error("评审流程异常: %s", e)
-                        print(f"\n❌ 错误: {e}\n")
+                        logger.error("評審流程異常: %s", e)
+                        print(f"\n❌ 錯誤: {e}\n")
                     continue
                 elif userInput.startswith("/deploy "):
                     # 一键部署：自适应加载 -> 自动 Docker 配置 -> 沙盒运行
@@ -279,13 +452,6 @@ async def main():
                         print("⚠️  请输入任务需求，例如: /auto 找到最火的 3 个 Python 量化框架\n")
                         continue
                     
-                    # AOS 3.3: 基因共鸣 (Gene Resonance) 预热加载
-                    matched_skills = agent.skill_manager.match_genes(demand)
-                    for sname in matched_skills:
-                        if sname not in agent.skill_manager.loaded_skills:
-                            print(f"🧬 [基因共鸣] 识别到任务相关的沉睡技能，自动唤醒: 🟢 {sname}")
-                            await agent.skill_manager.load_skill(sname, workspace_path=agent.workspace_path)
-
                     try:
                         async for chunk in agent.autonomous_execute(demand):
                             print(chunk, end="", flush=True)
@@ -371,25 +537,43 @@ async def main():
                     print("─" * 60 + "\n")
                     continue
 
-                # Agent 日常对话：根据 AGENT_MODE 决定路由策略
-                # TURBO 模式下日常对话也走云端（支持工具调用）
-                chat_tier = "PREMIUM" if AGENT_MODE == "TURBO" else "LOCAL"
+                # [AOS 7.0] Cold-Hot Isolation Protocol (冷热隔离协议)
+                # 彻底摒弃语义分诊，将主权交还给用户。
                 
-                # AOS 3.3: 基因共鸣 (Gene Resonance) 预热加载
-                matched_skills = agent.skill_manager.match_genes(userInput)
-                for sname in matched_skills:
-                    if sname not in agent.skill_manager.loaded_skills:
-                        print(f"🧬 [基因共鸣] 识别到相关需求，自动唤醒技能: 🟢 {sname}")
-                        await agent.skill_manager.load_skill(sname, workspace_path=agent.workspace_path)
-
-                try:
-                    print(f"\n🤖 Agent: ", end="", flush=True)
-                    async for chunk in agent.chat(userInput, tier=chat_tier):
-                        print(chunk, end="", flush=True)
-                    print("\n")
-                except Exception as e:
-                    logger.error("Agent 处理异常: %s", e)
-                    print(f"\n❌ 错误: {e}\n")
+                # 1. 社交词/超短内容预处理
+                social_words = ["hi", "hello", "你好", "你是谁", "help", "帮助", "谢谢", "thanks"]
+                is_social = userInput.lower() in social_words or len(userInput) < 5
+                
+                # 2. 隔离路由
+                if is_social:
+                    # 极速回复，不进记忆
+                    print(f"\n🤖 Agent: 你好呀，我是道子！随时听候吩咐。如果是执行类任务，请使用 /auto 开头。")
+                    continue
+                
+                # 显式 Hot Mode: 必须以 /auto 开头
+                if userInput.startswith("/auto "):
+                    demand = userInput[6:].strip()
+                    print(f"\n🚀 [Hot Mode] 识别到显式自治指令，启动刺客模式...\n")
+                    try:
+                        async for chunk in agent.autonomous_execute(demand):
+                            print(chunk, end="", flush=True)
+                        print("\n")
+                    except Exception as e:
+                        logger.error("自治任务失败: %s", e)
+                        print(f"\n❌ 执行失败: {e}\n")
+                
+                # 隐式 Cold Mode: 针对普通对话，锁定无工具权限
+                else:
+                    print(f"\n🤖 Agent: [Cold Mode] ", end="", flush=True)
+                    try:
+                        # [AOS 7.0] 物理限权：no_tools=True 确保 AI 只有嘴，没有手
+                        chat_tier = "PREMIUM" if AGENT_MODE == "TURBO" else "LOCAL"
+                        async for chunk in agent.chat(userInput, tier=chat_tier, no_tools=True):
+                            print(chunk, end="", flush=True)
+                        print("\n")
+                    except Exception as e:
+                        logger.error("对话异常: %s", e)
+                        print(f"\n❌ 处理失败: {e}\n")
 
     # 退出前保存所有记忆
     await agent.saveAllMemories()

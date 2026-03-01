@@ -168,3 +168,9 @@ class ExperienceEngine:
             }
             for key, exp in self.experiences.items()
         ]
+
+    def clear(self):
+        """[AOS 7.0] 物理级经验清除：强制归零。"""
+        self.experiences = {}
+        self._save()
+        logger.info("💥 [经验引擎] 经验库已物理归零。")

@@ -231,6 +231,23 @@ class Scheduler:
         print(f"💥 [调度器] 已清理所有任务 (共 {count} 个)")
         return {"status": "cleared", "count": count}
 
+    def get_state_snapshot(self) -> str:
+        """
+        [AOS 6.2] 获取当前数据库的状态指纹（用于物理审计）。
+        返回所有启用任务的任务 ID 拼接后的哈希或简单描述。
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute("SELECT task_id, last_run, run_count FROM scheduled_tasks WHERE enabled = 1 ORDER BY task_id")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        # 简单指纹：(任务数, 任务ID列表的Hash-like字符串)
+        if not rows:
+            return "empty"
+        
+        fingerprint = "|".join([f"{r[0]}:{r[1]}:{r[2]}" for r in rows])
+        return f"count:{len(rows)}|fp:{fingerprint}"
+
     def list_tasks(self) -> list[dict]:
         """列出所有定时任务"""
         result = []

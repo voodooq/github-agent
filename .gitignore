@@ -2,6 +2,7 @@
 .env
 .venv/
 Workspace/
+sandbox_workspace/
 memory.json
 memories/
 *.log

@@ -19,7 +19,7 @@ LOCAL_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "ollama")
 LOCAL_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:11434/v1")
 LOCAL_MODEL = os.getenv("LOCAL_LLM_MODEL", "GLM-PureGPU")
 
-# 综合模式配置
+# 综合模式配置 (AUTO, TURBO, SEQUENTIAL, CLOUD)
 AGENT_MODE = os.getenv("AGENT_MODE", "AUTO").upper()
 
 # MCP 服务端配置

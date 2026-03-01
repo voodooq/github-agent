@@ -72,7 +72,12 @@ class Blackboard:
         }
         # 🛡️ 防御式日志：确保 value 是字符串才切片
         display_log = value[:100] if isinstance(value, str) else str(value)[:100]
-        logger.info("📋 [黑板] %s 写入: %s = %s", author, key, display_log)
+        
+        # [AOS 5.1] 静默 CFO 记录：针对 CFO 写入黑板的操作降低日至级别
+        if author == "CFO":
+            logger.debug("📋 [黑板] %s 写入: %s = %s", author, key, display_log)
+        else:
+            logger.info("📋 [黑板] %s 写入: %s = %s", author, key, display_log)
 
         # 唤醒等待该 key 的所有订阅者
         if key in self._events:

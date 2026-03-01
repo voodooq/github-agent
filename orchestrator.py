@@ -586,24 +586,74 @@ class Orchestrator:
         return False
 
     async def verify_results(self, dod: list, results: dict[str, str]) -> dict:
-        # [AOS 5.3] Zero-Intelligence Verifier (去智能化物理验收)
+        # [AOS 5.4] Truth-Driven Verifier (真值驱动验收)
         if self.current_mission_plan.get("plan_summary") == "自维护单兵任务":
-            logger.info("⚡ [AOS 5.3] 正在应用极速验收协议 (Zero-Intelligence Pass)...")
+            logger.info("⚡ [AOS 5.4] 正在应用极速验证：物理真值审计 (Truth-Driven Pass)...")
             
-            # 1. 探测物理截断信号
+            # 1. 物理证据链审计 (SQLite 直接对齐)
+            # 如果是清理类任务，直接查库
+            dod_str = str(dod).lower()
+            if any(kw in dod_str for kw in ["clear", "cleanup", "清空", "清理", "delete"]):
+                try:
+                    import sqlite3
+                    db_path = os.path.join(os.path.dirname(__file__), "memories", "scheduler.db")
+                    if os.path.exists(db_path):
+                        conn = sqlite3.connect(db_path)
+                        cursor = conn.cursor()
+                        # 检查 tasks 表是否为空
+                        cursor.execute("SELECT count(*) FROM tasks")
+                        count = cursor.fetchone()[0]
+                        conn.close()
+                        if count == 0:
+                            logger.info("✅ [AOS 5.4 物理真值] 数据库任务已归零，判定 PASS")
+                            return {"overall": "PASS", "details": [], "correction_hint": "物理审计通过：数据库已处于净空状态。"}
+                except Exception as e:
+                    logger.warning("⚠️ 物理审计失败: %s", e)
+
+            # 2. 探测物理截断信号
             for role, res_text in results.items():
+                # [AOS 5.5] Fake Detection: 探测伪装执行
+                fake_indicators = ["echo ", "crontab ", "schtasks ", "manual set"]
+                # 如果回复中出现了伪装关键词，但没有物理成功信号标识，判定为冒充
+                if any(fi in res_text.lower() for fi in fake_indicators):
+                    if not any(sig in res_text for sig in ["⏰ [调度器]", "💥 [调度器]", "INSTANT_KILL_PASS", "TASK_COMPLETED"]):
+                        logger.error("❌ [AOS 5.5] 发现伪装执行迹象：模型试图用文本建议代替工具调用。")
+                        return {"overall": "FAIL", "details": [], "correction_hint": "🚨 严禁提供手动建议！你必须调用工具（如 add_scheduled_task）来完成物理操作，禁止使用 echo 或文本描述。"}
+
                 if "INSTANT_KILL_PASS" in res_text or "TASK_COMPLETED" in res_text:
-                    logger.info("✅ [AOS 5.3] 探测到物理成功信号，直接判 PASS")
+                    logger.info("✅ [AOS 5.3/5.4/5.5] 探测到物理成功或截断信号，直接判 PASS")
                     return {"overall": "PASS", "details": [], "correction_hint": "物理操作已闭环。"}
 
-            # 2. 物理收敛信号判定 (含备份词)
+            # 3. [AOS 5.7] Apology Check (拒收道歉信)
+            for role, res_text in results.items():
+                apology_keywords = ["我尝试了", "无法", "但是", "但目前", "抱歉", "sorry", "unfortunately", "无法获取"]
+                # 如果回复中包含道歉词且没有成功信号，直接判摆烂
+                if any(ak in res_text for ak in apology_keywords):
+                    if not any(sig in res_text for sig in ["⏰ [调度器]", "💥 [调度器]", "INSTANT_KILL_PASS", "TASK_COMPLETED", "✅"]):
+                        logger.error("❌ [AOS 5.7] 发现‘礼貌性失败’迹象：模型在用道歉掩盖执行失败。")
+                        return {"overall": "FAIL", "details": [], "correction_hint": "🚨 拒绝道歉！我不需要解释为什么失败，我只需要物理结果。请重新检查工具调用参数并确保执行成功。"}
+
+            # 4. [AOS 6.0] Universal Physical Delta Audit for Blitz
+            # 对于非纯维护/清空类的单兵任务，强制检查物理工作区是否有产出
+            if not any(kw in dod_str for kw in ["clear", "cleanup", "清空", "清理", "delete"]):
+                try:
+                    if self.workspace_path and os.path.exists(self.workspace_path):
+                        # 扫描目录（不含子目录及隐藏文件）
+                        files = [f for f in os.listdir(self.workspace_path) if os.path.isfile(os.path.join(self.workspace_path, f)) and not f.startswith(".")]
+                        if not files:
+                            logger.error("❌ [AOS 6.0] 物理审计失败：单兵任务未产生任何物理文件产出。")
+                            return {"overall": "FAIL", "details": [], "correction_hint": "物理审计失败：Blitz 模式下未发现任何物理文件产出。我拒绝接受纯文本的虚假成功报告，必须有物理记录。"}
+                except Exception as e:
+                    logger.warning("⚠️ 物理增量审计异常: %s", e)
+
+            # 5. 物理收敛信号判定 (含备份词)
             found_stop = False
             for role, res_text in results.items():
                 if any(kw in res_text for kw in ["强行收敛终止", "共 0 个", "清理完毕", "0 tasks found", "处于最新状态"]):
                     found_stop = True
                     break
             if found_stop:
-                logger.info("✅ [AOS 5.2] 物理状态已收敛，判定 PASS")
+                logger.info("✅ [AOS 5.2/5.4/5.7] 物理状态已收敛，判定 PASS")
                 return {"overall": "PASS", "details": [], "correction_hint": "物理目标已达成，单兵任务自动结项。"}
 
         pre_check_results = []
@@ -809,6 +859,35 @@ class Orchestrator:
         except Exception as e:
             logger.error("经验蒸馏失败: %s", e)
 
+    async def classify_intent(self, demand: str) -> str:
+        """
+        [AOS 6.0] 战术分诊器：判断任务是 L1_BLITZ 还是 L2_EXPERT。
+        极速前额叶：优先词法匹配，兜底 LLM 语义判断。
+        """
+        # 1. 极速词法预检
+        blitz_keywords = [
+            "schedule", "task", "定时", "提醒", "remind", "reminder", 
+            "fetch", "抓取", "获取", "新闻", "status", "check", "wallet", "balance",
+            "clear", "cleanup", "清空", "清理", "install", "安装", "新闻"
+        ]
+        if any(kw in demand.lower() for kw in blitz_keywords):
+            return "L1_BLITZ"
+            
+        # 2. 语义分诊 (使用 LOCAL 模式，追求极速)
+        prompt = f"请判断输入需求是否属于线性/原子任务（L1_BLITZ）或复杂/架构/跨领域任务（L2_EXPERT）。\n需求: \"{demand}\"\n直接输出分类ID，禁止废话。"
+        try:
+            # 这里的 agent 是 Orchestrator 的成员变量
+            resp = await self.agent.unified_client.generate(
+                tier="LOCAL", 
+                messages=[{"role": "user", "content": prompt}]
+            )
+            if "L1_BLITZ" in resp.upper():
+                return "L1_BLITZ"
+        except:
+            pass
+            
+        return "L2_EXPERT"
+
     async def run_mission(
         self,
         user_demand: str,
@@ -817,53 +896,109 @@ class Orchestrator:
     ):
         """
         完整的自治任务执行循环。
-
-        Yields 实时进度文本给用户。
-        流程: DoD → 招聘 → 并发执行 → 验收 → (失败则重试) → 交付
         """
-        yield f"🚀 [AOS 自治模式] 收到需求: {user_demand}\n"
+        yield f"🚀 [AOS 6.0] 战术分诊启动：正在评估任务复杂度...\n"
 
-        # [AOS 5.0] 单兵作战模式 (Single-Agent Self-Maintenance)
-        # 针对系统维护类任务，直接由主 Agent 物理碾压，禁止 PM 开废会
-        maintenance_keywords = ["schedule", "task", "定时任务", "skill", "技能", "economy", "财务", "钱包", "balance", "curator", "安装", "清空", "清理"]
-        is_maintenance = any(kw in user_demand.lower() for kw in maintenance_keywords)
-        if is_maintenance:
-            yield f"⚡ [AOS 5.0] 极速闭环：识别到系统维护任务，启动‘单兵作战’模式 (Bypass PM)...\n"
-            # 物理路径锁定
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.workspace_path = os.path.join(os.getcwd(), "Workspace", f"maint_{timestamp}")
-            os.makedirs(self.workspace_path, exist_ok=True)
+        # [AOS 6.0] 自动分诊：取代固定的关键词匹配
+        intent = await self.classify_intent(user_demand)
+        is_blitz_mode = (intent == "L1_BLITZ")
+        
+        if is_blitz_mode:
+            yield f"🚀 [AOS 6.0] 物理独裁：识别为 Blitz 线性任务 (L1)，强制锁定‘单兵突击’，拒绝会议。\n"
+            # [AOS 7.1] 调用 Agent 的集中隔离逻辑
+            if self.agent:
+                self.workspace_path = self.agent._setup_action_workspace("blitz")
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.workspace_path = os.path.join(os.getcwd(), "Workspace", "Blitz", f"blitz_{timestamp}")
+                os.makedirs(self.workspace_path, exist_ok=True)
             if self.agent:
                 self.agent.workspace_path = self.workspace_path
 
-            self.current_mission_plan = {"plan_summary": "自维护单兵任务"} # [AOS 5.2] 对齐 Verifier
+            self.current_mission_plan = {"plan_summary": "自维护单兵任务"} # 对齐 Verifier
             
+            # [AOS 6.4] Full-Spectrum Sniffing: 不再从阉割版中筛选，而是从全量工具库嗅探
+            available_tools = self.agent._get_combined_tools(slim=False)
+            targeted_tools = []
+            
+            # 1. 调度类
+            if any(kw in user_demand.lower() for kw in ["schedule", "task", "定时", "提醒"]):
+                # [AOS 6.4] 强制补装 write_file，作为物理收据生成器
+                st = ["add_scheduled_task", "list_scheduled_tasks", "cancel_scheduled_task", "clear_all_scheduled_tasks", "write_file", "search_skills"]
+                targeted_tools.extend([t for t in available_tools if t["function"]["name"] in st])
+            
+            # 2. 抓取/新闻类
+            if any(kw in user_demand.lower() for kw in ["news", "fetch", "抓取", "获取"]):
+                ft = ["http_fetch", "read_url_content", "search_web", "write_file"]
+                targeted_tools.extend([t for t in available_tools if t["function"]["name"] in ft])
+            
+            # 3. 财务类
+            if any(kw in user_demand.lower() for kw in ["wallet", "balance", "财务", "钱包"]):
+                wt = ["cfo_report", "read_blackboard", "write_file"]
+                targeted_tools.extend([t for t in available_tools if t["function"]["name"] in wt])
+
+            # 默认补全：如果没匹配到，给全量 slim 工具（AOS 5.6 逻辑降级）
+            if not targeted_tools:
+                targeted_tools = available_tools
+
+            # [AOS 6.3] 物理隔离：审计前记录初始状态
+            initial_files = os.listdir(self.workspace_path) if os.path.exists(self.workspace_path) else []
+            snapshot_before = self.agent.scheduler.get_state_snapshot() if hasattr(self.agent, "scheduler") else "none"
+            bb_hash_before = self.blackboard.get_snapshot_hash()
+
             final_report = await self.agent.execute_with_tools(
-                system_prompt="你现在是系统主控官。直接调用工具完成任务，不准废话，不准招聘。若观察到目标已达成或环境已处于目标状态（例如清理已完成、文件已存在且正确），必须立即停止并输出 'TASK_COMPLETED'。禁止重复执行已经产生结果的操作。",
+                system_prompt=(
+                    "你现在是 AOS 6.3 战时独裁官。禁止输出任何文字解释！禁止输出伪代码块！禁止询问意见！\n"
+                    "你必须通过【DB + FS】双重审计：\n"
+                    "1. 调用工具完成物理目标（如 add_scheduled_task）。\n"
+                    "2. 必须同时调用 write_file 在工作区生成一个 done.txt，内容包含任务详情，作为物理收据。\n"
+                    "你只有 3 轮机会（含拦截重算）。如果敢说废话而不调用工具，你将被视为‘逻辑坏疽’。"
+                ),
                 user_demand=user_demand,
                 tier="PREMIUM", 
-                context_id="maintenance_direct",
-                workspace_path=self.workspace_path
+                context_id="blitz_direct",
+                workspace_path=self.workspace_path,
+                max_iterations=3, # [AOS 6.3] 增加一轮，确保 Dual-Check 逻辑有足够空间尝试
+                tools=targeted_tools
             )
             yield f"\n📊 【单兵任务报告】\n{final_report}\n"
             
             # [AOS 5.2] 调用裁判验证物理收敛
             yield "⚖️ AI 裁判正在进行物理收敛核验...\n"
-            verdict = await self.verify_results(["物理操作已达成"], {"master": final_report})
             
-            if verdict.get("overall") == "PASS":
-                yield f"✅ [AOS 5.2] 物理闭环成功。工作区: {self.workspace_path}\n"
+            # [AOS 6.3] 物理准星：审计双重校验 (Audit Dual-Check)
+            is_maintenance = any(kw in user_demand.lower() for kw in ["schedule", "clear", "task", "提醒", "定时"])
+            db_snapshot_after = self.agent.scheduler.get_state_snapshot() if hasattr(self.agent, "scheduler") else "none"
+            
+            has_fs_delta = len(self.agent._get_workspace_delta(initial_files)) > 0
+            has_db_delta = snapshot_before != db_snapshot_after
+            has_bb_delta = self.blackboard.get_snapshot_hash() != bb_hash_before
+            
+            has_physical_evidence = has_fs_delta or has_db_delta or has_bb_delta
+            
+            if is_maintenance:
+                # [AOS 6.3] 强制双重收据：DB 变动且有文件产出
+                if not (has_db_delta and has_fs_delta):
+                    logger.error("❌ [AOS 6.3] 审计双检失败：维护任务缺少 DB 或 FS (done.txt) 收据。")
+                    yield f"❌ [AOS 6.3] 审计双检失败：维护任务必须同时产生数据库变更和物理文件收据(done.txt)。当前状态: DB={has_db_delta}, FS={has_fs_delta}。\n"
+                else:
+                    yield f"✅ [AOS 6.3] 双重审计通过。DB 指纹位移 + FS 物理回执已确认。\n"
+            elif intent == "L1_BLITZ" and not has_fs_delta:
+                 logger.error("❌ [AOS 6.0] 物理审计失败：单兵/自动分诊任务未产生物理文件产出。")
+                 yield f"❌ [AOS 6.0] 物理审计失败：检测到执行指令，但物理审计未发现文件增量。拒绝接受文本报告。\n"
             else:
-                yield f"❌ [AOS 5.2] 物理校检未完全通过: {verdict.get('correction_hint', '')}\n"
+                yield f"✅ [AOS 6.2] 物理闭环成功。审计维度: {'DB ' if has_db_delta else ''}{'FS ' if has_fs_delta else ''}{'BB' if has_bb_delta else ''}\n"
             return
 
         # 0. 为本次任务创建物理工作区沙箱 (AOS 2.7+)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # AOS 2.8.2: 进一步精简路径，仅保留时间戳，极致压缩路径长度防止写入失败
-        self.workspace_path = os.path.join(os.getcwd(), "Workspace", f"task_{timestamp}")
-        os.makedirs(self.workspace_path, exist_ok=True)
+        # [AOS 7.1] 调用 Agent 的集中隔离逻辑
         if self.agent:
-            self.agent.workspace_path = self.workspace_path
+            self.workspace_path = self.agent._setup_action_workspace("auto")
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.workspace_path = os.path.join(os.getcwd(), "Workspace", "Auto", f"auto_{timestamp}")
+            os.makedirs(self.workspace_path, exist_ok=True)
+            
         yield f"📁 [隔离] 已分配专属工作区: {self.workspace_path}\n"
         
         # [AOS 4.7] 根参数锚定 (URL-Anchor)

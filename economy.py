@@ -69,18 +69,18 @@ class EconomyEngine:
             self._set_balance(env_bal)
             self._set_stored_initial(env_bal)
             self._record_transaction("revenue", env_bal, "天使轮种子资金注入")
-            logger.info("💰 [CFO] 首次启动，注入种子资金: $%.2f", env_bal)
+            logger.debug("💰 [CFO] 首次启动，注入种子资金: $%.2f", env_bal)
         elif abs(last_initial - env_bal) > 0.0001:
             # 老板手动改了初始值，视为追加或重置
             self.balance = env_bal
             self._set_balance(env_bal)
             self._set_stored_initial(env_bal)
             self._record_transaction("inject", env_bal, "手动重置初始资金")
-            logger.info("🔄 [CFO] 检测到初始金额变更，已重置余额为: $%.2f", env_bal)
+            logger.debug("🔄 [CFO] 检测到初始金额变更，已重置余额为: $%.2f", env_bal)
         else:
             # 正常重启，继承数据库里的真实余额
             self.balance = existing_balance if existing_balance is not None else env_bal
-            logger.info("💾 [CFO] 继承持久化余额: $%.4f", self.balance)
+            logger.debug("💾 [CFO] 继承持久化余额: $%.4f", self.balance)
 
         # 当日消费追踪
         self.today_spend = self._get_today_spend()
@@ -211,7 +211,7 @@ class EconomyEngine:
         self._set_balance(self.balance)
         self._record_transaction("revenue", amount, description)
         self.sync_blackboard()
-        print(f"💵 [CFO] 收入 +${amount:.2f}: {description} | 余额: ${self.balance:.2f}")
+        logger.debug("💵 [CFO] 收入 +$%s: %s | 余额: $%s", amount, description, self.balance)
 
     def inject_funds(self, amount: float) -> None:
         """老板手动注资"""
@@ -219,7 +219,7 @@ class EconomyEngine:
         self._set_balance(self.balance)
         self._record_transaction("inject", amount, "老板注资")
         self.sync_blackboard()
-        print(f"💰 [CFO] 老板注资 +${amount:.2f} | 新余额: ${self.balance:.2f}")
+        logger.debug("💰 [CFO] 老板注资 +$%s | 新余额: $%s", amount, self.balance)
 
     # ========== Token 成本估算 ==========
 

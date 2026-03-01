@@ -360,16 +360,18 @@ class UnifiedClient:
         if not self.cloud_available and not self.local_available:
             raise Exception("未配置任何可用模型（云端或本地）")
 
+        # [AOS 2.8.7] 动态层级调整
+        effective_tier = tier
         if self.agent_mode == "MANUAL":
             order = ["LOCAL"]  # 手动模式强迫症，禁止上云
+        elif self.agent_mode == "CLOUD":
+            order = ["CLOUD"]  # 仅云端模式，禁止回退到本地
         else:  # AUTO 模式
-            # [AOS 2.8.7] 动态层级调整
-            effective_tier = tier
             if self.economy and not force_tier:
                 recommended = self.economy.get_recommended_tier()
                 # 如果财务推荐 LOCAL，而请求是 PREMIUM，则尝试降级
                 if recommended == "LOCAL" and tier == "PREMIUM":
-                    print("💰 [CFO] 处于生存模式，强制将 PREMIUM 请求降级为 LOCAL")
+                    logger.info("💰 [CFO] 处于生存模式，强制将 PREMIUM 请求降级为 LOCAL")
                     effective_tier = "LOCAL"
 
             if effective_tier in ("PREMIUM", "LONG_CONTEXT"):
@@ -419,7 +421,7 @@ class UnifiedClient:
                     if self.economy and not force_tier:
                         approval = self.economy.should_approve_cloud_call(estimated_cost=0.005)
                         if not approval["approved"]:
-                            print(f"💰 [CFO] 拒绝云端请求: {approval['reason']}")
+                            logger.info("💰 [CFO] 拒绝云端请求: %s", approval['reason'])
                             if "LOCAL" in order and order.index("LOCAL") > order.index("CLOUD"):
                                 logger.info("尝试本地回退...")
                                 continue
@@ -496,12 +498,14 @@ class UnifiedClient:
         if self.economy and not force_tier:
             recommended = self.economy.get_recommended_tier()
             if recommended == "LOCAL" and tier == "PREMIUM":
-                print("💰 [CFO] 处于生存模式，主循环被强制降级为 LOCAL")
+                logger.info("💰 [CFO] 处于生存模式，主循环被强制降级为 LOCAL")
                 effective_tier = "LOCAL"
 
         if not self.cloud_available:
             order = ["LOCAL"]
         elif not self.local_available:
+            order = ["CLOUD"]
+        elif self.agent_mode == "CLOUD":
             order = ["CLOUD"]
         elif self.agent_mode == "TURBO":
             order = ["CLOUD", "LOCAL"]
@@ -1242,15 +1246,23 @@ class McpAgent:
         while i >= 1 and found < keep_last_n:
             msg = msgs[i]
             if msg["role"] == "tool":
-                # 寻找匹配的 assistant（带 tool_calls 的）
-                j = i - 1
-                while j >= 1 and not (msgs[j]["role"] == "assistant" and msgs[j].get("tool_calls")):
+                # [AOS 5.5] 修复多工具调用截断 Bug：原子化采集整个 tool 序列
+                tool_group = []
+                j = i
+                # 往前收集所有连续的 tool 消息
+                while j >= 1 and msgs[j]["role"] == "tool":
+                    tool_group.insert(0, msgs[j])
                     j -= 1
-                if j >= 1:
-                    useful_rounds.insert(0, msg)
+                # 必须找到触发这些 tool_calls 的那个 assistant 消息
+                if j >= 1 and msgs[j]["role"] == "assistant" and msgs[j].get("tool_calls"):
+                    useful_rounds.insert(0, tool_group) # 先临时存为 list 以便整体 insert
                     useful_rounds.insert(0, msgs[j])
                     found += 1
                     i = j - 1
+                    continue
+                else:
+                    # 孤儿 tool 消息，跳过
+                    i = j
                     continue
             elif msg["role"] == "assistant" and not msg.get("tool_calls"):
                 useful_rounds.insert(0, msg)
@@ -1265,7 +1277,12 @@ class McpAgent:
         final = []
         if system_msg: 
             final.append(system_msg)
-        final.extend(useful_rounds)
+            
+        for round_item in useful_rounds:
+            if isinstance(round_item, list):
+                final.extend(round_item)
+            else:
+                final.append(round_item)
         
         # 5. 确保最新用户消息在末尾（如果它不在 useful_rounds 里）
         if latest_user_msg and (not final or final[-1] is not latest_user_msg):
@@ -1278,8 +1295,8 @@ class McpAgent:
         获取静态工具与动态技能工具的合集 (AOS 2.3)
         @param slim: 如果为 True, 则只返回核心元工具（用于极致省钱模式）
         """
-        # [AOS 2.9/4.9] 动态工具带：极大减少 Context 消耗
-        meta_tool_names = {"search_skills", "read_skill", "load_skill", "unload_skill", "list_skills", "http_fetch"}
+        # [AOS 2.9/4.9/6.4] 动态工具带：极大减少 Context 消耗。write_file 现已设为常驻元工具。
+        meta_tool_names = {"search_skills", "read_skill", "load_skill", "unload_skill", "list_skills", "http_fetch", "write_file", "edit_file"}
         
         all_tools = list(self.openaiTools) if self.openaiTools else []
         skill_tools = self.skill_manager.get_all_tools()
@@ -1296,10 +1313,11 @@ class McpAgent:
             
         return all_tools if all_tools else None
 
-    async def chat(self, userInput: str, tier: str = "LOCAL") -> AsyncGenerator[str, None]:
+    async def chat(self, userInput: str, tier: str = "LOCAL", no_tools: bool = False) -> AsyncGenerator[str, None]:
         """
         AOS 核心 ReAct 循环（流式版）。
         支持目标驱动、自动反思、技能加载、子专家召唤与 Token 预算控制。
+        [AOS 7.0] no_tools: 物理级避险开关。如果为 True，则剥离所有工具，强制进入纯社交模式。
         """
         if "main" not in self.memories:
             from prompts import AOS_GOD_MODE_PROMPT
@@ -1342,7 +1360,8 @@ class McpAgent:
             toolCallsDict = {}  # 用于按索引累计 tool_calls 数据
 
             # [AOS 2.9] 动态工具带：主对话初始只带元工具，极大减少首轮 Token 与推理压力
-            current_tools = self._get_combined_tools(slim=True)
+            # [AOS 7.0] no_tools 强制隔离：剥离所有实弹工具
+            current_tools = self._get_combined_tools(slim=True) if not no_tools else None
             
             response = self.unified_client.generate_stream(
                 tier=tier,
@@ -1664,6 +1683,38 @@ class McpAgent:
         print("✨ [AOS] 关闭序列完成，资源已释放。\n")
         logger.info("💾 所有 Agent 记忆已持久化到 %s/", self.memory_dir)
 
+    def _setup_action_workspace(self, action_name: str) -> str:
+        """
+        [AOS 7.1] 为特定动作设置物理隔离的工作区。
+        使用结构: Workspace/ActionName/YYYYMMDD_HHMMSS
+        """
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 允许的动作目录映射，确保命名规范
+        action_dir_map = {
+            "search": "Search",
+            "analyze": "Analyze",
+            "review": "Review",
+            "deploy": "Deploy",
+            "auto": "Auto",
+            "blitz": "Blitz"
+        }
+        dir_name = action_dir_map.get(action_name.lower(), action_name.capitalize())
+        
+        rel_path = os.path.join("Workspace", dir_name, f"{action_name}_{timestamp}")
+        abs_path = os.path.abspath(rel_path)
+        
+        os.makedirs(abs_path, exist_ok=True)
+        self.workspace_path = abs_path
+        
+        # 同步更新核心子组件
+        if hasattr(self, "skill_manager"):
+            self.skill_manager.workspace_path = abs_path
+        
+        logger.info("📁 [AOS 7.1] 已激活物理隔离区: %s", rel_path)
+        return abs_path
+
     # ========== AOS 2.0: 自治编排引擎 ==========
 
     async def autonomous_execute(self, user_demand: str) -> AsyncGenerator[str, None]:
@@ -1684,6 +1735,7 @@ class McpAgent:
             agent=self, # AOS 2.1: 传递当前 Agent 实例以便执行工具调用
             exp_engine=self.exp_engine, # AOS 2.4+: 共享经验引擎实例
         )
+        # run_mission 内部已集成 _setup_action_workspace
         async for chunk in orchestrator.run_mission(
             user_demand=user_demand,
             primary_session=self.session,
@@ -1731,7 +1783,8 @@ class McpAgent:
         context_id: str = "main",
         tier: str = "LOCAL",
         workspace_path: str | None = None,
-        tools: list | None = None
+        tools: list | None = None,
+        max_iterations: int = 10 # [AOS 5.4] 支持外部指定循环上限
     ) -> str:
         """
         核心 ReAct 循环：
@@ -1765,7 +1818,7 @@ class McpAgent:
         # 针对该任务重置预算
         self.token_budget.reset()
         
-        MAX_ITERATIONS = 10 # [AOS 2.9.1] 弹性熔断：由 5 步增加至 10 步，确保浏览器等复杂工具能跑完
+        MAX_ITERATIONS = max_iterations # [AOS 5.4] 真值对齐：支持外部强制关断
         call_history = []
         recent_errors = [] # [AOS 2.9] 同错熔断检测
         success_count = 0  # [AOS 4.8] 工具执行成功计数
@@ -1774,6 +1827,8 @@ class McpAgent:
         for iteration in range(MAX_ITERATIONS):
             # [AOS 4.5] 极速闭环：记录执行前的黑板指纹快照
             hash_before = self.blackboard.get_snapshot_hash()
+            # [AOS 6.2] 执行前记录文件列表
+            iteration_start_files = os.listdir(self.workspace_path) if self.workspace_path and os.path.exists(self.workspace_path) else []
 
             # [AOS 2.9.1] 临终关怀：最后一步前注入警告提示
             if iteration == MAX_ITERATIONS - 1:
@@ -1795,6 +1850,9 @@ class McpAgent:
             pruned_history = self._prune_history(context_id, keep_last_n=3)
             # 子 Agent 默认需要完整工具带以便协作
             current_tools = tools if tools is not None else self._get_combined_tools(slim=False) 
+            
+            # [AOS 6.2] 多维指纹快照：执行前记录 DB 状态
+            db_hash_before = self.scheduler.get_state_snapshot() if hasattr(self, "scheduler") else "none"
             
             # 使用流式生成并累积结果（复用流量控制与模型降级逻辑）
             response_stream = self.unified_client.generate_stream(
@@ -1889,25 +1947,46 @@ class McpAgent:
                     self.memories[context_id].append({"role": "user", "content": error_msg})
                     continue # 强制退回并要求重新执行真实工具
 
-                # [AOS 4.5] 零增量拦截 (Zero-Delta Guard)：指纹与物理增量核对
-                hash_after = self.blackboard.get_snapshot_hash()
-                
-                # 检查物理增量
-                has_physical_delta = False
-                if self.workspace_path and os.path.exists(self.workspace_path):
-                    try:
-                        files = os.listdir(self.workspace_path)
-                        f_stats_after = {f: os.path.getsize(os.path.join(self.workspace_path, f)) for f in files}
-                        # 此处比较逻辑可以进一步细化，但暂以指纹和工具调用为准
-                        # 如果黑板不变且无工具调用，基本可以判定为空转
-                    except:
-                        pass
+                # [AOS 6.3] 逻辑欺诈拦截 (Tool-Sign Mandate)
+                if context_id == "blitz_direct" and not toolCallsDict:
+                    # 1. 检测伪代码块 (Pseudo-Code Detection)
+                    pseudo_code_indicators = ["```python", "```bash", "```javascript", "def ", "import ", "const ", "with open"]
+                    has_pseudo_code = any(indicator in fullContent for indicator in pseudo_code_indicators)
+                    
+                    # 2. 检测推卸辞令 (Advice/Apology Detection)
+                    advice_keywords = ["可以使用", "可以直接", "建议你", "参考代码", "由于我无法", "抱歉", "sorry"]
+                    has_loitering = any(kw in fullContent for kw in advice_keywords)
 
-                if hash_before == hash_after and not toolCallsDict:
-                    logger.warning(f"⚠️ [极速拦截] 专家 {context_id} 试图输出无意义对话（物理/逻辑零增量），强制纠偏！")
-                    loitering_feedback = "🚨 [极速拦截] 检测到你的回复未产生任何物理变化（黑板未更新且未调用工具）。请停止描述或承诺，必须立即使用工具执行物理操作！"
-                    self.memories[context_id].append({"role": "user", "content": loitering_feedback})
-                    continue # 强制退回，再给一次机会（消耗 iteration）
+                    # 逻辑欺诈判定：写了代码但没有任何工具调用标识
+                    is_logical_fraud = has_pseudo_code and not toolCallsDict
+
+                    if is_logical_fraud or has_loitering or (has_pseudo_code and len(fullContent) > 80):
+                        logger.warning(f"🚨 [AOS 6.3 Tool-Sign Mandate] 拦截到专家 {context_id} 的‘逻辑欺诈’尝试。")
+                        fraud_feedback = (
+                            "🚨 [内核指令：逻辑欺诈拦截] 严禁在 BLITZ 模式下编写代码块或提供文档建议！\n"
+                            "你当前的任务是【执行】，禁止通过文字进行‘教学’或‘演示’。必须且只能调用实弹工具（如 add_scheduled_task）。\n"
+                            "立刻清除所有 Markdown 代码块，直接输出工具调用指令。多说一个字即视为内核逻辑死锁。"
+                        )
+                        self.memories[context_id].append({"role": "user", "content": fraud_feedback})
+                        continue # 强制重写
+
+                # [AOS 6.2] 多维零增量拦截 (Multi-Dim Guard)：指纹、DB 与物理增量核对
+                hash_after = self.blackboard.get_snapshot_hash()
+                db_hash_after = self.scheduler.get_state_snapshot() if hasattr(self, "scheduler") else "none"
+                
+                # 判定是否有任何维度的物理产出
+                has_fs_delta = len(self._get_workspace_delta(iteration_start_files)) > 0
+                has_bb_delta = hash_before != hash_after
+                has_db_delta = db_hash_before != db_hash_after
+                
+                # 如果没有任何物理变化且非单纯对话，拦截
+                if not toolCallsDict and not (has_fs_delta or has_bb_delta or has_db_delta):
+                    # 允许极简的确认信息通过，但禁止长篇大论的“假报告”
+                    if len(fullContent) > 80:
+                        logger.warning(f"⚠️ [极速拦截] 专家 {context_id} 试图输出无意义对话（物理/逻辑零增量），强制纠偏！")
+                        loitering_feedback = "🚨 [极速拦截] 检测到你的回复未产生任何物理变化（文件/黑板/数据库皆无更新）。请停止吹嘘，必须立即使用工具执行物理操作！"
+                        self.memories[context_id].append({"role": "user", "content": loitering_feedback})
+                        continue 
 
                 self.token_budget.consume(self.token_budget.estimate_tokens(fullContent))
                 return fullContent
@@ -1928,11 +2007,12 @@ class McpAgent:
                 call_sig = f"{funcName}:{arguments}"
                 call_history.append(call_sig)
                 
-                # [AOS 3.9.7] 优雅的“侦察容错” (Graceful Polling)
-                max_tolerance = 6 if any(kw in funcName for kw in ["list_directory", "read_blackboard", "list_files", "get_file_contents"]) else 3
+                # [AOS 7.0] 强硬熔断：下调侦察容错至 3 次
+                max_tolerance = 3 if any(kw in funcName for kw in ["list_directory", "read_blackboard", "list_files", "get_file_contents"]) else 3
                 
                 if call_history.count(call_sig) >= max_tolerance:
-                    return f"⚠️ [死循环中断] 任务已停止以防无限循环调用 {funcName}"
+                    logger.error("🚫 [物理熔断] 专家逻辑陷入死锁 (超限调用 %s)，已强行断路。", funcName)
+                    return f"⚠️ [物理熔断] 检测到工具调用死循环 (%s)，已由内核强制终止任务链路。" % funcName
 
                 logger.info("[%s] 正在执行子任务工具: %s", context_id, funcName)
                 
@@ -2153,44 +2233,76 @@ class McpAgent:
             logger.error("专家 %s 评审失败: %s", expertName, e)
             return {expertName: {"error": str(e)}}
 
-    async def multiAgentReview(self, repo_url: str) -> AsyncGenerator[str, None]:
+    async def multiAgentReview(self, repo_urls: str | list[str]) -> AsyncGenerator[str, None]:
         """
-        混合多 Agent 评审流：并发调度、算力路由、自适应加载。
+        混合多 Agent 評審流：支持單個或多個項目的併發評審與對比分析。
         """
-        print(f"\n🚀 [Hybrid Mode: {self.mode}] 启动 OpenClaw 多专家联合评审团...")
+        if isinstance(repo_urls, str):
+            repo_urls = [repo_urls]
+
+        # [AOS 7.1] 激活隔離工作區
+        wsp = self._setup_action_workspace("review")
+        yield f"📁 [隔離] 正在 Review 空間建立沙盒: {wsp}\n"
         
-        # 1. 自适应加载数据 (基础扫描)
-        project_data = await self.adaptive_load_data(repo_url)
+        print(f"\n🚀 [Hybrid Mode: {self.mode}] 啟動 OpenClaw 多專家聯合評委會...")
         
-        # 2. 调度专家评审 (AUTO/TURBO 模式并发)
-        experts = list(EXPERT_REGISTRY.keys())
-        if "Deployment_Executor" in experts:
-            # 评审时不包含部署专家，它只在 /deploy 时显式调用
-            experts.remove("Deployment_Executor")
+        all_experts_results = []
+        
+        for url in repo_urls:
+            yield f"🔍 正在加載項目數據: {url}...\n"
+            # 1. 自適應加載數據 (基礎掃描)
+            try:
+                project_data = await self.adaptive_load_data(url)
+            except Exception as e:
+                yield f"❌ 加載 {url} 失敗: {e}\n"
+                continue
             
-        tasks = []
-        for name in experts:
-            tasks.append(self.expertReview(name, EXPERT_REGISTRY[name], project_data))
+            # 2. 調度專家評審 (AUTO/TURBO 模式併發)
+            experts = list(EXPERT_REGISTRY.keys())
+            if "Deployment_Executor" in experts:
+                experts.remove("Deployment_Executor")
+            if "scheduler_configurator" in experts:
+                experts.remove("scheduler_configurator")
+            if "SkillCurator" in experts:
+                experts.remove("SkillCurator")
+                
+            tasks = []
+            for name in experts:
+                tasks.append(self.expertReview(name, EXPERT_REGISTRY[name], project_data))
+                
+            yield f"🕵️  正在調度 {len(tasks)} 位專家評審 {url}...\n"
+            results = await asyncio.gather(*tasks)
+            all_experts_results.append({
+                "url": url,
+                "results": results
+            })
+
+        # 3. 匯總/對比報告 (Coordinator)
+        if len(all_experts_results) == 0:
+            yield "❌ 未能在任何地址執行有效的專家評審。"
+            return
+
+        reviews_summary = ""
+        for item in all_experts_results:
+            url = item["url"]
+            results = item["results"]
+            reviews_summary += f"\n=== 項目評審: {url} ===\n"
+            reviews_summary += "\n".join([
+                f"- {r.get('dimension', '專家')} (得分: {r.get('score', '?')}): {r.get('summary', '')}" 
+                for r in results if r
+            ]) + "\n"
+        
+        if len(all_experts_results) > 1:
+            system_prompt = COORDINATOR_SYSTEM_PROMPT + "\n\n請注意：當前有多個項目，請重點進行【橫向對比】，並在報告結尾給出明確的最佳推薦結論。"
+        else:
+            system_prompt = COORDINATOR_SYSTEM_PROMPT
             
-        print(f"🕵️  正在调度 {len(tasks)} 位专家进行综合评审...")
-        results = await asyncio.gather(*tasks)
-        
-        # 3. 汇总报告 (Coordinator)
-        reviews_summary = "\n\n".join([
-            f"--- {r.get('dimension', '专家')} (得分: {r.get('score', '?')}) ---\n"
-            f"观察: {', '.join(r.get('key_observations', []))}\n"
-            f"总结: {r.get('summary', '')}" 
-            for r in results if r
-        ])
-        
-        system_prompt = COORDINATOR_SYSTEM_PROMPT.format(expert_reviews=reviews_summary)
-        user_input = f"请为项目 {repo_url} 生成最终的专家团综合评审报告。"
+        user_input = f"請根據以下專家評審意見生成最終報告。{'涉及對比' if len(all_experts_results) > 1 else ''}\n意見如下:\n{reviews_summary}"
         
         async for chunk in self.unified_client.generate_stream("PREMIUM", [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input}
         ]):
-            # [DEFENSIVE] Fix for list index out of range in streaming responses
             if not chunk or not hasattr(chunk, "choices") or not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -2207,6 +2319,9 @@ class McpAgent:
             yield f"❌ 无效的 GitHub URL: {repo_url}"
             return
 
+        # [AOS 7.1] 激活隔离工作区
+        wsp = self._setup_action_workspace("deploy")
+        yield f"📁 [隔离] 正在 Deploy 空间建立沙盒: {wsp}\n"
         yield f"🔍 正在初始化 [{repo}] 的部署流程...\n"
 
         # 1. 加载部署上下文
@@ -2308,6 +2423,14 @@ class McpAgent:
                         if event.get("logs"):
                             yield f"\n📋 **启动日志摘要 (前10行)**:\n```\n{event['logs']}\n```\n"
 
+                        # [AOS 7.1] 归档生成的 Dockerfile
+                        try:
+                            df_path = os.path.join(self.workspace_path, "Dockerfile")
+                            with open(df_path, "w", encoding="utf-8") as f:
+                                f.write(dockerfile_content)
+                            yield f"- **物理归档**: `Dockerfile` -> `{self.workspace_path}`\n"
+                        except: pass
+
                         yield "💡 温馨提示：容器仅在 Agent 运行时存活，关闭程序或使用 /clear 将自动销毁。\n\n"
                         return
                     elif evt_type == "error":
@@ -2348,4 +2471,17 @@ class McpAgent:
                 items.append(f"{s['name']}: {desc}")
         
         return " | ".join(items) if items else "暂无沉睡技能"
+
+    def _get_workspace_delta(self, initial_files: list[str]) -> list[str]:
+        """
+        [AOS 6.1] 计算工作区文件增量。
+        """
+        if not self.workspace_path or not os.path.exists(self.workspace_path):
+            return []
+        try:
+            current_files = os.listdir(self.workspace_path)
+            return [f for f in current_files if f not in initial_files]
+        except Exception as e:
+            logger.error(f"误差计算失败: {e}")
+            return []
 

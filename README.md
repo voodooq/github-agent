@@ -1,180 +1,78 @@
-# 🚀 OpenClaw GitHub Agent
+# 🚀 OpenClaw GitHub Agent (AOS 7.2)
 
-基于 MCP 协议的**混合算力多专家** GitHub 开源项目检索与分析工具。通过 AI 多轮对话，自动搜索、深度分析、并发专家评审 GitHub 项目。
-
-## ✨ 核心功能
-
-- **🔍 需求检索**：描述技术需求，Agent 自动搜索 GitHub、读取 README、按匹配度 1-10 分排序
-- **📊 精准分析**：提供仓库 URL，深度分析项目架构、源码、优缺点和适用场景
-- **🚀 多专家评审**：采用混合算力架构（Cloud + Local），5 大专家（架构/安全/UX/DevOps/生命力）并行深度联合审计
-- **💬 多轮对话**：持续对话，逐步细化搜索条件或追问项目细节
-- **🧠 独立记忆管理**：每个 Agent 拥有独立持久化记忆，支持精准清理与全量重置
-
-## 核心架构
-
-```mermaid
-flowchart TD
-    A[用户输入] --> B{命令类型?}
-    B -->|/search 需求| C[包装搜索 Prompt]
-    B -->|/analyze URL| D[包装分析 Prompt]
-    B -->|/review URL| R[多专家评审流]
-    B -->|自然语言| E[直接对话]
-    C --> F[Agent ReAct 循环]
-    D --> F
-    E --> F
-    F --> G{LLM 返回 tool_calls?}
-    G -->|是| H[MCP 执行 GitHub 工具]
-    H --> I[结果追加到记忆]
-    I --> F
-    G -->|否| J[输出结构化报告]
-
-    R --> R1[自适应数据加载]
-    R1 --> R2[智能算力路由]
-    R2 --> R3[5 大专家并行评审]
-    R3 --> R4[协调员汇总报告]
-```
-
-### 三种工作模式
-
-| 模式 | 命令 | 流程 |
-|------|------|------|
-| **需求检索** | `/search` | 解析需求 → 搜索仓库 → 读取 README → 打分排序 → 匹配报告 |
-| **精准分析** | `/analyze` | 解析 URL → 读取概览 → 分析目录 → 深入源码 → 分析报告 |
-| **专家评审** | `/review` | 数据加载 → 算力路由 → 专家并行审计 → 协调员汇总 |
+基于 **AOS (Agentic OS)** 架构的混合算力多专家 GitHub 协同平台。它不仅仅是一个搜索工具，而是一个具备**经济意识 (CFO)**、**沙盒环境 (Docker)** 和**物理隔离 (Workspace)** 的全自治 Agent 系統。
 
 ---
 
-## 快速开始
+## 🌟 AOS 7.2 核心特性
 
-### 1. 安装依赖
+- **📂 物理隔離工作區 (Workspace)**：所有 `/search`, `/analyze`, `/review` 操作都會在獨立、帶時間戳的沙盒目錄中執行，確保數據互不干擾。
+- **💰 CFO 經濟引擎 (AEA)**：內置錢包、ROI 評估與算力路由。根據餘額自動切換生存模式（飢餓/溫飽/土豪），預算不足自動降級本地模型。
+- **🛡️ 專家團橫向對比**：支持同時對比多個 GitHub 項目，提供專業的評分矩陣（UX、架構、安全、活躍度）並給出明確推薦。
+- **🚀 智能文件感官**：`/analyze` 和 `/review` 具備路徑識別與文件內容讀取能力，能自動從搜索報告中提取 URL 進行批量處理。
+- **📦 Docker 沙盒部署**：支持 `/deploy` 一鍵將開源項目構建並部署至隔離容器，自動生成 Dockerfile 並進行自愈檢查。
+- **📅 自治調度器**：內置 Scheduler，支持自然語言預約任務（如“每天早上 8 點複盤量化框架”）。
 
+---
+
+## 🛠️ 命令矩陣 (AOS 指令集)
+
+| 指令 | 描述 | 優點 |
+| :--- | :--- | :--- |
+| `/search <需求>` | 授權檢索與排名矩陣 | 帶預算的深度調研，自動導出 `ranking_data.json` |
+| `/analyze <URL/文件>` | 精準代碼審計與對比 | 支持讀取本地文件提取 URL，自動生成橫向對比報告 |
+| `/review <URL/文件>` | 混合算力專家團聯合評審 | 5 大專家（架構/安全/UX/DevOps/生命力）併發審計 |
+| `/deploy <URL>` | 一鍵 Docker 沙盒化部署 | 自動環境檢測、鏡像構建、映射運行 |
+| `/auto <需求>` | **Hot Mode** 全自治任務 | AI 自主拆解、招聘專家、執行、歸檔 |
+| `/bb` | 📖 黑板報告 | 查看任務事實、時間軸與物理證據鏈 |
+| `/wallet` | 💰 財務簡報 | 查看當前餘額、日燃燒率、預估跑道 (Runway) |
+| `/checkup` | 🛡️ 全量免疫掃描 | AOS 4.0 系統自檢與動態技能自愈 |
+
+---
+
+## 🏗️ 物理隔離協議 (Isolation Protocol)
+
+所有執行結果（報告、數據、鏡像配置）均鎖定在本地 `Workspace/` 目錄下：
+```text
+Workspace/
+├── Search/    # 存儲檢索報告與 ranking_data.json
+├── Analyze/   # 存儲代碼審計報告與多項目對比
+├── Review/    # 存儲專家團聯手彙報的 review_report.md
+└── Deploy/    # 存儲生成的 Dockerfile 與佈署日誌
+```
+> **注意**：該目錄已被列入 `.gitignore`，確保您的隱私數據和分析報告不會洩露至公有倉庫。
+
+---
+
+## 🚀 快速開始
+
+### 1. 依賴安裝
 ```bash
 pip install -r requirements.txt
 ```
 
-仅需 4 个核心依赖：`mcp[cli]`、`openai`、`python-dotenv`、`prompt_toolkit`。
+### 2. 環境配置
+複製 `.env.example` 為 `.env`，配置您的 `GITHUB_TOKEN` 以及 LLM API Key。
 
-### 2. 配置环境
-
-```bash
-cp .env.example .env
-```
-
-编辑 `.env` 文件，至少配置一个 LLM 的 API Key 和 GitHub Token。
-
-### 3. 运行
-
-```bash
-python main.py
-# 或使用快捷启动脚本
-./run-agent.bat
-```
+### 3. 動算力分配 (CFO 策略)
+在 `.env` 中設置預計初始金：
+`AEA_INITIAL_BALANCE=10.0`
+Agent 會根據餘額自動在 `PREMIUM` (雲端) 和 `LOCAL` (本地) 算力間切換。
 
 ---
 
-## 配置说明
+## 🧠 專家團組成
 
-所有配置通过 `.env` 文件管理，分为三个部分：
-
-### 1. 混合大模型配置 (LLM)
-
-Agent 采用云端+本地混合架构。您可以根据成本和隐私需求自由调节算力分配。
-
-| 变量前缀 | 推荐模型 | 用途 |
-|----------|----------|------|
-| `CLOUD_LLM_` | DeepSeek-Chat, GPT-4o | 架构审计、安全合规、协调汇总等高难度任务 |
-| `LOCAL_LLM_` | Ollama GLM-PureGPU, Qwen2.5 | 数据脱水、UX 评审、项目生命力评估 |
-
-**多模型切换参考：**
-
-| 模型类型 | `API_KEY` | `BASE_URL` | `MODEL` |
-|----------|-----------|------------|---------|
-| **DeepSeek (推荐云端)** | 你的 Key | `https://api.deepseek.com/v1` | `deepseek-chat` |
-| **Ollama (推荐本地)** | `ollama` | `http://localhost:11434/v1` | `GLM-PureGPU` |
-| **Kimi (长文本)** | 你的 Key | `https://api.moonshot.cn/v1` | `moonshot-v1-128k` |
-
-> **提示**：当云端模型不可用时，系统会自动触发 **平滑降级**，将任务回退给本地模型执行，确保评审永不断线。
-
-### 2. MCP 服务端配置
-
-控制 Agent 连接的 MCP 工具服务。默认连接 GitHub 官方 MCP Server：
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `MCP_COMMAND` | MCP 服务启动命令 | `npx` |
-| `MCP_ARGS` | 命令参数（逗号分隔） | `-y,@modelcontextprotocol/server-github` |
-| `MCP_ENV` | 服务端环境变量 | `GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx` |
-
-#### GitHub Token 权限方案
-
-在 [GitHub Settings](https://github.com/settings/tokens) 创建 Token (classic) 时勾选：
-
-- **`repo` (全选)**：读取公开/私有库源码、列出目录、操作 Issue/PR
-- **`read:org`**：读取组织信息
-- **`workflow`**：审计 CI/CD 流水线（推荐）
-
-将 Token 填入 `.env` 中的 `MCP_ENV=GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx`。
-
-### 3. Agent 运行配置
-
-| 变量 | 说明 | 可选值 |
-|------|------|--------|
-| `AGENT_MODE` | 专家评审调度策略 | `AUTO`（推荐）/ `TURBO` / `SEQUENTIAL` |
-
-- **AUTO**：智能路由，自动分配云端/本地算力
-- **TURBO**：全部使用云端算力（最快，费用最高）
-- **SEQUENTIAL**：串行执行（适合本地模型资源有限时）
+| 專業維度 | 算力傾向 | 核心觀察點 |
+| :--- | :--- | :--- |
+| **UX/DX** | LOCAL | 文檔友好度、上手門檻、API 易用性 |
+| **DevOps** | LOCAL | CI/CD 支持、Docker 友好性、構建鏈 |
+| **Security** | PREMIUM | 硬編碼、依賴缺陷、靜態漏洞 (SAST) |
+| **Arch** | PREMIUM | 擴展性、模式設計、並發設計 |
+| **Liveliness**| LOCAL | 修 commit 頻率、Issue 響應速度 |
 
 ---
 
-## 使用方式
+## 🔗 License
 
-| 命令 | 说明 | 示例 |
-|------|------|------|
-| `/search <需求>` | 搜索匹配项目并排序 | `/search 轻量级 Python WAF` |
-| `/analyze <URL>` | 精准分析指定仓库 | `/analyze https://github.com/fastapi/fastapi` |
-| `/review <URL>` | 混合专家团联合深度审计 | `/review https://github.com/owner/repo` |
-| 直接输入 | 自然语言对话 | `帮我对比上面 Top 3 的项目` |
-| `/clear` | 清除主对话记忆 | |
-| `/clear <agent>` | 清除指定专家记忆 | `/clear Security_Expert` |
-| `/clear all` | 全量清除所有记忆文件 | |
-| `/tools` | 查看可用 MCP 工具 | |
-| `/help` | 显示帮助 | |
-| `/quit` | 退出并保存 | |
-
-> **Tab 补全**：输入 `/` 后按 Tab 可快速补全命令；输入 `/clear ` 后按 Tab 可查看所有专家名称及描述。
-
----
-
-## 专家评审团
-
-`/review` 命令会触发以下 5 位 AI 专家并行评审：
-
-| 专家 | 算力层级 | 职责 |
-|------|----------|------|
-| **UX_Expert** | LOCAL | 开发者体验（DX）、文档质量、快速上手 |
-| **DevOps_Expert** | LOCAL | 工程化程度、容器化、CI/CD、部署复杂度 |
-| **Security_Expert** | PREMIUM | 硬编码风险、注入漏洞、合规性、供应链安全 |
-| **Liveliness_Expert** | LOCAL | 社区活跃度、更新频率、生态健康 |
-| **Arch_Expert** | LONG_CONTEXT | 架构设计、代码质量、可扩展性、技术选型 |
-
----
-
-## 项目结构
-
-| 文件/目录 | 用途 |
-|-----------|------|
-| `memories/` | 专家独立记忆存储目录（已加入 .gitignore） |
-| `config.py` | 配置管理（从 `.env` 加载） |
-| `prompts.py` | 多专家 Prompt 注册表 |
-| `mcp_agent.py` | 核心 Agent（混合引擎 + 独立记忆 + ReAct 循环） |
-| `main.py` | CLI 入口（快捷命令 + Tab 补全） |
-| `tool_converter.py` | MCP → OpenAI 工具格式转换 |
-| `requirements.txt` | 依赖声明 |
-| `.env.example` | 环境变量模板 |
-
----
-
-## License
-
-MIT
+MIT License. 基於開源協議保護。
