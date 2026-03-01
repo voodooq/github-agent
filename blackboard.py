@@ -213,6 +213,20 @@ class Blackboard:
             return True
         return False
 
+    def get_snapshot_hash(self) -> str:
+        """
+        [AOS 4.5] 获取当前黑板状态指纹（用于检测执行后是否发生状态漂移）。
+        采用 MD5 对事实内容进行指纹提取。
+        """
+        import hashlib
+        # 只计算非元数据字段（或过滤掉动态时间戳字段以保证稳定性，此处保留 facts 内容）
+        relevant_data = {k: v.get("value") for k, v in self.facts.items() if not k.startswith("_")}
+        # [AOS 4.5] 同时包含任务进度状态列表
+        relevant_data["_progress_"] = {k: v.get("status") for k, v in self.task_progress.items()}
+        
+        data_str = json.dumps(relevant_data, sort_keys=True)
+        return hashlib.md5(data_str.encode()).hexdigest()
+
     # ========== 持久化 ==========
 
     def _save(self) -> None:

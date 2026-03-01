@@ -439,7 +439,21 @@ class Orchestrator:
                     elif assertion.get("type") == "file_exists":
                         dod_enforcement += f"- 使用 `filesystem` 在 `./` 下创建物理文件: `{assertion['file']}`\n"
             
-            full_system_prompt = system_prompt + dod_enforcement + SYSTEM_GUARDRAIL
+            # [AOS 4.5] 睁眼看物理世界：提前注入文件快照
+            physical_evidence = ""
+            if self.workspace_path and os.path.exists(self.workspace_path):
+                try:
+                    files = os.listdir(self.workspace_path)
+                    f_stats = {f: os.path.getsize(os.path.join(self.workspace_path, f)) for f in files}
+                    physical_evidence = f"\n✅ 【工作区物理证据注入】 (AOS 4.5): {f_stats}\n"
+                except:
+                    pass
+
+            full_system_prompt = system_prompt + physical_evidence + dod_enforcement + SYSTEM_GUARDRAIL
+            
+            # [AOS 4.5] 极速执行规约注入
+            from prompts import DIRECT_EXECUTION_PROTOCOL
+            full_system_prompt += "\n" + DIRECT_EXECUTION_PROTOCOL
 
             # [AOS 3.7] 智商自动升档拦截器：识别高智商任务并强制 PREMIUM
             target_tier = "LOCAL"

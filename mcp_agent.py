@@ -1679,6 +1679,9 @@ class McpAgent:
         recent_errors = [] # [AOS 2.9] 同错熔断检测
         
         for iteration in range(MAX_ITERATIONS):
+            # [AOS 4.5] 极速闭环：记录执行前的黑板指纹快照
+            hash_before = self.blackboard.get_snapshot_hash()
+
             # [AOS 2.9.1] 临终关怀：最后一步前注入警告提示
             if iteration == MAX_ITERATIONS - 1:
                 warning_msg = f"[系统警告] 这是最后一次机会！你必须在本次回复中给出最终结论，或根据已搜集到的信息输出一份详尽的任务状态摘要。不允许再调用工具。"
@@ -1793,13 +1796,26 @@ class McpAgent:
                     self.memories[context_id].append({"role": "user", "content": error_msg})
                     continue # 强制退回并要求重新执行真实工具
 
-                # [AOS 2.9.2] 反幻觉补丁：如果任务包含“读取”、“搜索”、“抓取”等动词，但一步工具都没动就退出了，可能是幻觉。
-                if iteration == 0 and any(kw in user_demand for kw in ["读取", "搜索", "抓取", "查看", "分析", "写入", "安装"]):
-                    if tier == "LOCAL": # 本地模型更容易产生“口头完成”幻觉
-                        retry_msg = "你目前仅口头回复了任务。请务必使用工具（Tool Call）来获取真实数据或执行物理操作，然后再提交结果。"
-                        self.memories[context_id].append({"role": "user", "content": retry_msg})
-                        continue # 给它一次强制重试权
+                # [AOS 4.5] 零增量拦截 (Zero-Delta Guard)：指纹与物理增量核对
+                hash_after = self.blackboard.get_snapshot_hash()
                 
+                # 检查物理增量
+                has_physical_delta = False
+                if self.workspace_path and os.path.exists(self.workspace_path):
+                    try:
+                        files = os.listdir(self.workspace_path)
+                        f_stats_after = {f: os.path.getsize(os.path.join(self.workspace_path, f)) for f in files}
+                        # 此处比较逻辑可以进一步细化，但暂以指纹和工具调用为准
+                        # 如果黑板不变且无工具调用，基本可以判定为空转
+                    except:
+                        pass
+
+                if hash_before == hash_after and not toolCallsDict:
+                    logger.warning(f"⚠️ [极速拦截] 专家 {context_id} 试图输出无意义对话（物理/逻辑零增量），强制纠偏！")
+                    loitering_feedback = "🚨 [极速拦截] 检测到你的回复未产生任何物理变化（黑板未更新且未调用工具）。请停止描述或承诺，必须立即使用工具执行物理操作！"
+                    self.memories[context_id].append({"role": "user", "content": loitering_feedback})
+                    continue # 强制退回，再给一次机会（消耗 iteration）
+
                 self.token_budget.consume(self.token_budget.estimate_tokens(fullContent))
                 return fullContent
                 
