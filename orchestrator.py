@@ -232,25 +232,7 @@ class Orchestrator:
 
     async def generate_dod(self, user_demand: str) -> list[str]:
         """
-        # [AOS 5.0] 单兵作战模式 (Single-Agent Self-Maintenance)
-        # 针对系统维护类任务，直接由主 Agent 物理碾压，禁止 PM 开废会
-        maintenance_keywords = ["schedule", "task", "定时任务", "skill", "技能", "economy", "财务", "钱包", "balance", "curator", "安装"]
-        is_maintenance = any(kw in user_demand.lower() for kw in maintenance_keywords)
-        
-        if is_maintenance:
-            print(f"⚡ [AOS 5.0] 极速闭环：识别到系统维护任务，启动‘单兵作战’模式 (Bypass PM)...")
-            final_report = await self.agent.execute_with_tools(
-                system_prompt="你现在是系统主控官。直接调用工具完成任务，不准废话，不准招聘。完成后直接在黑板写结果。",
-                user_demand=user_demand,
-                tier="PREMIUM", # 维护任务通常重要，给足算力
-                context_id="maintenance_direct"
-            )
-            # Note: The original instruction had `yield` here, but `generate_dod` is not a generator.
-            # Assuming it should return a DoD list, or the maintenance task is self-contained.
-            # For now, we'll just return a simple DoD indicating the maintenance task was handled.
-            return [{"criterion": f"系统维护任务 '{user_demand}' 已完成", "assertion": {"type": "key_exists", "key": "maintenance_task_result"}}]
-
-        # 1. 拆解需求为 DoD (Definition of Done)
+        从用户需求自动生成可量化验收标准 (Definition of Done)。
         使用 PREMIUM 模型确保分析质量。
         """
         print("📝 [项目经理] 正在生成验收标准 (DoD)...")
@@ -307,28 +289,6 @@ class Orchestrator:
         )
         if negatives:
             prompt += f"\n\n{negatives}"
-            # [AOS 5.0] Anti-Mocking：分析文本语义，防止“体面地摆烂”
-        # The following block seems to belong to a verifier/evaluator function, not generate_recruiting_plan.
-        # It's placed here as per instruction, but it will cause a NameError for `evidence_path` and incorrect return type.
-        # Assuming `evidence_path` would be passed in a real verifier context.
-        # For now, commenting it out or adapting it to fit `generate_recruiting_plan` is not feasible without more context.
-        # I will place the comment as requested, but the code block itself cannot be inserted here meaningfully.
-        # negative_keywords = ["无法", "失败", "报错", "error", "failed", "cannot", "could not", "找不到"]
-        # # 如果报告文件存在，但内容全是失败描述
-        # if evidence_path and os.path.exists(evidence_path): # evidence_path is not defined here
-        #     try:
-        #         with open(evidence_path, "r", encoding="utf-8") as f:
-        #             content = f.read(2000).lower()
-        #             if any(kw in content for kw in negative_keywords):
-        #                 return { # This return type is not compatible with generate_recruiting_plan
-        #                     "success": False,
-        #                     "reason": f"报告内容显示核心逻辑失败（物理演戏拦截）：{content[:100]}",
-        #                     "score": 0
-        #                 }
-        #     except:
-        #         pass
-
-        # analyze_prompt = f"""你是一个严苛的 AI 裁判。 # This line also seems out of place here.
 
         result = await self.client.generate(
             "PREMIUM", # [AOS 2.9] 规划环节：坚持云端精英，防止招聘幻觉
@@ -735,11 +695,18 @@ class Orchestrator:
         # [AOS 2.6] 注入黑板快照作为物理证据
         blackboard_snapshot = self.blackboard.read_all()
         
-        # [AOS 2.6] 扩大上下文到 4000 字符，保留更多工具日志
-        results_text = "\n\n".join([
-            f"--- {role} 的执行结果 ---\n{text[:4000]}"
-            for role, text in results.items()
-        ])
+        # [AOS 5.0] Anti-Mocking：分析文本结果细节，防止“体面地摆烂”
+        negative_keywords = ["无法获取", "失败", "报错", "error", "failed", "cannot", "could not", "找不到", "无法提供"]
+        results_text = ""
+        for role, text in results.items():
+            lower_text = text.lower()
+            if any(kw in lower_text for kw in negative_keywords):
+                logger.error(f"🚫 [AOS 5.0 Anti-Mocking] 子专家 '{role}' 试图通过文字报告忽悠，判定为 FAIL")
+                return {
+                    "overall": "FAIL",
+                    "correction_hint": f"子专家 '{role}' 的报告中包含失败信号（{negative_keywords[0]}等），物理动作未闭环。禁止文字演戏！"
+                }
+            results_text += f"--- {role} 的执行结果 ---\n{text[:4000]}\n\n"
 
         verification_input = (
             f"【验收标准 (DoD)】:\n"
@@ -829,6 +796,31 @@ class Orchestrator:
         流程: DoD → 招聘 → 并发执行 → 验收 → (失败则重试) → 交付
         """
         yield f"🚀 [AOS 自治模式] 收到需求: {user_demand}\n"
+
+        # [AOS 5.0] 单兵作战模式 (Single-Agent Self-Maintenance)
+        # 针对系统维护类任务，直接由主 Agent 物理碾压，禁止 PM 开废会
+        maintenance_keywords = ["schedule", "task", "定时任务", "skill", "技能", "economy", "财务", "钱包", "balance", "curator", "安装", "清空", "清理"]
+        is_maintenance = any(kw in user_demand.lower() for kw in maintenance_keywords)
+        
+        if is_maintenance:
+            yield f"⚡ [AOS 5.0] 极速闭环：识别到系统维护任务，启动‘单兵作战’模式 (Bypass PM)...\n"
+            # 物理路径锁定
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.workspace_path = os.path.join(os.getcwd(), "Workspace", f"maint_{timestamp}")
+            os.makedirs(self.workspace_path, exist_ok=True)
+            if self.agent:
+                self.agent.workspace_path = self.workspace_path
+            
+            final_report = await self.agent.execute_with_tools(
+                system_prompt="你现在是系统主控官。直接调用工具完成任务，不准废话，不准招聘。完成后直接在黑板写结果。",
+                user_demand=user_demand,
+                tier="PREMIUM", 
+                context_id="maintenance_direct",
+                workspace_path=self.workspace_path
+            )
+            yield f"\n📊 【单兵任务报告】\n{final_report}\n"
+            yield f"✅ [AOS 5.0] 物理闭环成功。工作区: {self.workspace_path}\n"
+            return
 
         # 0. 为本次任务创建物理工作区沙箱 (AOS 2.7+)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
