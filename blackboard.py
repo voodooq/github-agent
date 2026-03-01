@@ -34,14 +34,16 @@ class Blackboard:
         self.task_progress: dict[str, dict] = {}
         # 错误事件队列：主 Agent 监控用
         self.error_queue: asyncio.Queue = asyncio.Queue()
+        # [AOS 4.7.1] 粘性变量：记录不可擦除的锚点
+        self.sticky_keys: set[str] = set()
         self._load()
 
     # ========== 核心读写 ==========
 
-    def write(self, key: str, value: str, author: str = "system") -> None:
+    def write(self, key: str, value: str, author: str = "system", sticky: bool = False) -> None:
         """
         向黑板写入客观事实。
-        防御补丁 #3: 超过 MAX_VALUE_SIZE 自动截断，防止 Token 爆仓。
+        [AOS 4.7.1] 增加 sticky 参数，用于锁定核心参数。
         """
         if not isinstance(value, str):
             # [AOS 4.0.1] 自动序列化非字符串对象（如诊断报告 dict）
@@ -58,6 +60,10 @@ class Blackboard:
                 author, len(value), self.MAX_VALUE_SIZE,
             )
             value = value[:self.MAX_VALUE_SIZE] + "...[TRUNCATED]"
+
+        if sticky:
+            self.sticky_keys.add(key)
+            logger.info("🎯 [锚点生效] 变量已锁定为粘性状态: %s", key)
 
         self.facts[key] = {
             "value": value,
@@ -176,6 +182,26 @@ class Blackboard:
             ts = info.get("timestamp", "")[:19]
             lines.append(f"  {icon} [{ts}] {role}: {info.get('message', '')}")
         return "\n".join(lines)
+
+    def clear(self, include_sticky: bool = False) -> None:
+        """
+        [AOS 4.7.1] 清理黑板数据。
+        默认保留粘性锚点记录，除非指定 include_sticky=True。
+        """
+        if include_sticky:
+            self.facts = {}
+            self.sticky_keys.clear()
+            self.task_progress = {}
+            self._events.clear()
+            logger.info("🗑️ [黑板] 已执行深度清场（含粘性变量）")
+        else:
+            # 仅保留锚点数据
+            self.facts = {k: v for k, v in self.facts.items() if k in self.sticky_keys}
+            # 清理进度与事件
+            self.task_progress = {}
+            self._events.clear()
+            logger.info("🧹 [黑板] 已清理任务状态，保留 %d 条锚点变量", len(self.facts))
+        self._save()
 
     # ========== 快照与回滚 ==========
 

@@ -94,3 +94,10 @@ skills:
   command: npx
   description: AI驱动网页抓取引擎，隐形绕过，MCP服务器，多模态输出（Markdown, JSON, PDF）。
   name: WebScraperToolkit
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-P-Link-MCP'
+  command: npx
+  description: P-Link-MCP：实现x402客户端与服务器，支持MCP协议的支付及资金收发。
+  name: P-Link-MCP

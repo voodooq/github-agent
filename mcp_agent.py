@@ -1505,7 +1505,12 @@ class McpAgent:
         path = self._get_memory_path(context_id)
         if os.path.exists(path):
             os.remove(path)
-        logger.info("🗑️ 已清理并重置记忆: %s", context_id)
+        
+        # [AOS 4.7.1] 同时清理黑板（保留固定的粘性变量）
+        if hasattr(self, "blackboard"):
+            self.blackboard.clear(include_sticky=False)
+            
+        logger.info("🗑️ 已清理并重置记忆与黑板: %s", context_id)
 
     def clearAllMemories(self):
         """
