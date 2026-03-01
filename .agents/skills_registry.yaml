@@ -101,3 +101,10 @@ skills:
   command: npx
   description: P-Link-MCP：实现x402客户端与服务器，支持MCP协议的支付及资金收发。
   name: P-Link-MCP
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-document-search-mcp-server'
+  command: npx
+  description: MCP文档检索，支持多库搜索、提取与展示。
+  name: document-search-mcp-server
