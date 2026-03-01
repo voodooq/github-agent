@@ -442,7 +442,19 @@ class Orchestrator:
                     elif assertion.get("type") == "file_exists":
                         dod_enforcement += f"- 使用 `filesystem` 在 `./` 下创建物理文件: `{assertion['file']}`\n"
             
-            # [AOS 4.7] 强制工具路由：静态资源锁定 fetch
+            # [AOS 4.7.2] 物理证据与视网膜同步初始化
+            physical_evidence = ""
+            
+            # [AOS 4.5] 物理视网膜同步 (Retina Sync)：注入工作区文件快照
+            if self.workspace_path and os.path.exists(self.workspace_path):
+                try:
+                    files = os.listdir(self.workspace_path)
+                    f_stats = {f: os.path.getsize(os.path.join(self.workspace_path, f)) for f in files}
+                    physical_evidence += f"\n✅ 【工作区物理视网膜同步】: {f_stats}\n"
+                except:
+                    pass
+
+            # [AOS 4.7] 强制工具路由与参数锚定
             # 优先从黑板读取锚定 URL，否则从任务描述中提取
             current_url = self.blackboard.read("SYSTEM_ROOT_URL")
             if not current_url:
@@ -452,7 +464,7 @@ class Orchestrator:
 
             if current_url:
                 # 全局变量死锁注入
-                physical_evidence += f"\n🎯 【核心目标锚点 (AOS 4.7)】: {current_url}\n"
+                physical_evidence += f"\n🎯 【核心目标锚点】: {current_url}\n"
                 
                 # 识别静态后缀并强制路由
                 static_exts = ['.js', '.json', '.txt', '.csv', '.xml']
