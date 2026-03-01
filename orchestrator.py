@@ -560,13 +560,11 @@ class Orchestrator:
                     val = self.blackboard.read(key) or ""
                     passed = len(val) >= assertion.get("min", 0)
                 elif a_type == "file_exists":
-                    # AOS 2.8.6: 增强型物理断言
+                    # [AOS 4.3] 物理刚性核验：文件必须存在且大小 > 100 字节（防止空壳文件蒙混过关）
                     file_path = assertion.get("file", "")
-                    # 如果是绝对路径，直接检查；如果是相对路径，优先拼接到工作区
                     if os.path.isabs(file_path):
                         full_p = file_path
                     elif self.workspace_path:
-                        # [AOS 2.9.3+] 规范化路径，移除多余的 ./ 并处理冗余前缀
                         p = file_path
                         if p.startswith("./"): p = p[2:]
                         if p.startswith("\\./"): p = p[3:]
@@ -574,15 +572,14 @@ class Orchestrator:
                     else:
                         full_p = os.path.abspath(file_path)
                         
-                    # [AOS 4.3] 物理刚性核验：不仅检查存在，还要检查文件大小 > 100 字节 (防止幻觉/空文件)
                     exists = os.path.exists(full_p)
                     size = os.path.getsize(full_p) if exists else 0
                     passed = exists and size > 100
                     
                     if passed:
-                        logger.info("🔬 [物理验收] 发现有效物理文件: %s (%d bytes)", full_p, size)
+                        logger.info("✅ 物理校验通过: %s (%d bytes)", file_path, size)
                     else:
-                        logger.error("🚫 [物理伪证拦截] 文件缺失或大小不足(%d bytes < 100B): %s", size, full_p)
+                        logger.error("🚫 物理伪证拦截：文件 %s 只有 %d 字节（或不存在），判定为无效执行！", file_path, size)
 
                 icon = "✅" if passed else "❌"
                 print(f"  {icon} [{a_type}] {key}: {criterion[:60]}")
@@ -747,14 +744,16 @@ class Orchestrator:
 
             # [AOS 4.3] 逻辑消磁：清理上一轮的任务状态，防止 Skip Trap
             self.blackboard.task_progress.clear()
-            if round_num > 1:
-                # 强制物理清理所有已完成标志，逼迫子专家重新执行工具动作
-                cleared_count = 0
+            if round_num > 1 and self.agent:
+                # 调用 McpAgent 的消磁逻辑
+                await self.agent.prepare_for_retry(self.blackboard)
+                yield "♻️ [消磁] 侦测到重试信号，已物理擦除所有专家状态标志，拒绝跳过。\n"
+            elif round_num > 1:
+                # 保底清理逻辑
                 for k in list(self.blackboard.facts.keys()):
                     if "_task_done_" in k:
                         self.blackboard.delete(k)
-                        cleared_count += 1
-                yield f"♻️ [消磁] 侦测到重试信号，已物理擦除 {cleared_count} 个状态标志，拒绝跳过。\n"
+                yield "♻️ [消磁] 侦测到重试信号，已物理清除状态标志。\n"
 
             # 2. 生成招聘计划 (AOS 2.4+: 优先尝试从经验库复用，并过 CFO 海关)
             is_fast_path = False

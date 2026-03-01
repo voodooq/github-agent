@@ -790,32 +790,36 @@ class SkillManager:
 
     async def run_full_checkup(self) -> str:
         """
-        [AOS 4.2] 免疫系统：全量物理与逻辑双重扫描报告。
+        [AOS 4.3] 免疫系统：物理级真实点火握手体检。
         """
-        print(f"📡 [AOS 4.2] 启动全量免疫扫描...")
-        results = []
+        print("\n📡 [OpenClaw 免疫系统] 正在启动全技能深度体检...")
+        print("-" * 50)
+        
+        results_lines = []
         details_for_bb = []
         
         for skill in self.registry:
             name = skill["name"]
             status = await self.check_health(name)
             
-            # 🚑 自动修复逻辑
+            # 🚑 自动修复逻辑 (AOS 4.3)
             if name in self.loaded_skills and not status["handshake_ok"]:
-                logger.warning("🚑 [自愈进程] 侦测到技能 '%s' 逻辑失效，启动断点重连...", name)
-                # 尝试暴力冷启动
+                print(f"   🚑 侦测到 {name} 逻辑失效，正在执行强行冷启动修复...")
                 await self.unload_skill(name)
                 load_res = await self.load_skill(name)
                 if load_res.get("status") == "loaded":
                     status["healed"] = True
                     status["handshake_ok"] = True
-                    status["reason"] = "已通过『暴力冷启动』自动修复"
             
-            status_icon = "🟢" if status["phys_ok"] and status["handshake_ok"] else "🟡" if not status["handshake_ok"] and "沉睡" in status.get("reason", "") else "🔴"
-            results.append(f"{status_icon} {name:<15} | 物理:{'PASS' if status['phys_ok'] else 'FAIL'} | 握手:{'PASS' if status['handshake_ok'] else 'FAIL'} | 状态:{status.get('reason', 'OK')}")
+            icon = "🟢 稳健" if status["phys_ok"] and status["handshake_ok"] else "🔴 异常"
+            line = f"{icon} | 技能: {name:<15} | 路径: {'OK' if status['phys_ok'] else 'ERR'} | 握手: {'OK' if status['handshake_ok'] else 'ERR'}"
+            print(line)
+            results_lines.append(line)
             details_for_bb.append(status)
             
-        # 🚨 AOS 4.2: Side-Effect Verification (副作用核验)
+        print("-" * 50 + "\n✅ 自检自愈完成")
+
+        # 🚨 AOS 4.3: Side-Effect Verification (副作用核验)
         if self.agent_ref and hasattr(self.agent_ref, "blackboard"):
             bb = self.agent_ref.blackboard
             try:
@@ -823,21 +827,18 @@ class SkillManager:
                 done_keys = [k for k in bb.facts.keys() if "_task_done_" in k or "reminder_scheduled_" in k]
                 for key in done_keys:
                     if key.replace("_task_done_", "") not in real_tasks_text and "reminder" in key:
-                        logger.warning("🔍 [副作用核验] 发现“账实不符”：黑板标记了 %s 但数据库无记录。物理抹除中...", key)
+                        logger.warning("🔍 [副作用核验] 发现“账实不符”：黑板已标记 %s 但物理库无记录。物理抹除中...", key)
                         bb.delete(key)
-                        bb.delete("_task_completed") 
             except:
                 pass
 
-        report_text = "\n".join(results)
-        
         # 同步体检报告到黑板
         if self.agent_ref and hasattr(self.agent_ref, "blackboard"):
             bb_data = {
-                "overall": "HEALTHY" if "🔴" not in report_text else "UNSTABLE",
+                "overall": "HEALTHY" if "🔴" not in "\n".join(results_lines) else "UNSTABLE",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "details": details_for_bb
             }
             self.agent_ref.blackboard.write("skill_health_report", bb_data, author="ImmuneSystem")
         
-        return report_text
+        return "\n".join(results_lines)

@@ -651,6 +651,21 @@ class McpAgent:
         self.openaiTools = []
 
         
+    async def prepare_for_retry(self, blackboard: Blackboard):
+        """
+        [AOS 4.3] 强制洗脑（逻辑消磁）：重试前抹除所有完成标志。
+        确保每一轮重跑都是真实的物理重跑，拒绝 Skip Trap。
+        """
+        logger.info("♻️ [AOS 4.3] 正在执行重试消磁程序...")
+        keys_to_clear = [k for k in blackboard.facts.keys() if k.startswith("_task_done_")]
+        for k in keys_to_clear:
+            blackboard.delete(k)
+            logger.info("   - 已物理抹除专家状态: %s (强制重跑)", k)
+        
+        # 抹除全局完成标志
+        blackboard.delete("_task_completed")
+        logger.info("✅ 逻辑消磁完成：已物理强制重置所有专家状态")
+
     async def connect(self, session: ClientSession) -> list[str]:
         """
         绑定 MCP Session 并获取可用工具列表
