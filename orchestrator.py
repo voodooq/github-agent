@@ -78,6 +78,13 @@ DOD_GENERATOR_PROMPT = """你是一个极其严格的需求分析师。
 3. **禁止刻舟求剑**: [CRITICAL] 绝对禁止将“安装/加载某技能”的验收标准设为“物理文件或同名文件存在”。MCP 技能安装是注册表级的，不会在工作区产生同名文件。
 4. **翻译宽容**: 你生成的断言可以为中文，系统会自动对齐英文 success/loaded。
 
+【工具调用协议 2.0 (AOS 4.2)】:
+1. 若目标地址后缀为 .js, .json, .txt, .csv 或 OSS 直链地址，必须优先使用 'fetch'。
+2. 严禁对非 HTML 页面使用 'puppeteer_navigate'，否则视为算力浪费。
+3. 任何专家在物理工具报错时，严禁通过输出 Markdown 总结来伪造“任务完成”。
+【物理刚性校验 (AOS 4.3)】: 所有的 'file_exists' 断言必须暗示内容非空（系统将强制执行 > 100B 校验）。
+【反脑补禁令 (AOS 4.3)】: 若无法获取真实数据源，必须如实汇报 `DATA_SOURCE_MISSING`，严禁捏造数据。
+
 不要输出任何解释文字，只输出 JSON 数组。"""
 
 VERIFIER_PROMPT = """你是一个极其严苛、具有「反幻觉」倾向公的 AOS (自治操作系统) 首席审计官。
@@ -152,7 +159,9 @@ RECRUITER_PROMPT = """你是一个数字公司的"项目经理"。
 - 每个子 Agent 只做一件事
 - 明确指定黑板读写字段名
 - 没有依赖关系的角色会并发执行
-- 最多 5 个子 Agent（控制开销）"""
+- 最多 5 个子 Agent（控制开销）
+- 【工具调用协议 2.0】：静态资源 (.js/.json/.txt) 必须强制子专家调用 'fetch'，严禁使用浏览器。
+- 【防反动/防摸鱼补丁】：严禁在物理数据源缺失时输出任何包含虚构数据的 Markdown 报告。"""
 
 
 META_PROMPT_TEMPLATE = """你是 AOS (自治操作系统) 的「核心经验抽象专家」。
@@ -565,11 +574,15 @@ class Orchestrator:
                     else:
                         full_p = os.path.abspath(file_path)
                         
-                    passed = os.path.exists(full_p)
+                    # [AOS 4.3] 物理刚性核验：不仅检查存在，还要检查文件大小 > 100 字节 (防止幻觉/空文件)
+                    exists = os.path.exists(full_p)
+                    size = os.path.getsize(full_p) if exists else 0
+                    passed = exists and size > 100
+                    
                     if passed:
-                        logger.info("🔬 [物理验收] 发现真实文件: %s", full_p)
+                        logger.info("🔬 [物理验收] 发现有效物理文件: %s (%d bytes)", full_p, size)
                     else:
-                        logger.warning("🔬 [物理验收失败] 文件不存在或路径错误: %s", full_p)
+                        logger.error("🚫 [物理伪证拦截] 文件缺失或大小不足(%d bytes < 100B): %s", size, full_p)
 
                 icon = "✅" if passed else "❌"
                 print(f"  {icon} [{a_type}] {key}: {criterion[:60]}")
@@ -732,8 +745,16 @@ class Orchestrator:
         for round_num in range(1, max_rounds + 1):
             yield f"\n{'='*40}\n🔄 第 {round_num}/{max_rounds} 轮执行\n{'='*40}\n"
 
-            # 清理上一轮的任务状态（保留事实）
+            # [AOS 4.3] 逻辑消磁：清理上一轮的任务状态，防止 Skip Trap
             self.blackboard.task_progress.clear()
+            if round_num > 1:
+                # 强制物理清理所有已完成标志，逼迫子专家重新执行工具动作
+                cleared_count = 0
+                for k in list(self.blackboard.facts.keys()):
+                    if "_task_done_" in k:
+                        self.blackboard.delete(k)
+                        cleared_count += 1
+                yield f"♻️ [消磁] 侦测到重试信号，已物理擦除 {cleared_count} 个状态标志，拒绝跳过。\n"
 
             # 2. 生成招聘计划 (AOS 2.4+: 优先尝试从经验库复用，并过 CFO 海关)
             is_fast_path = False

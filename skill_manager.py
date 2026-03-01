@@ -754,7 +754,7 @@ class SkillManager:
 
     async def check_health(self, skill_name: str) -> dict:
         """
-        [AOS 4.0] 免疫自检：针对单个技能进行三级健康检查。
+        [AOS 4.2] 免疫自检：针对单个技能进行物理与逻辑双重扫描。
         """
         config = self.get_skill_config(skill_name)
         if not config:
@@ -762,104 +762,82 @@ class SkillManager:
 
         report = {
             "name": skill_name, 
-            "static": "PASS", 
-            "dynamic": "PASS", 
-            "semantic": "PASS", 
+            "phys_ok": False, 
+            "handshake_ok": False, 
             "healed": False
         }
         
-        # 🟢 Level 1: Static Physical Check (针对外部命令可用性)
-        # 简单校验 command 是否在该 OS 路径下可通过 (此项可通过 try catch load 替代，此处预留)
+        # 🟢 Level 1: Physical Check (针对外部命令或路径)
+        # 检查 command 是否在路径中 (或者如果是 npx 则默认 PATH)
+        report["phys_ok"] = True # 默认通过，后续可增加 shutil.which 校验
         
-        # 🔵 Level 2: Dynamic Process Check
+        # 🔵 Level 2: Logic Handshake (探针)
         if skill_name in self.loaded_skills:
             skill = self.loaded_skills[skill_name]
-            if skill.runner_task.done():
-                 report["dynamic"] = "FAIL"
-                 report["reason"] = "进程已意外退出或被系统挂起"
-            else:
-                # 🟡 Level 3: Semantic Handshake (Ping)
+            if not skill.runner_task.done():
                 try:
-                    # 使用 list_tools 作为心跳，设置短超时
-                    await asyncio.wait_for(skill.session.list_tools(), timeout=5.0)
+                    # 使用 list_tools 作为心跳探针，限时 3.0s (AOS 4.2 标准)
+                    await asyncio.wait_for(skill.session.list_tools(), timeout=3.0)
+                    report["handshake_ok"] = True
                 except Exception as e:
-                    report["semantic"] = "FAIL"
-                    report["reason"] = f"语义握手超时 (Zombified): {str(e)}"
+                    report["reason"] = f"握手失败 (Zombified): {str(e)}"
+            else:
+                report["reason"] = "进程已意外退出"
         else:
-            # 未加载的技能，动态和语义检查跳过
-            report["dynamic"] = "N/A"
-            report["semantic"] = "N/A"
+            report["reason"] = "技能尚未加载（沉睡中）"
             
         return report
 
-    async def run_full_checkup(self) -> dict:
+    async def run_full_checkup(self) -> str:
         """
-        [AOS 4.0] 全量免疫扫描与自愈。
-        遍历所有已注册技能，检测由于环境漂移、进程挂死造成的异常，并执行暴力冷启动修复。
+        [AOS 4.2] 免疫系统：全量物理与逻辑双重扫描报告。
         """
-        print(f"📡 [AOS 4.0] 启动全量免疫扫描...")
+        print(f"📡 [AOS 4.2] 启动全量免疫扫描...")
         results = []
+        details_for_bb = []
+        
         for skill in self.registry:
             name = skill["name"]
             status = await self.check_health(name)
             
-            # 🚑 自愈逻辑 (Self-Healing)
-            # 如果是已加载但语义失败的（僵尸进程），或者已加载但 Task 挂了（崩了），执行重连
-            if status["dynamic"] == "FAIL" or status["semantic"] == "FAIL":
-                logger.warning("🚑 [自愈进程] 侦测到技能 '%s' 处于亚健康状态，启动断点重连...", name)
-                # 记录原始加载参数（如 workspace）
-                old_args = []
-                if name in self.loaded_skills:
-                    old_args = self.loaded_skills[name].last_args
-                    await self.unload_skill(name)
-                
+            # 🚑 自动修复逻辑
+            if name in self.loaded_skills and not status["handshake_ok"]:
+                logger.warning("🚑 [自愈进程] 侦测到技能 '%s' 逻辑失效，启动断点重连...", name)
                 # 尝试暴力冷启动
-                load_res = await self.load_skill(name) # 此处暂时默认不带 workspace，或由 load_skill 内部处理 always_loaded
+                await self.unload_skill(name)
+                load_res = await self.load_skill(name)
                 if load_res.get("status") == "loaded":
                     status["healed"] = True
-                    status["dynamic"] = "PASS"
-                    status["semantic"] = "PASS"
-                    status["reason"] = "已通过『暴力冷启动』恢复稳态"
+                    status["handshake_ok"] = True
+                    status["reason"] = "已通过『暴力冷启动』自动修复"
             
-            results.append(status)
-        
-        # 🚨 AOS 4.1: Side-Effect Verification (副作用核验)
-        # 针对调度器等具有持久化副作用的技能，进行“账实核验”
+            status_icon = "🟢" if status["phys_ok"] and status["handshake_ok"] else "🟡" if not status["handshake_ok"] and "沉睡" in status.get("reason", "") else "🔴"
+            results.append(f"{status_icon} {name:<15} | 物理:{'PASS' if status['phys_ok'] else 'FAIL'} | 握手:{'PASS' if status['handshake_ok'] else 'FAIL'} | 状态:{status.get('reason', 'OK')}")
+            details_for_bb.append(status)
+            
+        # 🚨 AOS 4.2: Side-Effect Verification (副作用核验)
         if self.agent_ref and hasattr(self.agent_ref, "blackboard"):
             bb = self.agent_ref.blackboard
             try:
-                # 1. 尝试获取物理数据库中的真实任务列表
                 real_tasks_text = await self.call_tool("list_scheduled_tasks", {})
-                
-                # 2. 扫描黑板中所有声称“已完成”的任务标志 (模式: _task_done_{expert})
-                # 以及特定的定时任务完成标志 (如 reminder_scheduled_at_xxxx)
                 done_keys = [k for k in bb.facts.keys() if "_task_done_" in k or "reminder_scheduled_" in k]
-                
                 for key in done_keys:
-                    # 如果黑板有标志，但物理列表里完全搜不到相关任务 ID 或描述
-                    # (由于 list_scheduled_tasks 返回的是文本，我们进行模糊匹配)
-                    # 注意：这只是一个简单的启发式自检，防止明显的“纸面胜利”
                     if key.replace("_task_done_", "") not in real_tasks_text and "reminder" in key:
-                        logger.warning("🔍 [副作用核验] 发现“账实不符”：黑板标记了 %s 但数据库中无相关记录。正在物理抹除...", key)
+                        logger.warning("🔍 [副作用核验] 发现“账实不符”：黑板标记了 %s 但数据库无记录。物理抹除中...", key)
                         bb.delete(key)
-                        # 同时抹掉 Orchestrator 的任务完成标志
                         bb.delete("_task_completed") 
-            except Exception as e:
-                # 如果没加载 scheduler 技能，call_tool 会抛错，此处静默忽略
+            except:
                 pass
 
-        # 统计整体稳态
-        total_fail = len([r for r in results if r["static"] == "FAIL" or r["dynamic"] == "FAIL" or r["semantic"] == "FAIL"])
-        overall = "HEALTHY" if total_fail == 0 else "UNSTABLE"
+        report_text = "\n".join(results)
         
-        report = {
-            "overall": overall,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "details": results
-        }
-        
-        # 将体检报告同步到黑板
+        # 同步体检报告到黑板
         if self.agent_ref and hasattr(self.agent_ref, "blackboard"):
-            self.agent_ref.blackboard.write("skill_health_report", report, author="ImmuneSystem")
+            bb_data = {
+                "overall": "HEALTHY" if "🔴" not in report_text else "UNSTABLE",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "details": details_for_bb
+            }
+            self.agent_ref.blackboard.write("skill_health_report", bb_data, author="ImmuneSystem")
         
-        return report
+        return report_text
