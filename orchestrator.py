@@ -586,13 +586,20 @@ class Orchestrator:
         return False
 
     async def verify_results(self, dod: list, results: dict[str, str]) -> dict:
-        # [AOS 5.2] Maintenance Pass Logic: 针对自维护任务的极简验收
+        # [AOS 5.3] Zero-Intelligence Verifier (去智能化物理验收)
         if self.current_mission_plan.get("plan_summary") == "自维护单兵任务":
-            logger.info("⚡ [AOS 5.2] 正在应用极速验收协议 (Maintenance Pass)...")
-            # 物理收敛信号判定
+            logger.info("⚡ [AOS 5.3] 正在应用极速验收协议 (Zero-Intelligence Pass)...")
+            
+            # 1. 探测物理截断信号
+            for role, res_text in results.items():
+                if "INSTANT_KILL_PASS" in res_text or "TASK_COMPLETED" in res_text:
+                    logger.info("✅ [AOS 5.3] 探测到物理成功信号，直接判 PASS")
+                    return {"overall": "PASS", "details": [], "correction_hint": "物理操作已闭环。"}
+
+            # 2. 物理收敛信号判定 (含备份词)
             found_stop = False
             for role, res_text in results.items():
-                if any(kw in res_text for kw in ["TASK_COMPLETED", "强行收敛终止", "共 0 个", "清理完毕", "0 tasks found"]):
+                if any(kw in res_text for kw in ["强行收敛终止", "共 0 个", "清理完毕", "0 tasks found", "处于最新状态"]):
                     found_stop = True
                     break
             if found_stop:

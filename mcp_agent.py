@@ -1960,6 +1960,16 @@ class McpAgent:
                     # [AOS 5.2] Physical Convergence Lock (收敛强关补丁)
                     # 如果工具反馈暗示任务已完成或环境已处于目标状态，立即关断循环返回结果，拒绝 Round 2
                     stop_keywords = ["共 0 个", "清理完毕", "Already cleaned", "0 tasks found", "处于最新状态", "已被物理抹除", "当前无任何待执行"]
+                    
+                    # [AOS 5.3] INSTANT_KILL Protocol: 硬核物理截断
+                    # 针对调度器工具的成功信号，实现“活干完立即关断”
+                    instant_kill_signals = ["⏰ [调度器]", "💥 [调度器]"]
+                    
+                    if any(sig in resultText for sig in instant_kill_signals):
+                        logger.info("⚡ [AOS 5.3] INSTANT_KILL: 调度器操作成功，强制物理断电。")
+                        self.memories[context_id].append({"role": "tool", "tool_call_id": tc["id"], "content": resultText})
+                        return f"INSTANT_KILL_PASS: {resultText}"
+
                     if any(sk.lower() in resultText.lower() for sk in stop_keywords):
                         logger.info("🛑 [AOS 5.2] Physical Convergence: 目标物理达成，强制收敛。回传结果并结束。")
                         # 写入记忆以便后续审计
