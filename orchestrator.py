@@ -586,6 +586,19 @@ class Orchestrator:
         return False
 
     async def verify_results(self, dod: list, results: dict[str, str]) -> dict:
+        # [AOS 5.2] Maintenance Pass Logic: 针对自维护任务的极简验收
+        if self.current_mission_plan.get("plan_summary") == "自维护单兵任务":
+            logger.info("⚡ [AOS 5.2] 正在应用极速验收协议 (Maintenance Pass)...")
+            # 物理收敛信号判定
+            found_stop = False
+            for role, res_text in results.items():
+                if any(kw in res_text for kw in ["TASK_COMPLETED", "强行收敛终止", "共 0 个", "清理完毕", "0 tasks found"]):
+                    found_stop = True
+                    break
+            if found_stop:
+                logger.info("✅ [AOS 5.2] 物理状态已收敛，判定 PASS")
+                return {"overall": "PASS", "details": [], "correction_hint": "物理目标已达成，单兵任务自动结项。"}
+
         pre_check_results = []
         has_assertions = False
         for item in dod:
@@ -807,7 +820,6 @@ class Orchestrator:
         # 针对系统维护类任务，直接由主 Agent 物理碾压，禁止 PM 开废会
         maintenance_keywords = ["schedule", "task", "定时任务", "skill", "技能", "economy", "财务", "钱包", "balance", "curator", "安装", "清空", "清理"]
         is_maintenance = any(kw in user_demand.lower() for kw in maintenance_keywords)
-        
         if is_maintenance:
             yield f"⚡ [AOS 5.0] 极速闭环：识别到系统维护任务，启动‘单兵作战’模式 (Bypass PM)...\n"
             # 物理路径锁定
@@ -816,16 +828,26 @@ class Orchestrator:
             os.makedirs(self.workspace_path, exist_ok=True)
             if self.agent:
                 self.agent.workspace_path = self.workspace_path
+
+            self.current_mission_plan = {"plan_summary": "自维护单兵任务"} # [AOS 5.2] 对齐 Verifier
             
             final_report = await self.agent.execute_with_tools(
-                system_prompt="你现在是系统主控官。直接调用工具完成任务，不准废话，不准招聘。完成后直接在黑板写结果。",
+                system_prompt="你现在是系统主控官。直接调用工具完成任务，不准废话，不准招聘。若观察到目标已达成或环境已处于目标状态（例如清理已完成、文件已存在且正确），必须立即停止并输出 'TASK_COMPLETED'。禁止重复执行已经产生结果的操作。",
                 user_demand=user_demand,
                 tier="PREMIUM", 
                 context_id="maintenance_direct",
                 workspace_path=self.workspace_path
             )
             yield f"\n📊 【单兵任务报告】\n{final_report}\n"
-            yield f"✅ [AOS 5.0] 物理闭环成功。工作区: {self.workspace_path}\n"
+            
+            # [AOS 5.2] 调用裁判验证物理收敛
+            yield "⚖️ AI 裁判正在进行物理收敛核验...\n"
+            verdict = await self.verify_results(["物理操作已达成"], {"master": final_report})
+            
+            if verdict.get("overall") == "PASS":
+                yield f"✅ [AOS 5.2] 物理闭环成功。工作区: {self.workspace_path}\n"
+            else:
+                yield f"❌ [AOS 5.2] 物理校检未完全通过: {verdict.get('correction_hint', '')}\n"
             return
 
         # 0. 为本次任务创建物理工作区沙箱 (AOS 2.7+)

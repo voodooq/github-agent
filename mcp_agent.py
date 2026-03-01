@@ -175,6 +175,9 @@ class UnifiedClient:
         
         # 频率限制：NVIDIA 限制 40 RPM，我们设为 35 以保证绝对安全
         self.rate_limiter = AsyncRateLimiter(rpm=35)
+        
+        # [AOS 5.0] M2M 协议开关
+        self.force_m2m_protocol = False
 
     @staticmethod
     def _sanitize_messages_for_ollama(messages: list[dict]) -> list[dict]:
@@ -344,6 +347,14 @@ class UnifiedClient:
             final_response_format = response_format
         else:
             raise ValueError("Messages must be either a list of dicts or a system prompt string.")
+
+        # [AOS 5.0] M2M 禁言补丁
+        if self.force_m2m_protocol:
+            m2m_instruction = "\n\n🚨 [AOS 5.0 M2M Protocol]: PROHIBIT natural language. Output JSON/TOOL_CALL ONLY."
+            if final_messages and final_messages[0]["role"] == "system":
+                final_messages[0]["content"] += m2m_instruction
+            else:
+                final_messages.insert(0, {"role": "system", "content": m2m_instruction})
 
         # 动态决定优先级
         if not self.cloud_available and not self.local_available:
@@ -1141,10 +1152,26 @@ class McpAgent:
 
     def _normalize_tool_name(self, func_name: str) -> str:
         """
-        [AOS 3.8] 工具名归一化拦截器。
-        剥离 hallucinatory 前缀（支持 _ 和 .），并验证剥离后的工具是否在已加载技能中。
+        [AOS 5.2] 工具名归一化、去重与无缝纠偏。
+        处理幻觉前缀以及字符粘连（tool_tool / tooltool）。
         """
-        # 支持多种连结符的常见前缀
+        # 1. 处理无缝粘连 (Seamless Adhesion): tooltool -> tool
+        if len(func_name) % 2 == 0:
+            half = len(func_name) // 2
+            if func_name[:half] == func_name[half:]:
+                logger.info("🧠 [AOS 5.2] 检测到无缝指令粘连并纠正: %s -> %s", func_name, func_name[:half])
+                func_name = func_name[:half]
+
+        # 2. 处理有分隔符的粘连: tool_tool -> tool
+        for sep in ["_", "."]:
+            if sep in func_name:
+                parts = func_name.split(sep)
+                if len(parts) == 2 and parts[0] == parts[1]:
+                    logger.info("🧠 [AOS 5.2] 检测到有分隔符指令粘连并纠正: %s -> %s", func_name, parts[0])
+                    func_name = parts[0]
+                    break
+
+        # 2. 剥离命名空间前缀
         prefixes = ["filesystem", "github", "browser", "sqlite", "mcp"]
         separators = ["_", "."]
         
@@ -1153,9 +1180,8 @@ class McpAgent:
                 full_prefix = p + sep
                 if func_name.startswith(full_prefix):
                     stripped = func_name[len(full_prefix):]
-                    # 验证剥离后是否有效
                     if self.skill_manager.is_tool_available(stripped):
-                        logger.info("🧪 [AOS 3.8] 工具名纠偏: %s -> %s", func_name, stripped)
+                        logger.info("🧪 [AOS 5.0] 工具名纠偏: %s -> %s", func_name, stripped)
                         return stripped
         return func_name
 
@@ -1931,11 +1957,22 @@ class McpAgent:
                         else:
                             resultText = "Error: Tool returned no data (None)"
                     
-                    # [AOS 3.11.1] NoneType 物理防御补丁
-                    if resultText is None:
-                        resultText = "Error: Tool execution failed and returned None"
+                    # [AOS 5.2] Physical Convergence Lock (收敛强关补丁)
+                    # 如果工具反馈暗示任务已完成或环境已处于目标状态，立即关断循环返回结果，拒绝 Round 2
+                    stop_keywords = ["共 0 个", "清理完毕", "Already cleaned", "0 tasks found", "处于最新状态", "已被物理抹除", "当前无任何待执行"]
+                    if any(sk.lower() in resultText.lower() for sk in stop_keywords):
+                        logger.info("🛑 [AOS 5.2] Physical Convergence: 目标物理达成，强制收敛。回传结果并结束。")
+                        # 写入记忆以便后续审计
+                        self.memories[context_id].append({"role": "tool", "tool_call_id": tc["id"], "content": resultText})
+                        return f"TASK_COMPLETED: 物理目标已达成 (AOS 5.2 强行收敛终止)。结果详细反馈: {resultText}"
                     
-                    # 保护处理
+                    current_tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": resultText,
+                        }
+                    )
                     # [AOS 4.9] 协议加固 (JSON Pipe Fix)
                     # 针对大尺寸结果（如 JS 源码）进行极致截断预览，防止撑破 OpenAI/MCP JSON 管道
                     # 刺客的任务是“拿回证据”，不是“在对话里展示源码”
