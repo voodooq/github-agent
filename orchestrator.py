@@ -484,15 +484,21 @@ class Orchestrator:
                 # 中间：刺客模式 (M2M)
                 full_system_prompt += "\n" + DIRECT_EXECUTION_PROTOCOL
 
-            # [AOS 3.7] 智商自动升档拦截器：识别高智商任务并强制 PREMIUM
+            # [AOS 3.7/5.0] 智商自动升档拦截器：识别高智商任务并强制 PREMIUM
             target_tier = "LOCAL"
-            high_iq_keywords = ["discover", "install", "scout", "deploy", "loader", "config"]
+            high_iq_keywords = ["discover", "install", "scout", "loader", "config"]
             combined_text = (role_id + " " + task_desc).lower()
-            for kw in high_iq_keywords:
-                if kw in combined_text:
-                    target_tier = "PREMIUM"
-                    print(f"☁️ [柔性路由] 检测到高智商子任务 '{role_id}'，自动升档至 PREMIUM 算力...")
-                    break
+            
+            # [AOS 5.0] Intelligence Lock: 涉及技能发现的任务必须锁定 PREMIUM，严禁智力降级
+            if "discover_and_install_skill" in task_desc or "load_skill" in task_desc:
+                target_tier = "PREMIUM"
+                print(f"🔒 [AOS 5.0] Intelligence Lock: 正在任务 '{role_id}' 中锁定 PREMIUM 算力以执行技能自愈...")
+            else:
+                for kw in high_iq_keywords:
+                    if kw in combined_text:
+                        target_tier = "PREMIUM"
+                        print(f"☁️ [柔性路由] 检测到高智商子任务 '{role_id}'，自动升档至 PREMIUM 算力...")
+                        break
 
             # AOS 2.1: 优先使用具备工具执行能力的 Agent.execute_with_tools 避免幻觉
             if self.agent:
@@ -510,11 +516,22 @@ class Orchestrator:
                     task_desc,
                 )
 
+            # [AOS 4.8] 状态纠偏协议 (State Correction Protocol)
+            # 识别“空头支票”内容：如果结果中包含明显的失败话术，严禁标记为 true
+            apology_patterns = ["无法获取", "数据缺失", "道歉", "未提供", "抓取失败", "死循环中断", "无法提供具体的3月赛事详情"]
+            is_polite_failure = any(pw in result_text for pw in apology_patterns)
+            
             # 将结果写入黑板
             self.blackboard.write(f"result_{role_id}", result_text[:2000], author=role_id)
-            # 标记任务完成（唤醒依赖方）
-            self.blackboard.write(f"_task_done_{role_id}", "true", author=role_id)
-            self.blackboard.update_task(role_id, "COMPLETED", "任务完成")
+            
+            if is_polite_failure:
+                logger.warning(f"🚫 [状态拦截] 子专家 {role_id} 返回了疑似“礼貌性失败”的内容，拦截 DONE 标志。")
+                self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
+                self.blackboard.update_task(role_id, "FAILED", "鉴定为礼貌性摆烂")
+            else:
+                # 标记任务完成（唤醒依赖方）
+                self.blackboard.write(f"_task_done_{role_id}", "true", author=role_id)
+                self.blackboard.update_task(role_id, "COMPLETED", "任务完成")
 
             return result_text
 
@@ -624,11 +641,16 @@ class Orchestrator:
                         # 即使文件存在且足够大，如果内容充满礼貌性道歉，依然判定为失败
                         try:
                             with open(full_p, 'r', encoding='utf-8') as f:
-                                content = f.read(2000) # 只读开头部分
-                                apology_keywords = ["无法获取", "数据缺失", "道歉", "未提供", "抓取失败", "PHYSICAL_FETCH_FAILED", "DATA_SOURCE_MISSING"]
+                                # [AOS 4.8] 深度内容扫描：扩大搜索范围并增加关键词
+                                content = f.read(5000) 
+                                apology_keywords = [
+                                    "无法获取", "数据缺失", "道歉", "未提供", "抓取失败", 
+                                    "PHYSICAL_FETCH_FAILED", "DATA_SOURCE_MISSING",
+                                    "无法提供具体的3月赛事详情", "死循环中断", "由于网络原因"
+                                ]
                                 if any(kw in content for kw in apology_keywords):
-                                    logger.error(f"🚫 [反忽悠拦截] 文件 '{file_path}' 虽在，但内容鉴定为“礼貌性失败”，拒绝验收！")
-                                    passed = False # Set passed to False if apology detected
+                                    logger.error(f"🚫 [反忽悠拦截] 文件 '{file_path}' 虽在，但内容鉴定为“礼貌性摆烂”，判定为 FAIL！")
+                                    passed = False 
                         except Exception as e:
                             logger.warning(f"❌ 物理文件内容读取失败: {e}")
                             # If content can't be read, it's suspicious, so fail the check

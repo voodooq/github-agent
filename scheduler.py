@@ -218,6 +218,19 @@ class Scheduler:
         print(f"🗑️ [调度器] 已取消任务: {task_id}")
         return {"status": "cancelled", "task_id": task_id}
 
+    def clear_all_tasks(self) -> dict:
+        """清空所有定时任务"""
+        count = len(self.tasks)
+        self.tasks.clear()
+        
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM scheduled_tasks")
+        conn.commit()
+        conn.close()
+        
+        print(f"💥 [调度器] 已清理所有任务 (共 {count} 个)")
+        return {"status": "cleared", "count": count}
+
     def list_tasks(self) -> list[dict]:
         """列出所有定时任务"""
         result = []

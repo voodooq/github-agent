@@ -266,6 +266,30 @@ class SkillManager:
 
         return {"status": "unloaded"}
 
+    async def hot_load_skill(self, name: str, workspace_path: str | None = None) -> dict:
+        """
+        [AOS 5.0] 物理环境对齐：热加载技能并瞬间同步到当前活跃专家的工具箱中。
+        """
+        logger.info(f"🧬 [AOS 5.0] 正在执行技能热插拔: {name}")
+        
+        # 1. 如果是 filesystem 等关键技能，先强制卸载旧的（如果有）以确保路径授权更新
+        if name in self.loaded_skills:
+            await self.unload_skill(name)
+            
+        # 2. 调用标准加载流程
+        load_result = await self.load_skill(name, workspace_path=workspace_path)
+        
+        if load_result.get("status") in ["loaded", "already_loaded"]:
+            # 3. 🚨 [AOS 5.0] 核心对齐：触发 Agent 引用，强制刷新其内部的 openaiTools
+            if self.agent_ref:
+                logger.info(f"🛰️ [AOS 5.0] 正在同步新技能 '{name}' 到 Agent 视网膜...")
+                # 重新构建 Agent 的工具列表
+                self.agent_ref.openaiTools = self.agent_ref._get_combined_tools()
+                
+            logger.info(f"✅ [AOS 5.0] 技能 '{name}' 热插拔成功，物理层已就位。")
+            
+        return load_result
+
     async def unload_all(self) -> None:
         """安全卸载所有已加载的技能（程序退出时调用）"""
         names = list(self.loaded_skills.keys())
@@ -751,6 +775,29 @@ class SkillManager:
             "score": winner.get("score", 0),
             "description": description
         }
+
+    async def auto_install_and_load(self, query: str, session=None, workspace_path: str | None = None) -> dict:
+        """
+        [AOS 5.0] 完全自治安装闭环：发现 -> 安装 -> 注册 -> 热加载。
+        """
+        logger.info(f"🛰️ [AOS 5.0] 启动军火采购闭环: {query}")
+        
+        # 1. 发现并安装（自动写入注册表）
+        install_result = await self.auto_install(query, session)
+        
+        if install_result.get("status") == "installed":
+            skill_name = install_result["skill_name"]
+            # 2. 物理热插拔：加载并同步工具
+            load_result = await self.hot_load_skill(skill_name, workspace_path=workspace_path)
+            
+            return {
+                "status": "evolution_success",
+                "skill_name": skill_name,
+                "tools": load_result.get("tools", []),
+                "message": f"🏆 进化成功！新技能 '{skill_name}' 已就绪并同步至视网膜。"
+            }
+        
+        return install_result
 
     async def check_health(self, skill_name: str) -> dict:
         """

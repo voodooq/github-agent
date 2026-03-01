@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+import requests
 from typing import AsyncGenerator
 from openai import AsyncOpenAI
 from mcp import ClientSession
@@ -812,9 +813,32 @@ class McpAgent:
                     }
                 }
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "http_fetch",
+                    "description": "[AOS 4.9 刺客武装] 物理级 HTTP 下载工具。直接抓取资源并存入本地文件，绕过浏览器。专用于抓取静态 JS/JSON/OSS 直链。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "description": "目标资源的完整 URL"},
+                            "save_path": {"type": "string", "description": "本地保存相对路径，如 'sportList.js'"}
+                        },
+                        "required": ["url"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "clear_all_scheduled_tasks",
+                    "description": "清空所有已注册的定时任务。慎用！",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            },
         ]
         self.openaiTools.extend(phase3_tools)
-        toolNames.extend(["add_scheduled_task", "list_scheduled_tasks", "cancel_scheduled_task", "discover_and_install_skill"])
+        toolNames.extend(["add_scheduled_task", "list_scheduled_tasks", "cancel_scheduled_task", "clear_all_scheduled_tasks", "discover_and_install_skill", "http_fetch"])
 
         # 启动后台调度器心跳
         self.scheduler.start()
@@ -1001,10 +1025,10 @@ class McpAgent:
             content = self.skill_manager.get_content(name)
             return content or "技能未找到"
             
-        elif target_func == "load_skill":
+        elif target_func == "load_skill" or target_func == "hot_load_skill":
             name = arguments.get("name", "")
-            # 自动继承物理隔离约束
-            result = await self.skill_manager.load_skill(name, workspace_path=self.workspace_path)
+            # [AOS 5.0] 自动识别热加载需求
+            result = await self.skill_manager.hot_load_skill(name, workspace_path=self.workspace_path)
             return json.dumps(result, ensure_ascii=False)
 
         elif target_func == "unload_skill":
@@ -1051,9 +1075,10 @@ class McpAgent:
             self.economy.inject_funds(amount=amount)
             return f"成功注入资金 ${amount}: {desc}"
             
-        elif func_name == "discover_and_install_skill":
+        elif func_name == "discover_and_install_skill" or func_name == "auto_install_and_load":
             query = arguments.get("query", "")
-            result = await self.skill_manager.auto_install(query, self.session)
+            # [AOS 5.0] 升级为全自动闭环安装并加载
+            result = await self.skill_manager.auto_install_and_load(query, self.session, self.workspace_path)
             return json.dumps(result, ensure_ascii=False)
 
         elif func_name == "run_checkup":
@@ -1080,6 +1105,37 @@ class McpAgent:
             id = arguments.get("task_id", "")
             result = self.scheduler.cancel_task(id)
             return json.dumps(result, ensure_ascii=False)
+
+        elif func_name == "clear_all_scheduled_tasks":
+            result = self.scheduler.clear_all_tasks()
+            return json.dumps(result, ensure_ascii=False)
+
+        # [AOS 4.9] Assassin Armament: 刺客级物理下载工具
+        elif func_name == "http_fetch":
+            url = arguments.get("url", "")
+            save_path = arguments.get("save_path", "downloaded_file.js")
+            # 路径锚定
+            if not os.path.isabs(save_path):
+                if self.workspace_path:
+                    save_path = os.path.join(self.workspace_path, save_path)
+                else:
+                    save_path = os.path.abspath(save_path)
+            
+            try:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                }
+                r = requests.get(url, timeout=30, headers=headers)
+                r.raise_for_status()
+                with open(save_path, 'wb') as f:
+                    f.write(r.content)
+                size = len(r.content)
+                logger.info(f"🎯 [AOS 4.9] http_fetch 成功: {url} -> {save_path} ({size} 字节)")
+                return f"SUCCESS: {size} bytes saved to {os.path.basename(save_path)}. 物理文件已落地。"
+            except Exception as e:
+                err_msg = f"FAILED: http_fetch 无法获取 {url}. 错误: {str(e)}"
+                logger.error(err_msg)
+                return err_msg
 
         return None
 
@@ -1196,8 +1252,8 @@ class McpAgent:
         获取静态工具与动态技能工具的合集 (AOS 2.3)
         @param slim: 如果为 True, 则只返回核心元工具（用于极致省钱模式）
         """
-        # [AOS 2.9] 动态工具带：极大减少 Context 消耗
-        meta_tool_names = {"search_skills", "read_skill", "load_skill", "unload_skill", "list_skills"}
+        # [AOS 2.9/4.9] 动态工具带：极大减少 Context 消耗
+        meta_tool_names = {"search_skills", "read_skill", "load_skill", "unload_skill", "list_skills", "http_fetch"}
         
         all_tools = list(self.openaiTools) if self.openaiTools else []
         skill_tools = self.skill_manager.get_all_tools()
@@ -1682,6 +1738,8 @@ class McpAgent:
         MAX_ITERATIONS = 10 # [AOS 2.9.1] 弹性熔断：由 5 步增加至 10 步，确保浏览器等复杂工具能跑完
         call_history = []
         recent_errors = [] # [AOS 2.9] 同错熔断检测
+        success_count = 0  # [AOS 4.8] 工具执行成功计数
+        failure_count = 0  # [AOS 4.8] 工具执行失败计数
         
         for iteration in range(MAX_ITERATIONS):
             # [AOS 4.5] 极速闭环：记录执行前的黑板指纹快照
@@ -1874,8 +1932,19 @@ class McpAgent:
                         resultText = "Error: Tool execution failed and returned None"
                     
                     # 保护处理
-                    if len(resultText) > 20000:
-                        resultText = resultText[:20000] + "...(数据截断)"
+                    # [AOS 4.9] 协议加固 (JSON Pipe Fix)
+                    # 针对大尺寸结果（如 JS 源码）进行极致截断预览，防止撑破 OpenAI/MCP JSON 管道
+                    # 刺客的任务是“拿回证据”，不是“在对话里展示源码”
+                    if len(resultText) > 1000:
+                        preview = resultText[:500] + "\n\n...(中间数据已物理截断以保护管道)...\n\n" + resultText[-500:]
+                        resultText = f"【物理数据快照 (已截断)】\n{preview}\n\n⚠️ 提示：完整内容已存入物理文件，严禁要求在对话中输出完整源码！"
+                    
+                    # [AOS 4.8] 识别工具执行结果，更新成功/失败计数器
+                    if "Error:" in resultText or "错误:" in resultText or "failed" in resultText.lower():
+                        failure_count += 1
+                    else:
+                        success_count += 1
+                        
                     self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
                     
                 except Exception as e:
@@ -1900,6 +1969,10 @@ class McpAgent:
         # [AOS 2.9] 自动整理动态加载的技能，任务结束清空，保持“冷酷无情”的低成本状态
         # asyncio.create_task(self.skill_manager.unload_all())
         
+        # [AOS 4.8] 硬核主权：如果任务包含工具调用但全数失败，则返回明确的失败信号，防止伪装成功
+        if failure_count > 0 and success_count == 0:
+            return f"🚫 [AOS 4.8 物理拒绝] 任务关键工具库调用失败 ({failure_count} 次错误)。物理路径未打通，拒绝撰写 Markdown 报告。底层错误细节：{fullContent[:300]}"
+
         # [AOS 2.9.1] 温柔终止：如果跑满 10 步还没完，返回最后一次的原始内容，而不是报错。
         return fullContent or f"🛑 [提示] 已达到最大限制 ({MAX_ITERATIONS} 步)，任务已暂停。当前进度：{fullContent[:200] if fullContent else '无输出'}"
 
