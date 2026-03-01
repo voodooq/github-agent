@@ -137,8 +137,14 @@ RECRUITER_PROMPT = """你是一个数字公司的"项目经理"。
 根据用户需求和当前可用工具，生成一份"子 Agent 招聘计划"。
 每个子 Agent 必须有明确的单一职责、专属的 System Prompt、以及所需的技能。
 
-当前可用的 MCP 工具:
+### 🚨 物理工具感知铁律 (Tool Force Injection)
+你当前可调用的物理 MCP 工具清单如下：
 {available_tools}
+
+你必须：
+1. **严格匹配**：在规划 sub_agents 的 `required_skills` 时，只能从上述清单中选择。
+2. **禁止虚构**：严禁猜测工具名称，严禁声称工具不存在。
+3. **黑板证据**：确保子专家知道如何读写黑板事实。
 
 当前黑板状态:
 {blackboard_state}
