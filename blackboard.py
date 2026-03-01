@@ -198,19 +198,20 @@ class Blackboard:
         logger.warning("⚠️ [黑板] 快照 #%d 不存在", snap_id)
         return False
 
-    def clear(self) -> None:
-        """清空黑板（新任务开始时调用）"""
-        self.facts.clear()
-        self.snapshots.clear()
-        self.task_progress.clear()
-        self._events.clear()
-        # 清空错误队列
-        while not self.error_queue.empty():
-            try:
-                self.error_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        self._save()
+    def delete(self, key: str) -> bool:
+        """
+        [AOS 4.1] 物理擦除黑板记录。
+        用于免疫系统纠偏：当物理现实与黑板描述不符时，擦除虚假标志。
+        """
+        if key in self.facts:
+            del self.facts[key]
+            # 同时清除关联事件，防止残留触发
+            if key in self._events:
+                del self._events[key]
+            logger.info("🗑️ [黑板] 物理纠偏：已删除虚假/过时记录: %s", key)
+            self._save()
+            return True
+        return False
 
     # ========== 持久化 ==========
 

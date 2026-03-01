@@ -823,6 +823,31 @@ class SkillManager:
             
             results.append(status)
         
+        # 🚨 AOS 4.1: Side-Effect Verification (副作用核验)
+        # 针对调度器等具有持久化副作用的技能，进行“账实核验”
+        if self.agent_ref and hasattr(self.agent_ref, "blackboard"):
+            bb = self.agent_ref.blackboard
+            try:
+                # 1. 尝试获取物理数据库中的真实任务列表
+                real_tasks_text = await self.call_tool("list_scheduled_tasks", {})
+                
+                # 2. 扫描黑板中所有声称“已完成”的任务标志 (模式: _task_done_{expert})
+                # 以及特定的定时任务完成标志 (如 reminder_scheduled_at_xxxx)
+                done_keys = [k for k in bb.facts.keys() if "_task_done_" in k or "reminder_scheduled_" in k]
+                
+                for key in done_keys:
+                    # 如果黑板有标志，但物理列表里完全搜不到相关任务 ID 或描述
+                    # (由于 list_scheduled_tasks 返回的是文本，我们进行模糊匹配)
+                    # 注意：这只是一个简单的启发式自检，防止明显的“纸面胜利”
+                    if key.replace("_task_done_", "") not in real_tasks_text and "reminder" in key:
+                        logger.warning("🔍 [副作用核验] 发现“账实不符”：黑板标记了 %s 但数据库中无相关记录。正在物理抹除...", key)
+                        bb.delete(key)
+                        # 同时抹掉 Orchestrator 的任务完成标志
+                        bb.delete("_task_completed") 
+            except Exception as e:
+                # 如果没加载 scheduler 技能，call_tool 会抛错，此处静默忽略
+                pass
+
         # 统计整体稳态
         total_fail = len([r for r in results if r["static"] == "FAIL" or r["dynamic"] == "FAIL" or r["semantic"] == "FAIL"])
         overall = "HEALTHY" if total_fail == 0 else "UNSTABLE"
