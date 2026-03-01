@@ -329,6 +329,7 @@ class Orchestrator:
         agent_config: dict,
         user_demand: str,
         primary_session,
+        is_final: bool = False
     ) -> str:
         """
         执行单个子 Agent 的任务。
@@ -451,9 +452,14 @@ class Orchestrator:
 
             full_system_prompt = system_prompt + physical_evidence + dod_enforcement + SYSTEM_GUARDRAIL
             
-            # [AOS 4.5] 极速执行规约注入
-            from prompts import DIRECT_EXECUTION_PROTOCOL
-            full_system_prompt += "\n" + DIRECT_EXECUTION_PROTOCOL
+            # [AOS 4.6] Janus Router: 分流协议注入
+            from prompts import DIRECT_EXECUTION_PROTOCOL, EXPERT_H2M_PROTOCOL
+            if is_final:
+                # 终点：管家模式 (H2M)
+                full_system_prompt += "\n" + EXPERT_H2M_PROTOCOL
+            else:
+                # 中间：刺客模式 (M2M)
+                full_system_prompt += "\n" + DIRECT_EXECUTION_PROTOCOL
 
             # [AOS 3.7] 智商自动升档拦截器：识别高智商任务并强制 PREMIUM
             target_tier = "LOCAL"
@@ -818,9 +824,11 @@ class Orchestrator:
 
             # 拓扑排序：无依赖的先跑，有依赖的通过 wait_for 自动等待
             tasks = []
-            for agent_config in sub_agents:
+            # [AOS 4.6] Janus Router: 判定任务节点
+            for i, agent_config in enumerate(sub_agents):
+                is_final = (i == len(sub_agents) - 1)
                 tasks.append(
-                    self.execute_sub_agent(agent_config, user_demand, primary_session)
+                    self.execute_sub_agent(agent_config, user_demand, primary_session, is_final=is_final)
                 )
 
             # 并发执行所有子 Agent（依赖通过黑板事件自动协调）

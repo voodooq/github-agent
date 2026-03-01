@@ -87,3 +87,10 @@ skills:
   command: npx
   description: RLM 转换，多工具迭代，答案收敛
   name: aleph
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-WebScraperToolkit'
+  command: npx
+  description: AI驱动网页抓取引擎，隐形绕过，MCP服务器，多模态输出（Markdown, JSON, PDF）。
+  name: WebScraperToolkit
