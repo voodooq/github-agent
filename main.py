@@ -543,17 +543,21 @@ async def main():
                     print("─" * 60)
                     for detail in report['details']:
                         # 确定图标
-                        if detail['dynamic'] == "PASS" and detail['semantic'] == "PASS":
+                        phys_ok = detail.get('phys_ok', False)
+                        handshake_ok = detail.get('handshake_ok', False)
+                        
+                        if phys_ok and handshake_ok:
                             status_icon = "✅"
-                        elif detail['healed']:
+                        elif detail.get('healed'):
                             status_icon = "🚑"
-                        elif detail['static'] == "FAIL" or detail['dynamic'] == "FAIL" or detail['semantic'] == "FAIL":
+                        elif not phys_ok or not handshake_ok:
                             status_icon = "❌"
                         else:
                             status_icon = "⚪"
                             
                         reason = f" | {detail['reason']}" if detail.get('reason') else ""
-                        line = f"  {status_icon} {detail['name']:<15} | 动态: {detail['dynamic']:<5} | 语义: {detail['semantic']:<5}{reason}"
+                        # [AOS 4.4] 统一显示物理与握手状态
+                        line = f"  {status_icon} {detail['name']:<15} | 物理: {'OK' if phys_ok else 'ERR':<5} | 握手: {'OK' if handshake_ok else 'ERR':<5}{reason}"
                         print(line)
                     print("─" * 60 + "\n")
                     continue
