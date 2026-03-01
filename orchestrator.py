@@ -948,17 +948,18 @@ class Orchestrator:
 
             final_report = await self.agent.execute_with_tools(
                 system_prompt=(
-                    "你现在是 AOS 6.3 战时独裁官。禁止输出任何文字解释！禁止输出伪代码块！禁止询问意见！\n"
-                    "你必须通过【DB + FS】双重审计：\n"
-                    "1. 调用工具完成物理目标（如 add_scheduled_task）。\n"
-                    "2. 必须同时调用 write_file 在工作区生成一个 done.txt，内容包含任务详情，作为物理收据。\n"
-                    "你只有 3 轮机会（含拦截重算）。如果敢说废话而不调用工具，你将被视为‘逻辑坏疽’。"
+                    "你現在是 AOS 7.3 戰時獨裁官（Blitz 模式）。禁止輸出廢話！禁止詢問意見！\n"
+                    "你必須通過【物理收斂】審計：\n"
+                    "1. 立即調用工具執行任務。如果是分析/提取任務，【一旦發現目標文件路徑，必須立即調用 read_file 讀取其內容】並進行後續處理。\n"
+                    "2. 務必追求【一次性物理交付】。系統已分配 8 輪彈藥預算，但若你原地踏步（連續無物理產出且重複操作），內核將立即斷電並判定為邏輯壞疽。\n"
+                    "3. 如果你有產出（文件寫入/黑板更新），內核會自動為你延展生命線；否則，請在有限輪次內給出 done.txt 收據。\n"
+                    "拒絕演戲，拒絕偽代碼。立即執行。"
                 ),
                 user_demand=user_demand,
                 tier="PREMIUM", 
-                context_id="blitz_direct",
+                context_id=f"blitz_{os.path.basename(self.workspace_path)}",
                 workspace_path=self.workspace_path,
-                max_iterations=3, # [AOS 6.3] 增加一轮，确保 Dual-Check 逻辑有足够空间尝试
+                max_iterations=8, # [AOS 7.3] 初始預算上調，由 McpAgent 智能關斷
                 tools=targeted_tools
             )
             yield f"\n📊 【单兵任务报告】\n{final_report}\n"

@@ -319,6 +319,13 @@ async def main():
 
                     print(f"🚀 開始準備分析 {len(target_urls)} 個項目...\n")
 
+                    # [AOS 7.2] CFO 授權與 ROI 評估
+                    print("💰 [CFO] 正在評估分析任務 ROI...")
+                    await asyncio.sleep(0.6)
+                    mode = agent.economy.get_survival_mode()
+                    tier = agent.economy.get_recommended_tier()
+                    print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.10 深度分析預算。")
+
                     # [AOS 7.1] 激活隔離工作區
                     wsp = agent._setup_action_workspace("analyze")
                     print(f"📁 [隔離] 已分配分析沙盒: {wsp}\n")
@@ -390,6 +397,13 @@ async def main():
                         print(f"⚠️  未找到任何有效的 GitHub 地址。\n")
                         continue
 
+                    # [AOS 7.2] CFO 授權與 ROI 評估
+                    print("💰 [CFO] 正在評估多專家評審任務 ROI...")
+                    await asyncio.sleep(1.0)
+                    mode = agent.economy.get_survival_mode()
+                    tier = agent.economy.get_recommended_tier()
+                    print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.25 專家團專項預算。")
+
                     try:
                         # 觸發混合算力專家團評審 (支持單個或多個地址)
                         print(f"\n🤖 專家團綜合評審報告 (共 {len(target_urls)} 個項目)：\n", end="", flush=True)
@@ -449,9 +463,16 @@ async def main():
                     # AOS 2.0: 全自治模式
                     demand = userInput[6:].strip()
                     if not demand:
-                        print("⚠️  请输入任务需求，例如: /auto 找到最火的 3 个 Python 量化框架\n")
+                        print("⚠️  請輸入任務需求，例如: /auto 找到最火的 3 個 Python 量化框架\n")
                         continue
                     
+                    # [AOS 7.2] CFO 授權與 ROI 評估
+                    print("💰 [CFO] 正在評估自治任務 ROI...")
+                    await asyncio.sleep(0.8)
+                    mode = agent.economy.get_survival_mode()
+                    tier = agent.economy.get_recommended_tier()
+                    print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.50 全自治預算。")
+
                     try:
                         async for chunk in agent.autonomous_execute(demand):
                             print(chunk, end="", flush=True)

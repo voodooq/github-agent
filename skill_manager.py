@@ -364,7 +364,7 @@ class SkillManager:
 
         # 🚨 AOS 3.9.7: 内部工具直通车 (Absolute Sync)
         # 防止由于专家工具列表缺失或未同步导致重要生存工具报 Unknown tool
-        internal_tools = ["discover_and_install_skill", "cfo_report", "write_blackboard", "inject_funds", "cfo_approve"]
+        internal_tools = ["discover_and_install_skill", "cfo_report", "write_blackboard", "inject_funds", "cfo_approve", "list_scheduled_tasks", "add_scheduled_task"]
         if func_name in internal_tools and self.agent_ref:
             logger.info("⚡ [直通车] 内部工具 '%s' 被拦截并交由 AOS 核心处理", func_name)
             return await self.agent_ref._handle_internal_tool(func_name, arguments)
@@ -835,9 +835,9 @@ class SkillManager:
             
         return report
 
-    async def run_full_checkup(self) -> str:
+    async def run_full_checkup(self) -> dict:
         """
-        [AOS 4.3] 免疫系统：物理级真实点火握手体检。
+        [AOS 4.3] 免疫系統：物理級真實點火握手體檢。
         """
         print("\n📡 [OpenClaw 免疫系统] 正在启动全技能深度体检...")
         print("-" * 50)
@@ -880,12 +880,12 @@ class SkillManager:
                 pass
 
         # 同步体检报告到黑板
+        bb_data = {
+            "overall": "HEALTHY" if "🔴" not in "\n".join(results_lines) else "UNSTABLE",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "details": details_for_bb
+        }
         if self.agent_ref and hasattr(self.agent_ref, "blackboard"):
-            bb_data = {
-                "overall": "HEALTHY" if "🔴" not in "\n".join(results_lines) else "UNSTABLE",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "details": details_for_bb
-            }
             self.agent_ref.blackboard.write("skill_health_report", bb_data, author="ImmuneSystem")
         
-        return "\n".join(results_lines)
+        return bb_data

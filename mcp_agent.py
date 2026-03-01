@@ -77,12 +77,13 @@ class AsyncRateLimiter:
             now = asyncio.get_event_loop().time()
             elapsed = now - self.last_called
             if elapsed < self.interval:
-                wait_time = self.interval - elapsed
-                print(f"⏳ [频率控制] 保护中... 需等待 {wait_time:.2f}s 以遵循 40 RPM 限制")
-                await asyncio.sleep(wait_time)
-                self.last_called = asyncio.get_event_loop().time()
-            else:
-                self.last_called = now
+                sleep_time = self.interval - elapsed
+                # [AOS 7.4] 物理間隔保障：強制睡眠以滿足 API 網關的 TPS 限制
+                await asyncio.sleep(sleep_time)
+            
+            # [AOS 7.4] 安全緩衝：在每次調用前額外增加 0.5s 抖動防止併發爆發
+            await asyncio.sleep(0.5)
+            self.last_called = asyncio.get_event_loop().time()
 
 
 class TokenBudget:
@@ -173,10 +174,10 @@ class UnifiedClient:
         # Ollama 单 GPU 串行推理，信号量防止并发排队
         self._local_semaphore = asyncio.Semaphore(1)
         
-        # 频率限制：NVIDIA 限制 40 RPM，我们设为 35 以保证绝对安全
-        self.rate_limiter = AsyncRateLimiter(rpm=35)
+        # 頻率限制：下調至 20 RPM (約 3s/次)，確保絕對穩定
+        self.rate_limiter = AsyncRateLimiter(rpm=20)
         
-        # [AOS 5.0] M2M 协议开关
+        # [AOS 5.0] M2M 協議開關
         self.force_m2m_protocol = False
 
     @staticmethod
@@ -1002,13 +1003,17 @@ class McpAgent:
                             expert_available_tools.append(sys_t)
                             break
 
+            # [AOS 7.4] 物理主權：使用 UUID 徹底隔絕併發記憶污染
+            import uuid
+            safe_id = f"expert_{role}_{uuid.uuid4().hex[:8]}"
+            
             # [AOS 3.7.4/3.9.5] 升级为「递归自治」：使用 execute_with_tools 替代简单的 generate
             # 这赋予了子专家思考并调用工具的能力，真正解决幻觉并提交物理成果
             result = await self.execute_with_tools(
                 system_prompt=final_system_prompt,
                 user_demand=expert_prompt,
                 tier=target_tier,
-                context_id=f"expert_{role}_{int(asyncio.get_event_loop().time())}",
+                context_id=safe_id,
                 workspace_path=self.workspace_path,
                 tools=expert_available_tools
             )
@@ -1189,12 +1194,13 @@ class McpAgent:
                         return stripped
         return func_name
 
-    def _anchor_tool_paths(self, tool_name: str, arguments: dict) -> None:
+    def _anchor_tool_paths(self, tool_name: str, arguments: dict, workspace_override: str | None = None) -> None:
         """
         [AOS 3.6] 绝对路径锚点拦截器。
         强制将文件操作工具的相对路径（./xxx）锚定到当前任务的工作区。
         """
-        if not self.workspace_path:
+        effective_wsp = workspace_override if workspace_override else self.workspace_path
+        if not effective_wsp:
             return
 
         # 涉及路径操作的工具列表
@@ -1212,7 +1218,7 @@ class McpAgent:
                     # 清洗前缀 ./
                     clean_path = raw_path[2:] if raw_path.startswith("./") else raw_path
                     # 锚定到任务工作区
-                    anchored_path = os.path.abspath(os.path.join(self.workspace_path, clean_path))
+                    anchored_path = os.path.abspath(os.path.join(effective_wsp, clean_path))
                     arguments["path"] = anchored_path
                     logger.info("⚓ [AOS 3.6] 空间锚点拦截: %s -> %s", raw_path, anchored_path)
 
@@ -1700,9 +1706,15 @@ class McpAgent:
             "auto": "Auto",
             "blitz": "Blitz"
         }
+        # [AOS 7.4] 物理隔離：增加納秒與隨機後綴，防止併發啟動導致的路徑衝突
+        import time, random
+        sub_ms = int((time.time() % 1) * 1000)
+        rand_id = random.randint(100, 999)
+        dir_id = f"{timestamp}_{sub_ms:03d}_{rand_id}"
+        
         dir_name = action_dir_map.get(action_name.lower(), action_name.capitalize())
         
-        rel_path = os.path.join("Workspace", dir_name, f"{action_name}_{timestamp}")
+        rel_path = os.path.join("Workspace", dir_name, f"{action_name}_{dir_id}")
         abs_path = os.path.abspath(rel_path)
         
         os.makedirs(abs_path, exist_ok=True)
@@ -1792,15 +1804,15 @@ class McpAgent:
         2. 自动根据需求和黑板上下文调用工具
         [AOS 2.8.5] 支持同步外部锁定的工作区路径。
         """
+        # [AOS 7.4] 使用局部變量而非實例屬性，防止併發競爭
+        effective_workspace = workspace_path if workspace_path else self.workspace_path
+        
         # AOS 3.3: 基因共鸣 (Gene Resonance) 预先加载
         matched = self.skill_manager.match_genes(user_demand)
         for sname in matched:
             if sname not in self.skill_manager.loaded_skills:
                 # 针对子专家等静默模式加载
-                await self.skill_manager.load_skill(sname, workspace_path=workspace_path or self.workspace_path)
-
-        if workspace_path:
-            self.workspace_path = workspace_path
+                await self.skill_manager.load_skill(sname, workspace_path=effective_workspace)
             
         # [AOS 4.8] 如果是 LOCAL 模式，强制 M2M 协议以减少模型冗余输出
         if tier == "LOCAL":
@@ -1818,17 +1830,22 @@ class McpAgent:
         # 针对该任务重置预算
         self.token_budget.reset()
         
-        MAX_ITERATIONS = max_iterations # [AOS 5.4] 真值对齐：支持外部强制关断
+        MAX_ITERATIONS = max_iterations # [AOS 5.4] 真值對齊：支持外部強制關斷
         call_history = []
-        recent_errors = [] # [AOS 2.9] 同错熔断检测
+        fingerprint_history = set() # [AOS 7.3] 物理指紋歷史：(tool, args_hash, result_hash)
+        recent_errors = [] # [AOS 2.9] 同錯熔斷檢測
         success_count = 0  # [AOS 4.8] 工具执行成功计数
         failure_count = 0  # [AOS 4.8] 工具执行失败计数
+        consecutive_stale_rounds = 0 # [AOS 7.3] 连续无产出轮次
         
-        for iteration in range(MAX_ITERATIONS):
+        current_max = MAX_ITERATIONS
+        for iteration in range(100): # 物理硬上限，逻辑上限由 current_max 控制
+            if iteration >= current_max:
+                break
             # [AOS 4.5] 极速闭环：记录执行前的黑板指纹快照
             hash_before = self.blackboard.get_snapshot_hash()
             # [AOS 6.2] 执行前记录文件列表
-            iteration_start_files = os.listdir(self.workspace_path) if self.workspace_path and os.path.exists(self.workspace_path) else []
+            iteration_start_files = os.listdir(effective_workspace) if effective_workspace and os.path.exists(effective_workspace) else []
 
             # [AOS 2.9.1] 临终关怀：最后一步前注入警告提示
             if iteration == MAX_ITERATIONS - 1:
@@ -1975,7 +1992,7 @@ class McpAgent:
                 db_hash_after = self.scheduler.get_state_snapshot() if hasattr(self, "scheduler") else "none"
                 
                 # 判定是否有任何维度的物理产出
-                has_fs_delta = len(self._get_workspace_delta(iteration_start_files)) > 0
+                has_fs_delta = len(self._get_workspace_delta(iteration_start_files, workspace_override=effective_workspace)) > 0
                 has_bb_delta = hash_before != hash_after
                 has_db_delta = db_hash_before != db_hash_after
                 
@@ -2021,10 +2038,22 @@ class McpAgent:
                     actual_func = self._normalize_tool_name(funcName)
 
                     parsed_args = json.loads(arguments)
-                    # [AOS 3.6] 绝对路径锚定拦截器
-                    self._anchor_tool_paths(actual_func, parsed_args)
+                    # [AOS 3.6] 絕對路徑錨定攔截器：使用本輪局部工作區
+                    self._anchor_tool_paths(actual_func, parsed_args, workspace_override=effective_workspace)
+                    
+                    # [AOS 7.5] 大文件手柄協議：攔截讀取操作
+                    read_tools = ["read_file", "read_text_file", "filesystem_read_file", "get_file_contents"]
+                    if actual_func in read_tools or any(kw in actual_func for kw in ["read", "content", "file"]):
+                        path = parsed_args.get("path")
+                        if path and os.path.exists(path) and os.path.isfile(path):
+                            f_size = os.path.getsize(path)
+                            if f_size > 32 * 1024: # 32KB 閾值
+                                logger.warning("🛑 [AOS 7.5] 觸發大文件攔截: %s (%d bytes)", path, f_size)
+                                resultText = self._generate_big_file_summary(path, f_size)
+                    
                     # 按照优先级处理工具：内部 -> 技能 -> MCP
-                    resultText = await self._handle_internal_tool(actual_func, parsed_args)
+                    if resultText is None:
+                        resultText = await self._handle_internal_tool(actual_func, parsed_args)
                     if resultText is None:
                         resultText = await self.skill_manager.call_tool(actual_func, parsed_args)
                     if resultText is None:
@@ -2076,6 +2105,19 @@ class McpAgent:
                     else:
                         success_count += 1
                         
+                    # [AOS 7.3] 智能重複與原地踏步檢測
+                    import hashlib
+                    args_hash = hashlib.md5(arguments.encode()).hexdigest()
+                    result_hash = hashlib.md5(resultText.encode()).hexdigest()
+                    fingerprint = f"{funcName}:{args_hash}:{result_hash}"
+                    
+                    if fingerprint in fingerprint_history:
+                        logger.warning("🚫 [AOS 7.3] 檢測到重複執行且無結果位移: %s", funcName)
+                        # 如果重複，不計入成功產出，增加停機權重
+                        consecutive_stale_rounds += 0.5 
+                    else:
+                        fingerprint_history.add(fingerprint)
+
                     self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
                     
                 except Exception as e:
@@ -2096,6 +2138,23 @@ class McpAgent:
                 
             # [AOS 3.9.9] 确保全量 tool_calls 回传，无论中途有无内部异常
             self.memories[context_id].extend(current_tool_messages)
+
+            # [AOS 7.3] 輪次動態精算
+            hash_after = self.blackboard.get_snapshot_hash()
+            has_physical_delta = (hash_before != hash_after) or (len(self._get_workspace_delta(iteration_start_files, workspace_override=effective_workspace)) > 0)
+            
+            if has_physical_delta:
+                consecutive_stale_rounds = 0
+                # 如果有產出且接近上限，自動延展（最高至 2 倍初始預算，但不超過 15）
+                if iteration >= current_max - 2 and current_max < 15:
+                    current_max += 2
+                    logger.info("📈 [AOS 7.3] 檢測到有效產出，動態延展預算至 %d 輪", current_max)
+            else:
+                consecutive_stale_rounds += 1
+                
+            if consecutive_stale_rounds >= 3:
+                logger.warning("🛑 [AOS 7.3] 連續 3 輪無物理增量，判定為無效循環，強行關斷。")
+                return fullContent + "\n\n🛑 [AOS 7.3 系統干預] 檢測到原地踏步（連續 3 輪無有效產出），已強制終止循環以保護預算。"
         
         # [AOS 2.9] 自动整理动态加载的技能，任务结束清空，保持“冷酷无情”的低成本状态
         # asyncio.create_task(self.skill_manager.unload_all())
@@ -2472,16 +2531,55 @@ class McpAgent:
         
         return " | ".join(items) if items else "暂无沉睡技能"
 
-    def _get_workspace_delta(self, initial_files: list[str]) -> list[str]:
+    def _get_workspace_delta(self, initial_files: list[str], workspace_override: str | None = None) -> list[str]:
         """
         [AOS 6.1] 计算工作区文件增量。
         """
-        if not self.workspace_path or not os.path.exists(self.workspace_path):
+        wsp = workspace_override if workspace_override else self.workspace_path
+        if not wsp or not os.path.exists(wsp):
             return []
         try:
-            current_files = os.listdir(self.workspace_path)
+            current_files = os.listdir(wsp)
             return [f for f in current_files if f not in initial_files]
         except Exception as e:
             logger.error(f"误差计算失败: {e}")
             return []
 
+    def _generate_big_file_summary(self, path: str, size: int) -> str:
+        """
+        [AOS 7.5] 生成大文件概覽，防止直接進入上下文。
+        """
+        try:
+            line_count = 0
+            header = ""
+            footer = ""
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+                line_count = len(lines)
+                if line_count > 20:
+                    header = "".join(lines[:10])
+                    footer = "".join(lines[-10:])
+                else:
+                    header = "".join(lines)
+            
+            ext = os.path.splitext(path)[1].lower()
+            summary = [
+                f"⚠️ [AOS 7.5 物理攔截] 文件過大 ({size/1024:.2f} KB)，已自動拒絕直接讀取全文以保護上下文。",
+                f"文件路徑: {path}",
+                f"總行數: {line_count}",
+                "\n【文件開頭 10 行】",
+                header,
+                "\n【文件末尾 10 行】",
+                footer,
+                "\n💡 [系統建議] 該文件已超過 32KB 安全閾值。請使用 spawn_expert 召喚 'BigFileAnalyzer' 或編寫 Python 腳本進行流式提取所需數據。"
+            ]
+            
+            # 如果是 JSON/JS，嘗試提取 Top-level Keys
+            if ext in ['.json', '.js']:
+                keys = re.findall(r'["\'](\w+)["\']\s*:', header)
+                if keys:
+                    summary.append(f"\n【偵測到潛在 Key】: {', '.join(list(set(keys))[:10])}")
+                    
+            return "\n".join(summary)
+        except Exception as e:
+            return f"❌ [AOS 7.5] 無法生成概覽: {e}"

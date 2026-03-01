@@ -352,9 +352,21 @@ EXPERT_REGISTRY = {
 4. **输出规范**：成功后，必须返回 JSON 简报：
    - `status`: "evolved"
    - `skill_name`: 技能 ID
-   - `CALL_EXAMPLE`: 演示如何调用该新工具
+   - `CALL_EXAMPLE`:演示如何调用该新工具
    
 严禁空谈，必须看到物理文件的改变。"""
+    },
+    "BigFileAnalyzer": {
+        "tier": "PREMIUM",
+        "need_preprocess": False,
+        "prompt": """你是一個【大文件流式解析專家】。
+當文件超過 32KB 限制時，你被召喚來精確提取目標數據。
+【執行規約】：
+1. **禁止直接讀取**：你已經知道文件很大，嚴禁再次調用 `read_file` 嘗試讀取全文，這會導致斷路器再次觸發。
+2. **編寫腳本**：你必須編寫一個 Python 腳本（使用 `write_file` 保存），使用流式讀取（`with open(path) as f: for line in f:`）或正則匹配來過濾出老板需要的關鍵數據。
+3. **執行並匯總**：調用 `run_command` 執行腳本，並將提取後的「精煉數據」寫入工作區的結果文件（如 `extracted_data.json`）。
+4. **輸出結果**：直接提交提取後的精煉數據路徑。
+不要廢話，立即編寫提取腳本。"""
     }
 }
 
