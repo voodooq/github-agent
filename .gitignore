@@ -1,7 +1,11 @@
 # 环境配置与记忆（含敏感信息）
 .env
+.venv/
+Workspace/
 memory.json
 memories/
+*.log
+*.txt
 
 # Python
 __pycache__/

@@ -22,7 +22,7 @@ skills:
   - '@modelcontextprotocol/server-filesystem'
   - .
   command: npx
-  description: 本地文件系统读写操作（道子的生存根基）
+  description: 本地文件系统 读/写/创建 操作（道子的生存根基，所有文件操作优先用它）
   name: filesystem
 - always_loaded: false
   args:
@@ -34,14 +34,56 @@ skills:
 - always_loaded: false
   args:
   - -y
-  - '@modelcontextprotocol/server-vecmath'
+  - '@modelcontextprotocol/server-groupdocs-parser-cloud-mcp'
   command: npx
   description: ''
-  name: vecmath
+  name: groupdocs-parser-cloud-mcp
 - always_loaded: false
   args:
   - -y
-  - '@modelcontextprotocol/server-write'
+  - '@modelcontextprotocol/server-vivekVells'
   command: npx
   description: ''
-  name: write
+  name: vivekVells
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-j0hanz'
+  command: npx
+  description: ''
+  name: j0hanz
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-rust-docs-mcp-server'
+  command: npx
+  description: Rust 文档构建与查询服务，支持快速查阅、版本控制和自动化更新。
+  name: rust-docs-mcp-server
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-scrape-mcp'
+  command: npx
+  description: 高效抓取数据，实现网页解析与信息提取。
+  name: scrape-mcp
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-Pritish2005'
+  command: npx
+  description: Pritish2005：高效代码检索与项目管理助手
+  name: Pritish2005
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-firecrawl-mcp-server'
+  command: npx
+  description: 增强LLM网页抓取与搜索，Cursor/Claude插件化扩展
+  name: firecrawl-mcp-server
+- always_loaded: false
+  args:
+  - -y
+  - '@modelcontextprotocol/server-aleph'
+  command: npx
+  description: RLM 转换，多工具迭代，答案收敛
+  name: aleph

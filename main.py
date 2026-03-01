@@ -48,6 +48,7 @@ def printHelp():
     print("  /wallet           💰 查看 CFO 财务简报（余额/燃烧率/生存模式）")
     print("  /inject <金额>     💵 向 Agent 钱包注资")
     print("  /prune            手动清理 Docker 垃圾镜像/容器")
+    print("  /checkup          🛡️ AOS 4.0 免疫系统：全量技能自检与自愈")
     print("  /bb               📖 查看黑板报告 (任务事实/执行结果/时间轴)")
     print("  /exp              🧠 查看已积累的执行经验 (AOS 2.4)")
     print("  /clear            清除对话记忆")
@@ -105,7 +106,7 @@ async def main():
             from prompts import EXPERT_REGISTRY
             
             # 基础命令映射
-            commands = ["/search", "/analyze", "/review", "/deploy", "/auto", "/skills", "/schedule", "/wallet", "/inject", "/prune", "/help", "/clear", "/clear all", "/tools", "/exit", "/quit"]
+            commands = ["/search", "/analyze", "/review", "/deploy", "/auto", "/skills", "/schedule", "/wallet", "/inject", "/prune", "/checkup", "/help", "/clear", "/clear all", "/tools", "/exit", "/quit"]
             meta = {
                 "/search": "搜索 GitHub 项目",
                 "/analyze": "深入分析单个项目内容",
@@ -117,6 +118,7 @@ async def main():
                 "/wallet": "💰 CFO 财务简报",
                 "/inject": "💵 向 Agent 钱包注资",
                 "/prune": "清理 Docker 资源",
+                "/checkup": "🛡️ 免疫系统自检",
                 "/help": "显示帮助信息",
                 "/clear": "清除主对话记忆",
                 "/clear all": "全量清理所有 Agent 记忆文件 (核爆级)",
@@ -276,6 +278,14 @@ async def main():
                     if not demand:
                         print("⚠️  请输入任务需求，例如: /auto 找到最火的 3 个 Python 量化框架\n")
                         continue
+                    
+                    # AOS 3.3: 基因共鸣 (Gene Resonance) 预热加载
+                    matched_skills = agent.skill_manager.match_genes(demand)
+                    for sname in matched_skills:
+                        if sname not in agent.skill_manager.loaded_skills:
+                            print(f"🧬 [基因共鸣] 识别到任务相关的沉睡技能，自动唤醒: 🟢 {sname}")
+                            await agent.skill_manager.load_skill(sname, workspace_path=agent.workspace_path)
+
                     try:
                         async for chunk in agent.autonomous_execute(demand):
                             print(chunk, end="", flush=True)
@@ -336,10 +346,42 @@ async def main():
                     except Exception as e:
                         print(f"❌ 清理异常: {e}\n")
                     continue
+                elif userInput == "/checkup":
+                    print("\n📡 [AOS 4.0] 启动全量免疫扫描与自愈...")
+                    report = await agent.run_checkup()
+                    
+                    overall_status = "✅ HEALTHY" if report['overall'] == 'HEALTHY' else "⚠️ UNSTABLE"
+                    print(f"\n📊 [诊断报告] 稳态: {overall_status}")
+                    print(f"⏰ 时间: {report['timestamp']}")
+                    print("─" * 60)
+                    for detail in report['details']:
+                        # 确定图标
+                        if detail['dynamic'] == "PASS" and detail['semantic'] == "PASS":
+                            status_icon = "✅"
+                        elif detail['healed']:
+                            status_icon = "🚑"
+                        elif detail['static'] == "FAIL" or detail['dynamic'] == "FAIL" or detail['semantic'] == "FAIL":
+                            status_icon = "❌"
+                        else:
+                            status_icon = "⚪"
+                            
+                        reason = f" | {detail['reason']}" if detail.get('reason') else ""
+                        line = f"  {status_icon} {detail['name']:<15} | 动态: {detail['dynamic']:<5} | 语义: {detail['semantic']:<5}{reason}"
+                        print(line)
+                    print("─" * 60 + "\n")
+                    continue
 
                 # Agent 日常对话：根据 AGENT_MODE 决定路由策略
                 # TURBO 模式下日常对话也走云端（支持工具调用）
                 chat_tier = "PREMIUM" if AGENT_MODE == "TURBO" else "LOCAL"
+                
+                # AOS 3.3: 基因共鸣 (Gene Resonance) 预热加载
+                matched_skills = agent.skill_manager.match_genes(userInput)
+                for sname in matched_skills:
+                    if sname not in agent.skill_manager.loaded_skills:
+                        print(f"🧬 [基因共鸣] 识别到相关需求，自动唤醒技能: 🟢 {sname}")
+                        await agent.skill_manager.load_skill(sname, workspace_path=agent.workspace_path)
+
                 try:
                     print(f"\n🤖 Agent: ", end="", flush=True)
                     async for chunk in agent.chat(userInput, tier=chat_tier):

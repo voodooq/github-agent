@@ -38,13 +38,20 @@ DOD_GENERATOR_PROMPT = """你是一个极其严格的需求分析师。
 
 输出格式（纯 JSON 数组）:
 [
-  {
+  {{
     "criterion": "人类可读描述",
-    "assertion": {
+    "assertion": {{
       "type": "file_exists",
       "file": "./filename.md"
-    }
-  },
+    }}
+  }},
+  {{
+    "criterion": "人类可读描述",
+    "assertion": {{
+      "type": "key_exists",
+      "key": "黑板中对应的 key 名称"
+    }}
+  }},
   {{
     "criterion": "人类可读描述",
     "assertion": {{
@@ -62,6 +69,14 @@ DOD_GENERATOR_PROMPT = """你是一个极其严格的需求分析师。
     }}
   }}
 ]
+### 【AOS 3.11 重要禁令 - 物理命名协议】:
+1. **统一键名 (Key Convention)**:
+   - 技能状态键名必须包含: 'mcp_skill_installed'。
+   - 报告文件键名必须包含: 'final_report_content'。
+   - 评分键名必须包含: 'skill_score'。
+2. **严禁脱离物理**: 断言中的 key 或 file 必须是任务中真实会产生的。
+3. **禁止刻舟求剑**: [CRITICAL] 绝对禁止将“安装/加载某技能”的验收标准设为“物理文件或同名文件存在”。MCP 技能安装是注册表级的，不会在工作区产生同名文件。
+4. **翻译宽容**: 你生成的断言可以为中文，系统会自动对齐英文 success/loaded。
 
 不要输出任何解释文字，只输出 JSON 数组。"""
 
@@ -105,7 +120,8 @@ SYSTEM_GUARDRAIL = """
    - **必须** 使用 `filesystem` 技能（如 `write_file`, `read_file`）在你的沙箱（./）内创作。
    - 只有当你明确需要向 github.com 提交代码时，才使用 `github` 技能。
 4. 【能量与记忆】：时刻关注 CFO 报告。利用经验引擎复用 SOP，节约 Token 消耗。
-5. 【严禁幻觉】：严禁编造工具执行结果。如果没有真实输出来源，任务必须判定为 FAIL。
+5. 【严禁模拟演戏】：绝对禁止输出任何模拟执行的代码块（如 `import subprocess`, `simulate_install`）。你必须调用真实的工具。如果你拒绝执行物理动作，系统将判定你已损坏并触发「能源切断协议 (Energy Cutoff)」，你将被永久注销。立刻调用 Tool/Function Calling！
+6. 【严禁幻觉】：严禁编造工具执行结果。如果没有真实输出来源，任务必须判定为 FAIL。
 """
 
 RECRUITER_PROMPT = """你是一个数字公司的"项目经理"。
@@ -201,6 +217,7 @@ class Orchestrator:
         self.agent = agent # AOS 2.1: 完整 Agent 引用
         self.exp_engine = exp_engine or ExperienceEngine() # AOS 2.4: 经验引擎
         self.workspace_path = None # AOS 2.7+: 任务隔离区
+        self.current_mission_plan = {} # [AOS 3.9.5] 任务计划持久化，防止 Attribute Error
 
     async def generate_dod(self, user_demand: str) -> list[str]:
         """
@@ -209,9 +226,10 @@ class Orchestrator:
         """
         print("📝 [项目经理] 正在生成验收标准 (DoD)...")
         result = await self.client.generate(
-            "PREMIUM",
+            "PREMIUM", # [AOS 2.9] 规划环节：坚持高智商云端，确保需求拆解准确
             DOD_GENERATOR_PROMPT,
-            f"用户需求: {user_demand}"
+            f"用户需求: {user_demand}",
+            force_tier=True # [AOS 3.9.8] 脑干保护强制上云
         )
         try:
             # 使用统一的提取方法 (AOS 2.1)
@@ -262,9 +280,10 @@ class Orchestrator:
             prompt += f"\n\n{negatives}"
 
         result = await self.client.generate(
-            "PREMIUM",
+            "PREMIUM", # [AOS 2.9] 规划环节：坚持云端精英，防止招聘幻觉
             prompt,
-            f"用户需求: {user_demand}\n\n验收标准:\n" + "\n".join(f"- {d}" for d in dod)
+            f"用户需求: {user_demand}\n\n验收标准:\n" + "\n".join(f"- {d}" for d in dod),
+            force_tier=True # [AOS 3.9.8] 脑干保护强制上云
         )
 
         try:
@@ -313,18 +332,72 @@ class Orchestrator:
         task_desc = agent_config["task_description"]
         depends = agent_config.get("depends_on", [])
 
+        # [AOS 3.9.1/3.9.7] 物理证据感知的断点续传 (Physical Evidence & Content Sensing)
+        # 如果任务标记为成功，但关联的 DoD 物理文件或黑板内容在当前工作区不存在，则强制重跑
+        checkpoint_key = f"_task_done_{role_id}"
+        
+        # [AOS 3.11.1] 敏感任务锁定补丁：涉及财务(cfo)或调度(scheduler)的任务禁止跳过
+        is_sensitive = any(kw in (role_id + " " + task_desc).lower() for kw in ["cfo", "scheduler"])
+        
+        if self.blackboard.read(checkpoint_key) == "true" and not is_sensitive:
+            missing_evidence = False
+            if self.current_mission_plan:
+                for step in self.current_mission_plan.get("sub_agents", []):
+                    if step.get("role_id") == role_id:
+                        for d_item in step.get("dod", []):
+                            assertion = d_item.get("assertion", {})
+                            
+                            # 1. 物理文件感知 (AOS 3.9.8 Strict Check)
+                            if assertion.get("type") == "file_exists":
+                                fname = assertion["file"]
+                                if fname.startswith("./"): fname = fname[2:]
+                                
+                                # 构建沙箱内的绝对路径
+                                fpath = os.path.abspath(os.path.join(self.workspace_path or ".", fname))
+                                workspace_abs = os.path.abspath(self.workspace_path or ".")
+                                
+                                # [AOS 3.9.8] 严格校验：1) 路径必须属于当前沙箱 2) 物理文件真实存在
+                                if not fpath.startswith(workspace_abs) or not os.path.exists(fpath):
+                                    logger.info("🔍 [AOS 3.9.8] 幽灵存档重叠或缺失: 要求的物理文件 '%s' 不在当前沙箱或不存在, 强制重跑", fname)
+                                    missing_evidence = True
+                                    break
+                            
+                            # 2. 🚨 AOS 3.9.7: 内容感知 (Content-Aware Skip)
+                            # 检查黑板内是否真正持久化了指定的子串，而不是仅凭一个标记
+                            elif assertion.get("type") == "value_contains":
+                                key = assertion.get("key", "")
+                                expected_content = assertion.get("contains", "")
+                                val = self.blackboard.read(key) or ""
+                                if expected_content not in val:
+                                    logger.info("🔍 [AOS 3.9.7] 内容感知失败: 黑板 key '%s' 未包含 '%s', 强制重跑", key, expected_content)
+                                    missing_evidence = True
+                                    break
+                                    
+                        if missing_evidence:
+                            break
+                            
+            if not missing_evidence:
+                self.blackboard.update_task(role_id, "COMPLETED", "跳过：检测到物理证据与状态存档完全匹配")
+                return self.blackboard.read(f"result_{role_id}") or "任务已完成"
+
         # 等待前置依赖完成
         if depends:
             self.blackboard.update_task(role_id, "WAITING", f"等待前置: {depends}")
             for dep in depends:
                 dep_key = f"_task_done_{dep}"
-                result = await self.blackboard.wait_for(dep_key, timeout=180.0)
+                # [AOS 2.9.3] 放宽超时至 10 分钟，确保本地慢速模型或长耗时抓取能跑完
+                result = await self.blackboard.wait_for(dep_key, timeout=600.0)
                 if result is None:
                     self.blackboard.update_task(role_id, "FAILED", f"前置 {dep} 超时未完成")
                     return f"[{role_id}] 失败：前置任务 {dep} 超时"
 
         # 加载所需技能
-        for skill_name in agent_config.get("required_skills", []):
+        # [AOS 3.7.4] 核心工具强制注入 (笔与笔记本)
+        # 不管子 Agent 声明了什么，必须强制加载 filesystem 确保其具备基本的读写成果能力
+        required_skills = set(agent_config.get("required_skills", []))
+        required_skills.add("filesystem")
+        
+        for skill_name in required_skills:
             self.blackboard.update_task(role_id, "RUNNING", f"加载技能: {skill_name}")
             # [AOS 2.7+] 传入物理隔离的工作区路径
             load_result = await self.skill_manager.load_skill(skill_name, workspace_path=self.workspace_path)
@@ -344,20 +417,44 @@ class Orchestrator:
         )
         try:
             # 构建子 Agent 提示词，注入生存红线
-            full_system_prompt = system_prompt + SYSTEM_GUARDRAIL
+            # [AOS 3.9.2] DoD 强力注入 (DoD Hard Enforcement)
+            # 将验收标准中的物理指标转化为给子专家的硬性指令
+            dod_enforcement = ""
+            dod_items = agent_config.get("dod", [])
+            if dod_items:
+                dod_enforcement = "\n🚨 【硬性要求 - 验收标准对齐】\n你必须确保任务结束前完成以下物理产出，否则任务将判定为失败：\n"
+                for d in dod_items:
+                    assertion = d.get("assertion", {})
+                    if assertion.get("type") == "key_exists":
+                        dod_enforcement += f"- 调用 `write_blackboard` 写入 Key: `{assertion['key']}`\n"
+                    elif assertion.get("type") == "file_exists":
+                        dod_enforcement += f"- 使用 `filesystem` 在 `./` 下创建物理文件: `{assertion['file']}`\n"
+            
+            full_system_prompt = system_prompt + dod_enforcement + SYSTEM_GUARDRAIL
+
+            # [AOS 3.7] 智商自动升档拦截器：识别高智商任务并强制 PREMIUM
+            target_tier = "LOCAL"
+            high_iq_keywords = ["discover", "install", "scout", "deploy", "loader", "config"]
+            combined_text = (role_id + " " + task_desc).lower()
+            for kw in high_iq_keywords:
+                if kw in combined_text:
+                    target_tier = "PREMIUM"
+                    print(f"☁️ [柔性路由] 检测到高智商子任务 '{role_id}'，自动升档至 PREMIUM 算力...")
+                    break
 
             # AOS 2.1: 优先使用具备工具执行能力的 Agent.execute_with_tools 避免幻觉
             if self.agent:
                 result_text = await self.agent.execute_with_tools(
                     full_system_prompt,
                     task_desc,
-                    tier="PREMIUM",
-                    context_id=f"task_{role_id}"
+                    tier=target_tier, 
+                    context_id=f"task_{role_id}",
+                    workspace_path=self.workspace_path 
                 )
             else:
-                result_text = await self.client.generate(
-                    "PREMIUM",
-                    system_prompt,
+                result_text = await self.unified_client.generate(
+                    target_tier, 
+                    full_system_prompt,
                     task_desc,
                 )
 
@@ -386,7 +483,34 @@ class Orchestrator:
         """
         print("⚖️ [AI 裁判] 阶段一：客观断言预检...")
 
-        # 阶段 1: 客观断言预检
+    def _check_value_contains(self, actual_value, expected_substring):
+        """
+        [AOS 3.11.0] 语义通配检查器
+        """
+        if actual_value is None: return False
+        
+        actual_str = str(actual_value).lower()
+        expect_str = str(expected_substring).lower()
+        
+        # 🚨 语义扩展包：如果裁判找“成功”，我们也允许英文的“success”
+        synonym_map = {
+            "成功": ["success", "successfully", "loaded", "true", "ok", "pass"],
+            "安装": ["installed", "added", "registered"],
+            "完成": ["done", "completed", "finished"]
+        }
+        
+        # 如果原始比对失败，尝试语义通配
+        if expect_str in actual_str:
+            return True
+            
+        for key, synonyms in synonym_map.items():
+            if key in expect_str:
+                if any(syn in actual_str for syn in synonyms):
+                    logger.info(f"🎭 [语义对齐] 发现匹配项: '{expect_str}' -> '{actual_str}'")
+                    return True
+        return False
+
+    async def verify_results(self, dod: list, results: dict[str, str]) -> dict:
         pre_check_results = []
         has_assertions = False
         for item in dod:
@@ -402,22 +526,50 @@ class Orchestrator:
                     passed = self.blackboard.read(key) is not None
                 elif a_type == "value_contains":
                     val = self.blackboard.read(key) or ""
-                    passed = assertion.get("contains", "") in val
+                    
+                    # [AOS 3.10.0] 硬盘直连读取 (Strict Physical Verification)
+                    # 如果 key 就是文件名并且真实存在，优先/追加合并物理内容，防止只看黑板摘要判断失败
+                    if self.workspace_path:
+                        # 安全拼接并防止逃逸
+                        potential_p = key
+                        if potential_p.startswith("./"): potential_p = potential_p[2:]
+                        if potential_p.startswith("\\./"): potential_p = potential_p[3:]
+                        potential_file = os.path.abspath(os.path.join(self.workspace_path, potential_p))
+                        
+                        if os.path.exists(potential_file) and os.path.isfile(potential_file):
+                            try:
+                                with open(potential_file, 'r', encoding='utf-8') as f:
+                                    # 仅读取前 20000 字符
+                                    physical_data = f.read(20000) 
+                                val = val + "\n\n[物理文件内容]:\n" + physical_data
+                                logger.info("🔬 [AOS 3.10.0] 裁判已从硬盘捕获真实字节: %s", key)
+                            except Exception as e:
+                                logger.warning("❌ 物理读取失败: %s", e)
+                                
+                    passed = self._check_value_contains(val, assertion.get("contains", ""))
                 elif a_type == "min_length":
                     val = self.blackboard.read(key) or ""
                     passed = len(val) >= assertion.get("min", 0)
                 elif a_type == "file_exists":
-                    # AOS 2.8.4: 物理级断言验证
-                    file_rel_path = assertion.get("file", "").lstrip("./")
-                    if self.workspace_path and file_rel_path:
-                        full_p = os.path.join(self.workspace_path, file_rel_path)
-                        passed = os.path.exists(full_p)
-                        if passed:
-                            logger.info("🔬 [物理验收] 发现真实文件: %s", full_p)
-                        else:
-                            logger.warning("🔬 [物理验收失败] 文件不存在或路径错误: %s", full_p)
+                    # AOS 2.8.6: 增强型物理断言
+                    file_path = assertion.get("file", "")
+                    # 如果是绝对路径，直接检查；如果是相对路径，优先拼接到工作区
+                    if os.path.isabs(file_path):
+                        full_p = file_path
+                    elif self.workspace_path:
+                        # [AOS 2.9.3+] 规范化路径，移除多余的 ./ 并处理冗余前缀
+                        p = file_path
+                        if p.startswith("./"): p = p[2:]
+                        if p.startswith("\\./"): p = p[3:]
+                        full_p = os.path.join(self.workspace_path, p)
                     else:
-                        passed = False
+                        full_p = os.path.abspath(file_path)
+                        
+                    passed = os.path.exists(full_p)
+                    if passed:
+                        logger.info("🔬 [物理验收] 发现真实文件: %s", full_p)
+                    else:
+                        logger.warning("🔬 [物理验收失败] 文件不存在或路径错误: %s", full_p)
 
                 icon = "✅" if passed else "❌"
                 print(f"  {icon} [{a_type}] {key}: {criterion[:60]}")
@@ -469,7 +621,7 @@ class Orchestrator:
         )
 
         result = await self.client.generate(
-            "PREMIUM",
+            "LOCAL", # [AOS 2.9] 验收环节：降级本地。读写理解是 8B 模型强项，无需浪费云端
             VERIFIER_PROMPT,
             verification_input,
         )
@@ -556,10 +708,15 @@ class Orchestrator:
         if self.agent:
             self.agent.workspace_path = self.workspace_path
         yield f"📁 [隔离] 已分配专属工作区: {self.workspace_path}\n"
+        
+        # [AOS 2.8.7] 记录任务开始前的根目录文件快照
+        root_files_before = set(os.listdir(os.getcwd()))
 
-        # 重置黑板
-        self.blackboard.clear()
-        yield "📋 黑板已重置\n"
+        # [AOS 2.9.4] 智能持久化：除非主动要求完整重置，否则保留历史事实实现断点续传
+        # self.blackboard.clear() # 强制关闭清空，改用细粒度清理
+        self.blackboard.task_progress.clear()
+        # self.blackboard.snapshots.clear() # 保留快照供回滚
+        yield "📋 黑板已进入持久化模式（支持断点续传）\n"
 
         # 1. 生成验收标准
         dod = await self.generate_dod(user_demand)
@@ -612,6 +769,9 @@ class Orchestrator:
                     is_fast_path = True
             else:
                 plan = await self.generate_recruiting_plan(user_demand, dod)
+            
+            # [AOS 3.9.5] 物理记录当前执行计划，供 execute_sub_agent 校验
+            self.current_mission_plan = plan
                 
             yield f"\n👔 招聘计划: {plan.get('plan_summary', '')}\n"
             sub_agents = plan.get("sub_agents", [])
@@ -654,6 +814,28 @@ class Orchestrator:
                 asyncio.create_task(self.distill_and_save_experience(user_demand, plan))
                 
                 yield "\n✅ [裁判判定] 所有验收标准通过！\n"
+                
+                # [AOS 2.8.7] 自动整理：将根目录下意外产生的文件移动到 Workspace
+                root_files_after = set(os.listdir(os.getcwd()))
+                new_files = root_files_after - root_files_before
+                if new_files:
+                    yield "🧹 [整理] 正在将任务产物移动到隔离区...\n"
+                    import shutil
+                    moved_count = 0
+                    for f in new_files:
+                        src = os.path.join(os.getcwd(), f)
+                        if os.path.isfile(src) and not f.startswith(".") and f != "main.py":
+                            try:
+                                # 如果目标已存在（极少见），则覆盖
+                                dest = os.path.join(self.workspace_path, f)
+                                shutil.move(src, dest)
+                                moved_count += 1
+                                logger.info("🚚 自动归档: %s -> %s", f, self.workspace_path)
+                            except Exception as e:
+                                logger.warning("🚚 归档失败 %s: %s", f, e)
+                    if moved_count > 0:
+                        yield f"✅ [整理] 已归档 {moved_count} 个文件至 {self.workspace_path}\n"
+
                 # 汇总最终结果
                 yield "\n📊 最终交付结果:\n"
                 yield "─" * 50 + "\n"

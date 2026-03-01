@@ -43,6 +43,13 @@ class Blackboard:
         向黑板写入客观事实。
         防御补丁 #3: 超过 MAX_VALUE_SIZE 自动截断，防止 Token 爆仓。
         """
+        if not isinstance(value, str):
+            # [AOS 4.0.1] 自动序列化非字符串对象（如诊断报告 dict）
+            try:
+                value = json.dumps(value, ensure_ascii=False)
+            except Exception:
+                value = str(value)
+
         # 上下文瘦身：强制截断过大的值
         if len(value) > self.MAX_VALUE_SIZE:
             logger.warning(
@@ -57,7 +64,9 @@ class Blackboard:
             "author": author,
             "timestamp": datetime.now().isoformat(),
         }
-        logger.info("📋 [黑板] %s 写入: %s = %s", author, key, value[:100])
+        # 🛡️ 防御式日志：确保 value 是字符串才切片
+        display_log = value[:100] if isinstance(value, str) else str(value)[:100]
+        logger.info("📋 [黑板] %s 写入: %s = %s", author, key, display_log)
 
         # 唤醒等待该 key 的所有订阅者
         if key in self._events:
@@ -79,9 +88,11 @@ class Blackboard:
             return "[黑板为空，尚无共享信息]"
         lines = ["=== 项目状态黑板 ==="]
         for key, fact in self.facts.items():
-            # 上下文瘦身：截断显示
-            display_val = fact['value'][:200]
-            if len(fact['value']) > 200:
+            val = fact.get('value', "")
+            # 上下文瘦身：截断显示 (防御式编码)
+            str_val = str(val)
+            display_val = str_val[:200]
+            if len(str_val) > 200:
                 display_val += "..."
             lines.append(f"- {key}: {display_val} (by {fact['author']})")
         # 附加任务进度

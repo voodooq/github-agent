@@ -39,4 +39,4 @@ if _mcp_env_raw:
 MEMORY_FILE = os.getenv("MEMORY_FILE", "memory.json")
 
 # AOS: Token 预算上限（单次任务最大 Token 消耗，超过则挂起等待用户确认）
-TOKEN_BUDGET = int(os.getenv("TOKEN_BUDGET", "20000"))
+TOKEN_BUDGET = int(os.getenv("TOKEN_BUDGET", "50000"))
