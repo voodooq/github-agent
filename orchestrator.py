@@ -948,12 +948,12 @@ class Orchestrator:
 
             final_report = await self.agent.execute_with_tools(
                 system_prompt=(
-                    "你現在是 AOS 7.3 戰時獨裁官（Blitz 模式）。禁止輸出廢話！禁止詢問意見！\n"
-                    "你必須通過【物理收斂】審計：\n"
-                    "1. 立即調用工具執行任務。如果是分析/提取任務，【一旦發現目標文件路徑，必須立即調用 read_file 讀取其內容】並進行後續處理。\n"
-                    "2. 務必追求【一次性物理交付】。系統已分配 8 輪彈藥預算，但若你原地踏步（連續無物理產出且重複操作），內核將立即斷電並判定為邏輯壞疽。\n"
-                    "3. 如果你有產出（文件寫入/黑板更新），內核會自動為你延展生命線；否則，請在有限輪次內給出 done.txt 收據。\n"
-                    "拒絕演戲，拒絕偽代碼。立即執行。"
+                    "你现在是 AOS 7.3 战时独裁官（Blitz 模式）。禁止输出废话！禁止询问意见！\n"
+                    "你必须通过【物理收敛】审计：\n"
+                    "1. 立即调用工具执行任务。如果是分析/提取任务，【一旦发现目标文件路径，必须立即调用 read_file 读取其内容】并进行后续处理。\n"
+                    "2. 务必追求【一次性物理交付】。系统已分配 8 轮弹药预算，但若你原地踏步（连续无物理产出且重复操作），内核将立即断电并判定为逻辑坏疽。\n"
+                    "3. 如果你有产出（文件写入/黑板更新/读取到新信息），内核会自动为你延展生命线。针对分析任务，建议最后将结论写入 report.md 以确保审计通过。\n"
+                    "拒绝演戏，拒绝伪代码。立即执行。"
                 ),
                 user_demand=user_demand,
                 tier="PREMIUM", 
@@ -977,19 +977,22 @@ class Orchestrator:
             
             has_physical_evidence = has_fs_delta or has_db_delta or has_bb_delta
             
+            # [AOS 7.5.8] 核心优化：如果 Agent 产生了逻辑位移（拿到了新数据），允许审计通过
+            has_logical_delta = getattr(self.agent, "has_logical_delta", False)
+            
             if is_maintenance:
-                # [AOS 7.5.4] 冪等性審計：對於清理/查詢類維護任務，只要有工具執行成功（即使無位移）即判定為通過
-                # 防止因「清理已空列表」無位移導致 AI 重試觸發熔斷。
+                # [AOS 7.5.4] 幂等性审计：对于清理/查询类维护任务，只要有工具执行成功（即使无位移）即判定为通过
                 if has_physical_evidence or "cleared" in final_report.lower() or "success" in final_report.lower():
-                    yield f"✅ [AOS 7.5.4] 維護任務物理閉環成功。審計維度: {'DB ' if has_db_delta else ''}{'FS ' if has_fs_delta else ''}{'BB' if has_bb_delta else ''} (容忍冪等性無位移)\n"
+                    yield f"✅ [AOS 7.5.4] 维护任务物理闭环成功。审计维度: {'DB ' if has_db_delta else ''}{'FS ' if has_fs_delta else ''}{'BB' if has_bb_delta else ''} (容忍幂等性无位移)\n"
                 else:
-                    logger.error("❌ [AOS 6.3] 審計失敗：維護任務未檢測到任何物理位移或成功標誌。")
-                    yield f"❌ [AOS 6.3] 審計失敗：維護任務必須產生數據變更、文件收據(done.txt)或明確的成功狀態。\n"
-            elif intent == "L1_BLITZ" and not has_fs_delta:
-                 logger.error("❌ [AOS 6.0] 物理审计失败：单兵/自动分诊任务未产生物理文件产出。")
-                 yield f"❌ [AOS 6.0] 物理审计失败：检测到执行指令，但物理审计未发现文件增量。拒绝接受文本报告。\n"
+                    logger.error("❌ [AOS 6.3] 审计失败：维护任务未检测到任何物理位移或成功标志。")
+                    yield f"❌ [AOS 6.3] 审计失败：维护任务必须产生数据变更、文件收据(done.txt)或明确的成功状态。\n"
+            elif intent == "L1_BLITZ" and not (has_fs_delta or has_logical_delta):
+                 logger.error("❌ [AOS 6.0] 物理审计失败：单兵/自动分诊任务未产生物理文件产出且无逻辑增量。")
+                 yield f"❌ [AOS 6.0] 物理审计失败：检测到执行指令，但物理审计未发现文件增量或显著的数据读取进展。拒绝接受纯文本报告。\n"
             else:
-                yield f"✅ [AOS 6.2] 物理闭环成功。审计维度: {'DB ' if has_db_delta else ''}{'FS ' if has_fs_delta else ''}{'BB' if has_bb_delta else ''}\n"
+                 reason = "FS" if has_fs_delta else ("Logical(Data)" if has_logical_delta else "Evidence")
+                 yield f"✅ [AOS 6.2] 物理闭环成功。审计维度: {reason} {'DB ' if has_db_delta else ''}{'BB' if has_bb_delta else ''}\n"
             return
 
         # 0. 为本次任务创建物理工作区沙箱 (AOS 2.7+)

@@ -1328,9 +1328,9 @@ class McpAgent:
                 if "offset" not in params:
                     params["offset"] = {
                         "type": "integer",
-                        "description": "[AOS 7.5.8] 大文件讀取偏移量 (bytes)。當文件超過 10KB 時，請根據反饋中的建議傳入此參數以讀取下一分片。"
+                        "description": "[AOS 7.5.8] 大文件读取偏移量 (bytes)。当文件超过 30KB 时，请根据反馈中的建议传入此参数以读取下一分片。"
                     }
-                    # 確保 parameters 結構完整
+                    # 确保 parameters 结构完整
                     if "parameters" not in t["function"]:
                         t["function"]["parameters"] = {"type": "object", "properties": params}
                     else:
@@ -1823,7 +1823,7 @@ class McpAgent:
         2. 自动根据需求和黑板上下文调用工具
         [AOS 2.8.5] 支持同步外部锁定的工作区路径。
         """
-        # [AOS 7.4] 使用局部變量而非實例屬性，防止併發競爭
+        # [AOS 7.4] 使用局部变量而非实例属性，防止并发竞争
         effective_workspace = workspace_path if workspace_path else self.workspace_path
         
         # AOS 3.3: 基因共鸣 (Gene Resonance) 预先加载
@@ -1849,10 +1849,10 @@ class McpAgent:
         # 针对该任务重置预算
         self.token_budget.reset()
         
-        MAX_ITERATIONS = max_iterations # [AOS 5.4] 真值對齊：支持外部強制關斷
+        MAX_ITERATIONS = max_iterations # [AOS 5.4] 真值对齐：支持外部强制关断
         call_history = []
-        fingerprint_history = set() # [AOS 7.3] 物理指紋歷史：(tool, args_hash, result_hash)
-        recent_errors = [] # [AOS 2.9] 同錯熔斷檢測
+        fingerprint_history = set() # [AOS 7.3] 物理指纹历史：(tool, args_hash, result_hash)
+        recent_errors = [] # [AOS 2.9] 同错熔断检测
         success_count = 0  # [AOS 4.8] 工具执行成功计数
         failure_count = 0  # [AOS 4.8] 工具执行失败计数
         consecutive_stale_rounds = 0 # [AOS 7.3] 连续无产出轮次
@@ -2121,24 +2121,24 @@ class McpAgent:
                     else:
                         success_count += 1
                         
-                    # [AOS 7.3] 智能重複與原地踏步檢測
+                    # [AOS 7.3] 智能重复与原地踏步检测
                     import hashlib
-                    # 🛡️ 保護：防止 resultText 為 None 導致 encode() 崩潰
+                    # 🛡️ 保护：防止 resultText 为 None 导致 encode() 崩溃
                     safe_result = str(resultText or "None")
                     args_hash = hashlib.md5(arguments.encode()).hexdigest()
                     result_hash = hashlib.md5(safe_result.encode()).hexdigest()
                     fingerprint = f"{funcName}:{args_hash}:{result_hash}"
                     
                     if fingerprint in fingerprint_history:
-                        logger.warning("🚫 [AOS 7.3] 檢測到重複執行且無結果位移: %s", funcName)
-                        # 如果重複，不計入成功產出，增加停機權重
+                        logger.warning("🚫 [AOS 7.3] 检测到重复执行且无结果位移: %s", funcName)
+                        # 如果重复，不计入成功产出，增加停机权重
                         consecutive_stale_rounds += 0.5 
                     else:
                         fingerprint_history.add(fingerprint)
-                        # [AOS 7.5.8] 核心突破：只要拿到了新數據（非重複指紋），就視為產生了邏輯位移
+                        # [AOS 7.5.8] 核心突破：只要拿到了新数据（非重复指纹），就视为产生了逻辑位移
                         if any(kw in funcName for kw in ["read", "list", "get_file", "search"]):
                              has_logical_delta = True
-                             logger.info("🧠 [AOS 7.5.8] 偵測到邏輯位移（拿到了新信息）: %s", funcName)
+                             logger.info("🧠 [AOS 7.5.8] 侦测到逻辑位移（拿到了新信息）: %s", funcName)
 
                     self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
                     
@@ -2161,22 +2161,22 @@ class McpAgent:
             # [AOS 3.9.9] 确保全量 tool_calls 回传，无论中途有无内部异常
             self.memories[context_id].extend(current_tool_messages)
 
-            # [AOS 7.5.8] 物理或邏輯位移判定
+            # [AOS 7.5.8] 物理或逻辑位移判定
             hash_after = self.blackboard.get_snapshot_hash()
             has_physical_delta = (hash_before != hash_after) or (len(self._get_workspace_delta(iteration_start_files, workspace_override=effective_workspace)) > 0)
             
             if has_physical_delta or has_logical_delta:
                 consecutive_stale_rounds = 0
-                # 如果有產出且接近上限，自動延展（最高至 50 輪，確保讀完大文件）
+                # 如果有产出且接近上限，自动延展（最高至 50 轮，确保读完大文件）
                 if iteration >= current_max - 2 and current_max < 50:
                     current_max += 5
-                    logger.info("📈 [AOS 7.5.8] 檢測到有效位移（物理:%s, 邏輯:%s），動態延展預算至 %d 輪", has_physical_delta, has_logical_delta, current_max)
+                    logger.info("📈 [AOS 7.5.8] 检测到有效位移（物理:%s, 逻辑:%s），动态延展预算至 %d 轮", has_physical_delta, has_logical_delta, current_max)
             else:
                 consecutive_stale_rounds += 1
                 
             if consecutive_stale_rounds >= 3:
-                logger.warning("🛑 [AOS 7.3] 連續 3 輪無物理增量，判定為無效循環，強行關斷。")
-                return fullContent + "\n\n🛑 [AOS 7.3 系統干預] 檢測到原地踏步（連續 3 輪無有效產出），已強制終止循環以保護預算。"
+                logger.warning("🛑 [AOS 7.3] 连续 3 轮无物理增量，判定为无效循环，强行关断。")
+                return fullContent + "\n\n🛑 [AOS 7.3 系统干预] 检测到原地踏步（连续 3 轮无有效产出），已强制终止循环以保护预算。"
         
         # [AOS 2.9] 自动整理动态加载的技能，任务结束清空，保持“冷酷无情”的低成本状态
         # asyncio.create_task(self.skill_manager.unload_all())
@@ -2569,9 +2569,9 @@ class McpAgent:
 
     def _read_file_chunked(self, path: str, size: int, offset: int = 0) -> str:
         """
-        [AOS 7.5.8] 核心改進：支持大文件分片讀取，每分片 30KB。
+        [AOS 7.5.8] 核心改进：支持大文件分片读取，每分片 30KB。
         """
-        CHUNK_SIZE = 30 * 1024 # 30KB (用戶要求升級)
+        CHUNK_SIZE = 30 * 1024 # 30KB (用户要求升级)
         try:
             with open(path, 'rb') as f:
                 f.seek(offset)
@@ -2582,17 +2582,17 @@ class McpAgent:
             has_more = next_offset < size
             
             summary = [
-                f"📝 [AOS 7.5.8 分片讀取] 當前偏移量: {offset} byte, 讀取長度: {len(data)} bytes, 總大小: {size} bytes",
+                f"📝 [AOS 7.5.8 分片读取] 当前偏移量: {offset} byte, 读取长度: {len(data)} bytes, 总大小: {size} bytes",
                 "--- START CHUNK ---",
                 content,
                 "--- END CHUNK ---",
             ]
             
             if has_more:
-                summary.append(f"\n💡 [系統建議] 文件尚未讀完（已完成 {next_offset/size*100:.1f}%）。如需繼續讀取，請再次調用 read_file 並傳入參數: {{\"path\": \"{path}\", \"offset\": {next_offset}}}")
+                summary.append(f"\n💡 [系统建议] 文件尚未读完（已完成 {next_offset/size*100:.1f}%）。如需继续读取，请再次调用 read_file 并传入参数: {{\"path\": \"{path}\", \"offset\": {next_offset}}}")
             else:
-                summary.append("\n✅ [系統反饋] 已到達文件末尾，全文讀取完畢。")
+                summary.append("\n✅ [系统反馈] 已到达文件末尾，全文读取完毕。")
                 
             return "\n".join(summary)
         except Exception as e:
-            return f"❌ [AOS 7.5.8] 分片讀取失敗: {e}"
+            return f"❌ [AOS 7.5.8] 分片读取失败: {e}"
