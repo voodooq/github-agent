@@ -27,7 +27,7 @@ async def test_scheduler():
     res = agent.scheduler.add_task(
         task_id="test_timer_001",
         description="测试定时器唤醒",
-        cron_expr="* * * * * *", # 每秒执行？ scheduler.py 支持6段式吗？目前项目似乎支持简单的。
+        cron_expr="* * * * *", 
         action="autonomous_task",
         payload=payload
     )

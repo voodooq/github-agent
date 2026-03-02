@@ -129,6 +129,16 @@ def collect_target_urls(original_input: str) -> tuple[list[str], list[str], list
     return target_urls, found_files, file_hits, file_errors
 
 
+def print_collected_targets(found_files, file_hits, file_errors):
+    if found_files:
+        print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
+        for fpath, count in file_hits:
+            print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 個地址")
+        for fpath, err in file_errors:
+            print(f"  ❌ 讀取 {fpath} 失敗: {err}")
+
+
+
 async def main():
     """主函数：初始化 Agent → 连接 MCP → 交互循环"""
     agent = McpAgent(
@@ -324,13 +334,7 @@ async def main():
                         continue
 
                     target_urls, found_files, file_hits, file_errors = collect_target_urls(original_input)
-
-                    if found_files:
-                        print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
-                        for fpath, count in file_hits:
-                            print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 個地址")
-                        for fpath, err in file_errors:
-                            print(f"  ❌ 讀取 {fpath} 失敗: {err}")
+                    print_collected_targets(found_files, file_hits, file_errors)
                     
                     if not target_urls:
                         print(f"⚠️  未找到任何有效的 GitHub 地址。輸入內容: \"{original_input[:50]}...\"\n")

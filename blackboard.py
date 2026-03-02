@@ -62,13 +62,14 @@ class Blackboard:
             value = value[:self.MAX_VALUE_SIZE] + "...[TRUNCATED]"
 
         existing_fact = self.facts.get(key)
-        if (
-            existing_fact
-            and existing_fact.get("value") == value
-            and existing_fact.get("author") == author
-            and (not sticky or key in self.sticky_keys)
-        ):
-            logger.debug("📋 [黑板] 跳过重复写入: %s", key)
+        if existing_fact and existing_fact.get("value") == value:
+            # [Optimization] Update author logic in memory without forcing a disk I/O just for authorship changes
+            if existing_fact.get("author") != author:
+                existing_fact["author"] = author
+            if sticky and key not in self.sticky_keys:
+                self.sticky_keys.add(key)
+                logger.info("🎯 [锚点生效] 变量已锁定为粘性状态: %s", key)
+            logger.debug("📋 [黑板] 值未变化，跳过落盘: %s", key)
             return
 
         if sticky:

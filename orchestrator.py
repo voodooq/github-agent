@@ -457,8 +457,8 @@ class Orchestrator:
                     files = os.listdir(self.workspace_path)
                     f_stats = {f: os.path.getsize(os.path.join(self.workspace_path, f)) for f in files}
                     physical_evidence += f"\n✅ 【工作区物理视网膜同步】: {f_stats}\n"
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug("工作区视网膜同步失败: %s", e)
 
             # [AOS 4.7] 强制工具路由与参数锚定
             # 优先从黑板读取锚定 URL，否则从任务描述中提取
@@ -548,15 +548,6 @@ class Orchestrator:
             # 仍然标记完成以免阻塞依赖链
             self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
             return f"[{role_id}] 失败: {error_msg}"
-
-    async def verify_results(self, dod: list, results: dict[str, str]) -> dict:
-        """
-        两阶段验收：
-        1. 客观断言预检 — 扫描黑板数据结构
-        2. AI 语义验证 — 只有客观检查通过后才进行
-        防御补丁 #2: 防止 AI 裁判与执行者互相"幻觉"。
-        """
-        print("⚖️ [AI 裁判] 阶段一：客观断言预检...")
 
     def _check_value_contains(self, actual_value, expected_substring):
         """
@@ -898,8 +889,8 @@ class Orchestrator:
             )
             if "L1_BLITZ" in resp.upper():
                 return "L1_BLITZ"
-        except:
-            pass
+        except Exception as e:
+            logger.debug("分诊兜底模型调用失败，使用默认 L2_EXPERT: %s", e)
             
         return "L2_EXPERT"
 

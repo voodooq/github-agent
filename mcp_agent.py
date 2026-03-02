@@ -58,7 +58,8 @@ def extract_json(text: str) -> dict | list:
     if markdown_match:
         try:
             return json.loads(markdown_match.group(1))
-        except: pass
+        except Exception as e:
+            logger.debug(f"JSON extraction regex strategy failed: {e}")
             
     raise ValueError(f"JSON 解析失败: 未能在文本中找到合法的 JSON 对象或数组。\n片段: {text[:200]}")
 
@@ -179,6 +180,21 @@ class UnifiedClient:
         
         # [AOS 5.0] M2M 協議開關
         self.force_m2m_protocol = False
+        # 本地 HTTP 客户端复用（减少频繁建连开销）
+        self._local_http_client = None
+
+    async def _get_local_http_client(self):
+        """惰性初始化并复用本地 HTTP 客户端。"""
+        import httpx
+        if self._local_http_client is None:
+            self._local_http_client = httpx.AsyncClient(timeout=180, proxy=None, trust_env=False)
+        return self._local_http_client
+
+    async def close(self):
+        """释放底层网络资源。"""
+        if self._local_http_client is not None:
+            await self._local_http_client.aclose()
+            self._local_http_client = None
 
     @staticmethod
     def _sanitize_messages_for_ollama(messages: list[dict]) -> list[dict]:
@@ -262,7 +278,6 @@ class UnifiedClient:
         """
         直接调用 Ollama 原生 /api/chat 端点，绕过 OpenAI 兼容层。
         """
-        import httpx
         safe_messages = self._sanitize_messages_for_ollama(messages)
         payload = {
             "model": self._local_model,
@@ -271,23 +286,22 @@ class UnifiedClient:
         }
         if format == "json":
             payload["format"] = "json"
-        # 显式禁用代理（使用 proxies={} 和 trust_env=False）
-        async with httpx.AsyncClient(timeout=180, proxy=None, trust_env=False) as client:
-            resp = await client.post(self._local_api_url, json=payload)
-            print(f"📡 本地模型响应状态: {resp.status_code}")
-            resp.raise_for_status()
+        # 显式禁用代理（proxy=None + trust_env=False）
+        client = await self._get_local_http_client()
+        resp = await client.post(self._local_api_url, json=payload)
+        print(f"📡 本地模型响应状态: {resp.status_code}")
+        resp.raise_for_status()
 
-            data = resp.json()
-            content = data.get("message", {}).get("content", "")
-            if not content.strip():
-                logger.warning("⚠️  本地模型返回了空内容，这可能导致后续解析失败")
-            return content
+        data = resp.json()
+        content = data.get("message", {}).get("content", "")
+        if not content.strip():
+            logger.warning("⚠️  本地模型返回了空内容，这可能导致后续解析失败")
+        return content
 
     async def _call_ollama_stream(self, messages: list[dict]):
         """
         流式调用 Ollama 原生 /api/chat 端点。
         """
-        import httpx
         import json
         safe_messages = self._sanitize_messages_for_ollama(messages)
         payload = {
@@ -296,36 +310,36 @@ class UnifiedClient:
             "stream": True,
         }
         # 使用 yield 来模拟 OpenAI 的流式输出结构
-        # 显式禁用代理（使用 proxies={} 和 trust_env=False）
-        async with httpx.AsyncClient(timeout=180, proxy=None, trust_env=False) as client:
-            async with client.stream("POST", self._local_api_url, json=payload) as resp:
+        # 显式禁用代理（proxy=None + trust_env=False）
+        client = await self._get_local_http_client()
+        async with client.stream("POST", self._local_api_url, json=payload) as resp:
 
-                if resp.status_code != 200:
-                    body = await resp.aread()
-                    print(f"📡 本地流式模型连接异常 (状态码: {resp.status_code}), 响应: {body.decode('utf-8', errors='replace')[:300]}")
-                resp.raise_for_status()
+            if resp.status_code != 200:
+                body = await resp.aread()
+                print(f"📡 本地流式模型连接异常 (状态码: {resp.status_code}), 响应: {body.decode('utf-8', errors='replace')[:300]}")
+            resp.raise_for_status()
 
-                async for line in resp.aiter_lines():
-                    if not line: continue
-                    data = json.loads(line)
-                    if "message" in data:
-                        content = data["message"].get("content", "")
-                        # 构造兼容 OpenAI chunk 的完整对象层级
-                        class MockDelta:
-                            def __init__(self, c):
-                                self.content = c
-                                self.tool_calls = None
-                                self.role = 'assistant'
-                                
-                        class MockChoice:
-                            def __init__(self, c):
-                                self.delta = MockDelta(c)
-                                
-                        class MockChunk:
-                            def __init__(self, c):
-                                self.choices = [MockChoice(c)]
-                                
-                        yield MockChunk(content)
+            async for line in resp.aiter_lines():
+                if not line: continue
+                data = json.loads(line)
+                if "message" in data:
+                    content = data["message"].get("content", "")
+                    # 构造兼容 OpenAI chunk 的完整对象层级
+                    class MockDelta:
+                        def __init__(self, c):
+                            self.content = c
+                            self.tool_calls = None
+                            self.role = 'assistant'
+                            
+                    class MockChoice:
+                        def __init__(self, c):
+                            self.delta = MockDelta(c)
+                            
+                    class MockChunk:
+                        def __init__(self, c):
+                            self.choices = [MockChoice(c)]
+                            
+                    yield MockChunk(content)
 
 
     async def generate(self, tier: str = "LOCAL", messages: list[dict] | str = None, user_content: str = None, response_format: dict = None, force_tier: bool = False) -> str:
@@ -1511,8 +1525,8 @@ class McpAgent:
                                 "function": {"name": t_name, "arguments": json.dumps(t_args, ensure_ascii=False)}
                             }
                             logger.info("🔧 [AOS 3.7] 本地语者 (Chat) 成功从 Markdown JSON 中抢救出工具调用: %s", t_name)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug("[AOS 3.7] Markdown JSON 抢救失败(chat): %s", e)
 
             self.memories["main"].append(assistantMsg)
 
@@ -1754,14 +1768,21 @@ class McpAgent:
             except Exception as e:
                 logger.error("🚫 调度器停止失败: %s", e)
 
-        # 3. 卸载所有动态技能 (AOS 2.7 隔离卸载)
+        # 3. 释放底层网络连接
+        if hasattr(self, "unified_client"):
+            try:
+                await self.unified_client.close()
+            except Exception as e:
+                logger.error("🚫 UnifiedClient 关闭失败: %s", e)
+
+        # 4. 卸载所有动态技能 (AOS 2.7 隔离卸载)
         if hasattr(self, "skill_manager"):
             try:
                 await self.skill_manager.unload_all()
             except Exception as e:
                 logger.error("🚫 技能卸载失败: %s", e)
 
-        # 4. 清理 Docker 沙盒
+        # 5. 清理 Docker 沙盒
         if hasattr(self, "docker_sandbox"):
             try:
                 self.docker_sandbox.cleanup_all()
@@ -2009,8 +2030,8 @@ class McpAgent:
                                     "function": {"name": t_name, "arguments": json.dumps(t_args, ensure_ascii=False)}
                                 }
                                 logger.info("🔧 [AOS 3.7] 本地语者成功从 Markdown JSON 中抢救出工具调用: %s", t_name)
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug("[AOS 3.7] Markdown JSON 抢救失败(execute_with_tools): %s", e)
 
             if toolCallsDict:
                 assistantMsg["tool_calls"] = list(toolCallsDict.values())
@@ -2540,8 +2561,7 @@ class McpAgent:
                         yield f"\n🏁 [里程碑] 容器启动成功，正在执行健康检查...\n"
 
                         # AOS: 健康探针
-                        import time
-                        time.sleep(3)  # 等待服务启动
+                        await asyncio.sleep(3)  # 等待服务启动（避免阻塞事件循环）
                         health = self.docker_sandbox.check_health(container_id)
 
                         self.memories["main"].append({
@@ -2573,7 +2593,8 @@ class McpAgent:
                             with open(df_path, "w", encoding="utf-8") as f:
                                 f.write(dockerfile_content)
                             yield f"- **物理归档**: `Dockerfile` -> `{self.workspace_path}`\n"
-                        except: pass
+                        except Exception as e:
+                            logger.warning("部署结果归档 Dockerfile 失败: %s", e)
 
                         yield "💡 温馨提示：容器仅在 Agent 运行时存活，关闭程序或使用 /clear 将自动销毁。\n\n"
                         return
