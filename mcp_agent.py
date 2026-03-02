@@ -1115,7 +1115,7 @@ class McpAgent:
                 action=arguments.get("action", "print"),
                 payload=arguments.get("payload", "")
             )
-            return json.dumps(result, ensure_ascii=False)
+            return f"⏰ [调度器] 任务已添加: {json.dumps(result, ensure_ascii=False)}"
 
         elif func_name == "list_scheduled_tasks":
             tasks = self.scheduler.list_tasks()
@@ -1124,11 +1124,11 @@ class McpAgent:
         elif func_name == "cancel_scheduled_task":
             id = arguments.get("task_id", "")
             result = self.scheduler.cancel_task(id)
-            return json.dumps(result, ensure_ascii=False)
+            return f"⏰ [调度器] 任务已取消: {json.dumps(result, ensure_ascii=False)}"
 
         elif func_name == "clear_all_scheduled_tasks":
             result = self.scheduler.clear_all_tasks()
-            return json.dumps(result, ensure_ascii=False)
+            return f"💥 [调度器] 所有任务已清理: {json.dumps(result, ensure_ascii=False)}"
 
         # [AOS 4.9] Assassin Armament: 刺客级物理下载工具
         elif func_name == "http_fetch":
@@ -1315,9 +1315,28 @@ class McpAgent:
         
         if slim:
             # 仅保留元工具
-            return [t for t in all_tools if t["function"]["name"] in meta_tool_names]
-            
-        return all_tools if all_tools else None
+            tools = [t for t in all_tools if t["function"]["name"] in meta_tool_names]
+        else:
+            tools = all_tools if all_tools else []
+        
+        # [AOS 7.5.8] 核心增強：動態注入分片讀取參數 (offset)
+        # 防止模型因不知道有 offset 而陷入死循環
+        read_target_tools = ["read_file", "read_text_file", "filesystem_read_file", "get_file_contents"]
+        for t in tools:
+            if t["function"]["name"] in read_target_tools:
+                params = t["function"].get("parameters", {}).get("properties", {})
+                if "offset" not in params:
+                    params["offset"] = {
+                        "type": "integer",
+                        "description": "[AOS 7.5.8] 大文件讀取偏移量 (bytes)。當文件超過 10KB 時，請根據反饋中的建議傳入此參數以讀取下一分片。"
+                    }
+                    # 確保 parameters 結構完整
+                    if "parameters" not in t["function"]:
+                        t["function"]["parameters"] = {"type": "object", "properties": params}
+                    else:
+                        t["function"]["parameters"]["properties"] = params
+                        
+        return tools if tools else None
 
     async def chat(self, userInput: str, tier: str = "LOCAL", no_tools: bool = False) -> AsyncGenerator[str, None]:
         """
@@ -1837,6 +1856,7 @@ class McpAgent:
         success_count = 0  # [AOS 4.8] 工具执行成功计数
         failure_count = 0  # [AOS 4.8] 工具执行失败计数
         consecutive_stale_rounds = 0 # [AOS 7.3] 连续无产出轮次
+        has_logical_delta = False    # [AOS 7.5.8] 逻辑位移：是否从工具中拿到了新数据
         
         current_max = MAX_ITERATIONS
         for iteration in range(100): # 物理硬上限，逻辑上限由 current_max 控制
@@ -1846,6 +1866,7 @@ class McpAgent:
             hash_before = self.blackboard.get_snapshot_hash()
             # [AOS 6.2] 执行前记录文件列表
             iteration_start_files = os.listdir(effective_workspace) if effective_workspace and os.path.exists(effective_workspace) else []
+            has_logical_delta = False # 每轮重置逻辑位移
 
             # [AOS 2.9.1] 临终关怀：最后一步前注入警告提示
             if iteration == MAX_ITERATIONS - 1:
@@ -2038,7 +2059,7 @@ class McpAgent:
                     actual_func = self._normalize_tool_name(funcName)
 
                     parsed_args = json.loads(arguments)
-                    resultText = "No result produced" # Initialize with a safe default
+                    resultText = None # Initialize as None to allow fallback checks
                     # [AOS 3.6] 絕對路徑錨定攔截器：使用本輪局部工作區
                     self._anchor_tool_paths(actual_func, parsed_args, workspace_override=effective_workspace)
                     
@@ -2048,9 +2069,10 @@ class McpAgent:
                         path = parsed_args.get("path")
                         if path and os.path.exists(path) and os.path.isfile(path):
                             f_size = os.path.getsize(path)
-                            if f_size > 32 * 1024: # 32KB 閾值
-                                logger.warning("🛑 [AOS 7.5] 觸發大文件攔截: %s (%d bytes)", path, f_size)
-                                resultText = self._generate_big_file_summary(path, f_size)
+                            if f_size > 30 * 1024: # 30KB 閾值
+                                offset = parsed_args.get("offset", 0)
+                                logger.warning("🛑 [AOS 7.5] 觸發大文件分片讀取: %s (size: %d, offset: %d)", path, f_size, offset)
+                                resultText = self._read_file_chunked(path, f_size, offset)
                     
                     # 按照优先级处理工具：内部 -> 技能 -> MCP
                     if resultText is None:
@@ -2080,19 +2102,12 @@ class McpAgent:
                         self.memories[context_id].append({"role": "tool", "tool_call_id": tc["id"], "content": resultText})
                         return f"INSTANT_KILL_PASS: {resultText}"
 
-                    if any(sk.lower() in resultText.lower() for sk in stop_keywords):
-                        logger.info("🛑 [AOS 5.2] Physical Convergence: 目标物理达成，强制收敛。回传结果并结束。")
-                        # 写入记忆以便后续审计
+                    # 🚨 [Fix AOS 7.5.8] 核心修复：删除此处多余的 append，防止进入 memories 时 ID 重复导致 400
+                    # 恢復 AOS 5.2 收斂邏輯
+                    if any(sk.lower() in str(resultText).lower() for sk in stop_keywords):
+                        logger.info("🛑 [AOS 5.2] Physical Convergence: 目标物理达成，强制收敛。")
                         self.memories[context_id].append({"role": "tool", "tool_call_id": tc["id"], "content": resultText})
                         return f"TASK_COMPLETED: 物理目标已达成 (AOS 5.2 强行收敛终止)。结果详细反馈: {resultText}"
-                    
-                    current_tool_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": resultText,
-                        }
-                    )
                     # [AOS 4.9] 协议加固 (JSON Pipe Fix)
                     # 针对大尺寸结果（如 JS 源码）进行极致截断预览，防止撑破 OpenAI/MCP JSON 管道
                     # 刺客的任务是“拿回证据”，不是“在对话里展示源码”
@@ -2120,6 +2135,10 @@ class McpAgent:
                         consecutive_stale_rounds += 0.5 
                     else:
                         fingerprint_history.add(fingerprint)
+                        # [AOS 7.5.8] 核心突破：只要拿到了新數據（非重複指紋），就視為產生了邏輯位移
+                        if any(kw in funcName for kw in ["read", "list", "get_file", "search"]):
+                             has_logical_delta = True
+                             logger.info("🧠 [AOS 7.5.8] 偵測到邏輯位移（拿到了新信息）: %s", funcName)
 
                     self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
                     
@@ -2142,16 +2161,16 @@ class McpAgent:
             # [AOS 3.9.9] 确保全量 tool_calls 回传，无论中途有无内部异常
             self.memories[context_id].extend(current_tool_messages)
 
-            # [AOS 7.3] 輪次動態精算
+            # [AOS 7.5.8] 物理或邏輯位移判定
             hash_after = self.blackboard.get_snapshot_hash()
             has_physical_delta = (hash_before != hash_after) or (len(self._get_workspace_delta(iteration_start_files, workspace_override=effective_workspace)) > 0)
             
-            if has_physical_delta:
+            if has_physical_delta or has_logical_delta:
                 consecutive_stale_rounds = 0
-                # 如果有產出且接近上限，自動延展（最高至 2 倍初始預算，但不超過 15）
-                if iteration >= current_max - 2 and current_max < 15:
-                    current_max += 2
-                    logger.info("📈 [AOS 7.3] 檢測到有效產出，動態延展預算至 %d 輪", current_max)
+                # 如果有產出且接近上限，自動延展（最高至 50 輪，確保讀完大文件）
+                if iteration >= current_max - 2 and current_max < 50:
+                    current_max += 5
+                    logger.info("📈 [AOS 7.5.8] 檢測到有效位移（物理:%s, 邏輯:%s），動態延展預算至 %d 輪", has_physical_delta, has_logical_delta, current_max)
             else:
                 consecutive_stale_rounds += 1
                 
@@ -2548,41 +2567,32 @@ class McpAgent:
             logger.error(f"误差计算失败: {e}")
             return []
 
-    def _generate_big_file_summary(self, path: str, size: int) -> str:
+    def _read_file_chunked(self, path: str, size: int, offset: int = 0) -> str:
         """
-        [AOS 7.5] 生成大文件概覽，防止直接進入上下文。
+        [AOS 7.5.8] 核心改進：支持大文件分片讀取，每分片 30KB。
         """
+        CHUNK_SIZE = 30 * 1024 # 30KB (用戶要求升級)
         try:
-            line_count = 0
-            header = ""
-            footer = ""
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
-                line_count = len(lines)
-                if line_count > 20:
-                    header = "".join(lines[:10])
-                    footer = "".join(lines[-10:])
-                else:
-                    header = "".join(lines)
+            with open(path, 'rb') as f:
+                f.seek(offset)
+                data = f.read(CHUNK_SIZE)
+                content = data.decode('utf-8', errors='ignore')
+                
+            next_offset = offset + len(data)
+            has_more = next_offset < size
             
-            ext = os.path.splitext(path)[1].lower()
             summary = [
-                f"⚠️ [AOS 7.5 物理攔截] 文件過大 ({size/1024:.2f} KB)，已自動拒絕直接讀取全文以保護上下文。",
-                f"文件路徑: {path}",
-                f"總行數: {line_count}",
-                "\n【文件開頭 10 行】",
-                header,
-                "\n【文件末尾 10 行】",
-                footer,
-                "\n💡 [系統建議] 該文件已超過 32KB 安全閾值。請使用 spawn_expert 召喚 'BigFileAnalyzer' 或編寫 Python 腳本進行流式提取所需數據。"
+                f"📝 [AOS 7.5.8 分片讀取] 當前偏移量: {offset} byte, 讀取長度: {len(data)} bytes, 總大小: {size} bytes",
+                "--- START CHUNK ---",
+                content,
+                "--- END CHUNK ---",
             ]
             
-            # 如果是 JSON/JS，嘗試提取 Top-level Keys
-            if ext in ['.json', '.js']:
-                keys = re.findall(r'["\'](\w+)["\']\s*:', header)
-                if keys:
-                    summary.append(f"\n【偵測到潛在 Key】: {', '.join(list(set(keys))[:10])}")
-                    
+            if has_more:
+                summary.append(f"\n💡 [系統建議] 文件尚未讀完（已完成 {next_offset/size*100:.1f}%）。如需繼續讀取，請再次調用 read_file 並傳入參數: {{\"path\": \"{path}\", \"offset\": {next_offset}}}")
+            else:
+                summary.append("\n✅ [系統反饋] 已到達文件末尾，全文讀取完畢。")
+                
             return "\n".join(summary)
         except Exception as e:
-            return f"❌ [AOS 7.5] 無法生成概覽: {e}"
+            return f"❌ [AOS 7.5.8] 分片讀取失敗: {e}"

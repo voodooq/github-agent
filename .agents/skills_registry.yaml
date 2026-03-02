@@ -12,7 +12,7 @@ skills:
   args:
   - -y
   - '@modelcontextprotocol/server-sqlite'
-  - ./data.db
+  - E:\work\githubAgent\memories\data.db
   command: npx
   description: 本地 SQLite 数据库连接与 SQL 查询分析
   name: sqlite_analyzer
@@ -76,7 +76,7 @@ skills:
 - always_loaded: false
   args:
   - -y
-  - '@modelcontextprotocol/server-firecrawl'
+  - firecrawl-mcp
   command: npx
   description: 增强LLM网页抓取与搜索
   name: firecrawl-mcp-server
@@ -90,7 +90,7 @@ skills:
 - always_loaded: false
   args:
   - -y
-  - '@modelcontextprotocol/server-WebScraperToolkit'
+  - firecrawl-mcp
   command: npx
   description: AI驱动网页抓取引擎，隐形绕过，MCP服务器，多模态输出（Markdown, JSON, PDF）。
   name: WebScraperToolkit

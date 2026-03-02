@@ -158,11 +158,16 @@ class SkillManager:
 
         try:
             # [AOS 7.5.4] NPM 兼容性加固：強制使用官方 Registry 以免鏡像同步延遲導致包找不到
-            env_config = {
+            # [Fix AOS 7.5.6] 環境變量加固：必須繼承原始環境變量（特別是 PATH 和 SystemRoot），否则 npx 会失败
+            import os
+            env_config = os.environ.copy()
+            env_config.update({
                 "NPM_CONFIG_REGISTRY": "https://registry.npmjs.org",
                 "NPM_CONFIG_AUDIT": "false",
-                "NPM_CONFIG_FUND": "false"
-            }
+                "NPM_CONFIG_FUND": "false",
+                "NPM_CONFIG_LOGLEVEL": "error",
+                "NPM_CONFIG_UPDATE_NOTIFIER": "false"
+            })
             for key, val in config.get("env", {}).items():
                 if isinstance(val, str) and val.startswith("${") and val.endswith("}"):
                     env_var = val[2:-1]
@@ -787,13 +792,27 @@ class SkillManager:
             description = await self._enrich_metadata(winner["name"], description)
 
         # 注册到 registry（npm 包名推断）
+        # [AOS 7.5.7] 智能包名推斷：不再盲目加前綴
+        # 如果是官方 repo 則保留，否則嘗試使用 winner["repo"] 或原始名稱
+        pkg_name = winner.get("repo", f"@modelcontextprotocol/server-{winner['name']}")
+        if "/" in pkg_name and not pkg_name.startswith("@"):
+            # 如果是 github 路径，npx 通常需要补全或从 search 结果映射
+            # 此处简单兜底：如果分数高，通常已有标准包名
+            pass
+
         skill_config = {
             "name": winner["name"],
             "description": description,
             "command": "npx",
-            "args": ["-y", f"@modelcontextprotocol/server-{winner['name']}"],
+            "args": ["-y", f"{winner['name']}" if not winner['name'].startswith("@") else winner['name']],
             "always_loaded": False,
         }
+        
+        # 针对特定大厂技能的特殊映射
+        if "firecrawl" in winner["name"].lower():
+            skill_config["args"] = ["-y", "firecrawl-mcp"]
+        elif "sqlite" in winner["name"].lower():
+             skill_config["args"] = ["-y", "@modelcontextprotocol/server-sqlite", "./data.db"]
 
         self.register_new_skill(skill_config)
         print(f"🏆 [技能安装] 冠军技能 '{winner['name']}' 已注册到注册表")

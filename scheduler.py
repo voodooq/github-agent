@@ -26,8 +26,7 @@ SCHEDULER_DB_PATH = os.path.join(os.path.dirname(__file__), "memories", "schedul
 
 def _parse_simple_cron(cron_expr: str) -> dict:
     """
-    解析简化版 cron 表达式: "HH:MM" 每天定时 / "*/N" 每 N 分钟。
-    完整 cron 解析可后续接入 croniter 库。
+    解析简化版 cron 表达式: "HH:MM" 每天定时 / "*/N" 每 N 分钟 / "0 * * * *" 每小时。
     """
     cron_expr = cron_expr.strip()
 
@@ -37,18 +36,27 @@ def _parse_simple_cron(cron_expr: str) -> dict:
         return {"type": "interval", "minutes": interval_min}
 
     # 每天定时: "08:30" -> 每天 08:30
-    if ":" in cron_expr:
+    if ":" in cron_expr and " " not in cron_expr:
         parts = cron_expr.split(":")
         return {"type": "daily", "hour": int(parts[0]), "minute": int(parts[1])}
 
-    # 标准 5 段 cron: "0 8 * * *" -> 简化解析
+    # 标准 5 段 cron: "0 * * * *" -> 每小时 / "0 8 * * *" -> 每天 8 点
     parts = cron_expr.split()
     if len(parts) == 5:
-        return {
-            "type": "daily",
-            "minute": int(parts[0]) if parts[0] != "*" else 0,
-            "hour": int(parts[1]) if parts[1] != "*" else 0,
-        }
+        minute = parts[0]
+        hour = parts[1]
+        
+        # 每小时: "0 * * * *"
+        if minute != "*" and hour == "*":
+            return {"type": "hourly", "minute": int(minute)}
+            
+        # 每天: "0 8 * * *"
+        if minute != "*" and hour != "*":
+            return {"type": "daily", "hour": int(hour), "minute": int(minute)}
+        
+        # 通配每分钟: "* * * * *"
+        if minute == "*" and hour == "*":
+            return {"type": "interval", "minutes": 1}
 
     raise ValueError(f"无法解析 cron 表达式: {cron_expr}")
 
@@ -59,6 +67,12 @@ def _next_trigger_time(parsed_cron: dict) -> datetime:
 
     if parsed_cron["type"] == "interval":
         return now + timedelta(minutes=parsed_cron["minutes"])
+
+    if parsed_cron["type"] == "hourly":
+        target = now.replace(minute=parsed_cron["minute"], second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(hours=1)
+        return target
 
     if parsed_cron["type"] == "daily":
         target = now.replace(
@@ -138,6 +152,7 @@ class Scheduler:
         """从 SQLite 加载所有任务"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.execute("SELECT * FROM scheduled_tasks WHERE enabled = 1")
+        new_tasks = {}
         for row in cursor.fetchall():
             task = ScheduledTask(
                 task_id=row[0],
@@ -149,10 +164,11 @@ class Scheduler:
             )
             task.last_run = row[6]
             task.run_count = row[7] or 0
-            self.tasks[task.task_id] = task
+            new_tasks[task.task_id] = task
         conn.close()
+        self.tasks = new_tasks
         if self.tasks:
-            logger.info("⏰ [调度器] 已加载 %d 个定时任务", len(self.tasks))
+            logger.info("⏰ [调度器] 已加载/同步 %d 个定时任务", len(self.tasks))
 
     def add_task(
         self,
@@ -164,11 +180,6 @@ class Scheduler:
     ) -> dict:
         """
         添加定时任务。
-        @param task_id 唯一标识
-        @param description 任务描述
-        @param cron_expr cron 表达式（支持 "08:30" 或 "*/5" 或 "0 8 * * *"）
-        @param action 动作类型: print / webhook / wechat / agent_chat
-        @param payload 动作参数（消息内容 / URL 等）
         """
         # 验证 cron 表达式
         try:
@@ -197,7 +208,7 @@ class Scheduler:
         conn.commit()
         conn.close()
 
-        print(f"[调度器] 已添加任务 '{task_id}': {description} (下次触发: {next_time.strftime('%Y-%m-%d %H:%M')})")
+        print(f"⏰ [调度器] 已添加任务 '{task_id}': {description} (下次触发: {next_time.strftime('%Y-%m-%d %H:%M')})")
         return {
             "status": "created",
             "task_id": task_id,
@@ -207,10 +218,9 @@ class Scheduler:
 
     def cancel_task(self, task_id: str) -> dict:
         """取消定时任务"""
-        if task_id not in self.tasks:
-            return {"status": "not_found", "message": f"任务 '{task_id}' 不存在"}
-
-        del self.tasks[task_id]
+        if task_id in self.tasks:
+            del self.tasks[task_id]
+            
         conn = sqlite3.connect(self.db_path)
         conn.execute("DELETE FROM scheduled_tasks WHERE task_id = ?", (task_id,))
         conn.commit()
@@ -225,7 +235,6 @@ class Scheduler:
         self.tasks.clear()
         
         conn = sqlite3.connect(self.db_path)
-        # 获取实际删除行数
         cursor = conn.execute("DELETE FROM scheduled_tasks")
         count_db = conn.total_changes
         conn.commit()
@@ -236,15 +245,13 @@ class Scheduler:
 
     def get_state_snapshot(self) -> str:
         """
-        [AOS 6.2] 获取当前数据库的状态指纹（用于物理审计）。
-        返回所有启用任务的任务 ID 拼接后的哈希或简单描述。
+        [AOS 6.2] 获取当前数据库的状态指纹。
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.execute("SELECT task_id, last_run, run_count FROM scheduled_tasks WHERE enabled = 1 ORDER BY task_id")
         rows = cursor.fetchall()
         conn.close()
         
-        # 简单指纹：(任务数, 任务ID列表的Hash-like字符串)
         if not rows:
             return "empty"
         
@@ -252,7 +259,8 @@ class Scheduler:
         return f"count:{len(rows)}|fp:{fingerprint}"
 
     def list_tasks(self) -> list[dict]:
-        """列出所有定时任务"""
+        """列出所有定时任务 (AOS 7.5.5: 强制与 DB 同步)"""
+        self._load_tasks()  # 确保返回的是最新物理状态
         result = []
         for task in self.tasks.values():
             try:
@@ -272,7 +280,7 @@ class Scheduler:
         return result
 
     def register_action(self, action_name: str, handler: Callable[[str], Awaitable[None]]) -> None:
-        """注册消息推送通道（微信/Webhook/自定义）"""
+        """注册消息推送通道"""
         self._action_handlers[action_name] = handler
         logger.info("⏰ [调度器] 已注册动作通道: %s", action_name)
 
@@ -304,9 +312,12 @@ class Scheduler:
             logger.error("⏰ [调度器] 任务 %s 执行失败: %s", task.task_id, e)
 
     async def _tick_loop(self) -> None:
-        """后台心跳循环：每 30 秒检查一次是否有任务需要触发"""
+        """后台心跳循环"""
         while self._running:
             now = datetime.now()
+            # 每次心跳动态加载，防止外部进程更新了 DB
+            self._load_tasks()
+            
             for task in list(self.tasks.values()):
                 if not task.enabled:
                     continue
@@ -321,6 +332,14 @@ class Scheduler:
                         else:
                             last = datetime.fromisoformat(task.last_run)
                             should_fire = (now - last).total_seconds() >= parsed["minutes"] * 60
+
+                    elif parsed["type"] == "hourly":
+                        if now.minute == parsed["minute"]:
+                            if task.last_run:
+                                last = datetime.fromisoformat(task.last_run)
+                                if last.hour == now.hour and last.day == now.day:
+                                    continue
+                            should_fire = True
 
                     elif parsed["type"] == "daily":
                         if now.hour == parsed["hour"] and now.minute == parsed["minute"]:
