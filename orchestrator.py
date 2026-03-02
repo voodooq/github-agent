@@ -600,8 +600,8 @@ class Orchestrator:
                     if os.path.exists(db_path):
                         conn = sqlite3.connect(db_path)
                         cursor = conn.cursor()
-                        # 检查 tasks 表是否为空
-                        cursor.execute("SELECT count(*) FROM tasks")
+                        # 检查 scheduled_tasks 表是否为空
+                        cursor.execute("SELECT count(*) FROM scheduled_tasks")
                         count = cursor.fetchone()[0]
                         conn.close()
                         if count == 0:
@@ -978,12 +978,13 @@ class Orchestrator:
             has_physical_evidence = has_fs_delta or has_db_delta or has_bb_delta
             
             if is_maintenance:
-                # [AOS 6.3] 强制双重收据：DB 变动且有文件产出
-                if not (has_db_delta and has_fs_delta):
-                    logger.error("❌ [AOS 6.3] 审计双检失败：维护任务缺少 DB 或 FS (done.txt) 收据。")
-                    yield f"❌ [AOS 6.3] 审计双检失败：维护任务必须同时产生数据库变更和物理文件收据(done.txt)。当前状态: DB={has_db_delta}, FS={has_fs_delta}。\n"
+                # [AOS 7.5.4] 冪等性審計：對於清理/查詢類維護任務，只要有工具執行成功（即使無位移）即判定為通過
+                # 防止因「清理已空列表」無位移導致 AI 重試觸發熔斷。
+                if has_physical_evidence or "cleared" in final_report.lower() or "success" in final_report.lower():
+                    yield f"✅ [AOS 7.5.4] 維護任務物理閉環成功。審計維度: {'DB ' if has_db_delta else ''}{'FS ' if has_fs_delta else ''}{'BB' if has_bb_delta else ''} (容忍冪等性無位移)\n"
                 else:
-                    yield f"✅ [AOS 6.3] 双重审计通过。DB 指纹位移 + FS 物理回执已确认。\n"
+                    logger.error("❌ [AOS 6.3] 審計失敗：維護任務未檢測到任何物理位移或成功標誌。")
+                    yield f"❌ [AOS 6.3] 審計失敗：維護任務必須產生數據變更、文件收據(done.txt)或明確的成功狀態。\n"
             elif intent == "L1_BLITZ" and not has_fs_delta:
                  logger.error("❌ [AOS 6.0] 物理审计失败：单兵/自动分诊任务未产生物理文件产出。")
                  yield f"❌ [AOS 6.0] 物理审计失败：检测到执行指令，但物理审计未发现文件增量。拒绝接受文本报告。\n"

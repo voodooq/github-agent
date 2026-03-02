@@ -8,6 +8,8 @@ import asyncio
 import logging
 import os
 import yaml
+import shutil
+import traceback
 from datetime import datetime
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -118,8 +120,14 @@ class SkillManager:
         except (Exception, BaseExceptionGroup) as e:
             if not session_future.done():
                 session_future.set_exception(e)
-            else:
-                logger.error("🚫 [技能运行器] 运行时异常 (%s): %s", name, e)
+            
+            # [AOS 7.5.2] 深度異常診斷：展開 ExceptionGroup 查看真實原因
+            logger.error("🚫 [技能運行器] 運行時異常 (%s): %s", name, str(e))
+            if hasattr(e, "exceptions"):
+                for idx, sub_e in enumerate(e.exceptions):
+                    logger.error("  └─ [子異常 %d]: %s", idx, str(sub_e))
+                    # 如果子異常還有堆棧，記錄下來
+                    logger.error(traceback.format_exc())
         finally:
             logger.debug("🔌 [技能运行器] 任务已终结: %s", name)
 
@@ -149,8 +157,12 @@ class SkillManager:
         print(f"🔌 [技能管理器] 正在加载技能: {name}...")
 
         try:
-            # 环境与路径处理
-            env_config = {}
+            # [AOS 7.5.4] NPM 兼容性加固：強制使用官方 Registry 以免鏡像同步延遲導致包找不到
+            env_config = {
+                "NPM_CONFIG_REGISTRY": "https://registry.npmjs.org",
+                "NPM_CONFIG_AUDIT": "false",
+                "NPM_CONFIG_FUND": "false"
+            }
             for key, val in config.get("env", {}).items():
                 if isinstance(val, str) and val.startswith("${") and val.endswith("}"):
                     env_var = val[2:-1]
@@ -179,9 +191,27 @@ class SkillManager:
                 new_args.extend(allowed_roots)
                 args = new_args
 
+            # [AOS 7.5.2] Windows 兼容性補丁：優先使用 .cmd 版本且透過 shutil.which 尋找絕對路徑
+            cmd_name = config["command"]
+            if os.name == "nt" and cmd_name == "npx":
+                resolved_cmd = shutil.which("npx.cmd") or shutil.which("npx")
+            else:
+                resolved_cmd = shutil.which(cmd_name) or cmd_name
+            
+            if not resolved_cmd:
+                logger.warning("⚠️ [AOS 7.5.2] 未能找到可執行文件: %s，嘗試使用原始名稱。", cmd_name)
+                resolved_cmd = cmd_name
+            
+            # [AOS 7.5.3] Shell Protocol：在 Windows 上，如果是腳本類指令，可能需要 cmd /c 輔助
+            final_args = args
+            if os.name == "nt" and resolved_cmd.lower().endswith((".cmd", ".bat", ".ps1")):
+                logger.info("🐚 [Shell Protocol] 偵測到 Windows 腳本，封裝為 cmd /c 模式")
+                final_args = ["/c", resolved_cmd] + args
+                resolved_cmd = "cmd.exe"
+
             server_params = StdioServerParameters(
-                command=config["command"],
-                args=args,
+                command=resolved_cmd,
+                args=final_args,
                 env=env_config if env_config else None,
             )
 

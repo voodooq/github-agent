@@ -129,6 +129,7 @@ class Scheduler:
                 created_at TEXT
             )
         """)
+        conn.execute("PRAGMA journal_mode=WAL")  # AOS 7.6: 启用 WAL 模式解决 Windows 并发锁定问题
         conn.commit()
         conn.close()
         logger.info("⏰ [调度器] SQLite 已初始化: %s", self.db_path)
@@ -196,7 +197,7 @@ class Scheduler:
         conn.commit()
         conn.close()
 
-        print(f"⏰ [调度器] 已添加任务 '{task_id}': {description} (下次触发: {next_time.strftime('%Y-%m-%d %H:%M')})")
+        print(f"[调度器] 已添加任务 '{task_id}': {description} (下次触发: {next_time.strftime('%Y-%m-%d %H:%M')})")
         return {
             "status": "created",
             "task_id": task_id,
@@ -220,16 +221,18 @@ class Scheduler:
 
     def clear_all_tasks(self) -> dict:
         """清空所有定时任务"""
-        count = len(self.tasks)
+        count_mem = len(self.tasks)
         self.tasks.clear()
         
         conn = sqlite3.connect(self.db_path)
-        conn.execute("DELETE FROM scheduled_tasks")
+        # 获取实际删除行数
+        cursor = conn.execute("DELETE FROM scheduled_tasks")
+        count_db = conn.total_changes
         conn.commit()
         conn.close()
         
-        print(f"💥 [调度器] 已清理所有任务 (共 {count} 个)")
-        return {"status": "cleared", "count": count}
+        print(f"💥 [调度器] 已清理所有任务 (内存: {count_mem}, 数据库: {count_db})")
+        return {"status": "cleared", "count": count_db}
 
     def get_state_snapshot(self) -> str:
         """

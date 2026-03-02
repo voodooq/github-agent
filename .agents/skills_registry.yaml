@@ -76,9 +76,9 @@ skills:
 - always_loaded: false
   args:
   - -y
-  - '@modelcontextprotocol/server-firecrawl-mcp-server'
+  - '@modelcontextprotocol/server-firecrawl'
   command: npx
-  description: 增强LLM网页抓取与搜索，Cursor/Claude插件化扩展
+  description: 增强LLM网页抓取与搜索
   name: firecrawl-mcp-server
 - always_loaded: false
   args:
@@ -104,7 +104,7 @@ skills:
 - always_loaded: false
   args:
   - -y
-  - '@modelcontextprotocol/server-document-search-mcp-server'
+  - '@modelcontextprotocol/server-document-search'
   command: npx
-  description: MCP文档检索，支持多库搜索、提取与展示。
+  description: MCP文档检索，支持多库搜索
   name: document-search-mcp-server

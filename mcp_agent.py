@@ -1302,7 +1302,7 @@ class McpAgent:
         @param slim: 如果为 True, 则只返回核心元工具（用于极致省钱模式）
         """
         # [AOS 2.9/4.9/6.4] 动态工具带：极大减少 Context 消耗。write_file 现已设为常驻元工具。
-        meta_tool_names = {"search_skills", "read_skill", "load_skill", "unload_skill", "list_skills", "http_fetch", "write_file", "edit_file"}
+        meta_tool_names = {"search_skills", "read_skill", "load_skill", "unload_skill", "list_skills", "http_fetch", "write_file", "edit_file", "read_file", "list_dir"}
         
         all_tools = list(self.openaiTools) if self.openaiTools else []
         skill_tools = self.skill_manager.get_all_tools()
@@ -2038,6 +2038,7 @@ class McpAgent:
                     actual_func = self._normalize_tool_name(funcName)
 
                     parsed_args = json.loads(arguments)
+                    resultText = "No result produced" # Initialize with a safe default
                     # [AOS 3.6] 絕對路徑錨定攔截器：使用本輪局部工作區
                     self._anchor_tool_paths(actual_func, parsed_args, workspace_override=effective_workspace)
                     
@@ -2107,8 +2108,10 @@ class McpAgent:
                         
                     # [AOS 7.3] 智能重複與原地踏步檢測
                     import hashlib
+                    # 🛡️ 保護：防止 resultText 為 None 導致 encode() 崩潰
+                    safe_result = str(resultText or "None")
                     args_hash = hashlib.md5(arguments.encode()).hexdigest()
-                    result_hash = hashlib.md5(resultText.encode()).hexdigest()
+                    result_hash = hashlib.md5(safe_result.encode()).hexdigest()
                     fingerprint = f"{funcName}:{args_hash}:{result_hash}"
                     
                     if fingerprint in fingerprint_history:
