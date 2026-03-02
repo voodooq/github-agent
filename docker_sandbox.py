@@ -36,26 +36,29 @@ class DockerSandboxAgent:
         except Exception as e:
             logger.debug(f"[_on_rm_error] 彻底删除失败 {path}: {e}")
 
-    def clone_repo(self, repo_url, project_name):
-        """克隆仓库到沙盒目录，采用随机后缀防止路径冲突"""
-        # 为每次克隆生成唯一的目录名
-        safe_name = f"{project_name.replace('/', '_')}_{random.randint(1000, 9999)}"
-        project_dir = os.path.join(self.sandbox_dir, safe_name)
+    def clone_repo(self, repo_url, project_name, workspace_path=None):
+        """克隆仓库到沙盒目录，采用随机后缀防止路径冲突，或直接落盘到指定 workspace"""
+        if workspace_path:
+            # 如果指定了特定工作区，使用工作区内部按项目名建的子文件夹
+            project_dir = os.path.join(workspace_path, project_name.replace('/', '_'))
+        else:
+            # 兼容老逻辑：在临时 sandbox_dir 下
+            safe_name = f"{project_name.replace('/', '_')}_{random.randint(1000, 9999)}"
+            project_dir = os.path.join(self.sandbox_dir, safe_name)
         
-        # 理论上新随机路径不存在，但保留一层探测以防万一
         if os.path.exists(project_dir):
             try:
                 shutil.rmtree(project_dir, onerror=self._on_rm_error)
             except Exception as e:
                 logger.warning(f"无法清理预期路径 {project_dir}: {e}")
         
-        print(f"🚚 正在克隆仓库 {repo_url} 到沙盒...")
+        print(f"🚚 正在克隆仓库 {repo_url} 到 {project_dir}...")
         result = subprocess.run(["git", "clone", "--depth", "1", repo_url, project_dir], capture_output=True, text=True)
         if result.returncode != 0:
             return False, result.stderr
         return True, project_dir
 
-    def deploy_in_sandbox(self, project_name, dockerfile_content, repo_url):
+    def deploy_in_sandbox(self, project_name, dockerfile_content, repo_url, workspace_path=None):
         """
         供部署专家调用的核心工具：在独立沙盒中构建并运行代码。
         这是一个生成器，会 yield 进度信息。
@@ -66,7 +69,7 @@ class DockerSandboxAgent:
 
         # 1. 克隆代码
         yield {"type": "progress", "message": f"🚚 正在克隆仓库 {repo_url}..."}
-        success, res = self.clone_repo(repo_url, project_name)
+        success, res = self.clone_repo(repo_url, project_name, workspace_path=workspace_path)
         if not success:
             yield {"type": "error", "message": "代码克隆失败", "details": res}
             return
@@ -85,17 +88,33 @@ class DockerSandboxAgent:
             
             # 使用 API client 进行流式构建
             # decode=True 会自动将响应解析为字典
-            for chunk in self.client.api.build(
-                path=project_dir,
-                tag=image_tag,
-                rm=True,
-                decode=True
-            ):
-                if 'stream' in chunk:
-                    yield {"type": "log", "message": chunk['stream'].strip()}
-                elif 'error' in chunk:
-                    yield {"type": "error", "message": "镜像构建失败", "details": chunk['error']}
-                    return
+            build_error_details = ""
+            try:
+                for chunk in self.client.api.build(
+                    path=project_dir,
+                    tag=image_tag,
+                    rm=True,
+                    decode=True
+                ):
+                    if 'stream' in chunk:
+                        yield {"type": "log", "message": chunk['stream'].strip()}
+                    elif 'error' in chunk:
+                        err_msg = chunk.get('errorDetail', {}).get('message', chunk['error'])
+                        build_error_details += err_msg + "\n"
+                        yield {"type": "error", "message": "镜像构建失败 (Dockerfile 语法或依赖错误)", "details": err_msg}
+            except Exception as build_ex:
+                build_error_details += str(build_ex) + "\n"
+                yield {"type": "error", "message": "镜像构建过程中断", "details": str(build_ex)}
+
+            if build_error_details:
+                return # 发生过错误，不再继续启动容器，让上层去自愈
+
+            # 二次核对：确认镜像是否真的本地生成了，防止它跑到云端拉取提示无权限
+            try:
+                self.client.images.get(image_tag)
+            except docker.errors.ImageNotFound:
+                yield {"type": "error", "message": "构建逻辑未反馈错误，但本地未找到产物镜像。可能构建由于环境原因中止。", "details": ""}
+                return
 
             # 4. 动态分配空闲端口并启动容器
             yield {"type": "progress", "message": "🚀 正在协商空闲端口并启动容器..."}

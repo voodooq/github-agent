@@ -2524,7 +2524,7 @@ class McpAgent:
 
             current_attempt_failed = False
             try:
-                for event in self.docker_sandbox.deploy_in_sandbox(repo, dockerfile_content, repo_url):
+                for event in self.docker_sandbox.deploy_in_sandbox(repo, dockerfile_content, repo_url, workspace_path=wsp):
                     evt_type = event.get("type")
                     msg = event.get("message", "")
 
