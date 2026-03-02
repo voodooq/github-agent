@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 # NOTE: 使用 GitHub 专用 System Prompt 替代通用 prompt
 SYSTEM_PROMPT = GITHUB_SEARCH_PROMPT
 
+GITHUB_REPO_URL_PATTERN = re.compile(r"https://github\.com/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+")
+QUOTED_MD_FILE_PATTERN = re.compile(r'["\'](.*?\.md)["\']')
+TEXT_SPLIT_PATTERN = re.compile(r'[\s,，;；]+')
+
 
 def printHelp():
     """打印帮助信息"""
@@ -67,9 +71,7 @@ def extract_github_urls(text: str) -> list[str]:
     """
     從文本中提取所有 GitHub 倉庫地址
     """
-    import re
-    pattern = r"https://github\.com/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+"
-    urls = re.findall(pattern, text)
+    urls = GITHUB_REPO_URL_PATTERN.findall(text)
     # 去重並清洗（去除末尾的 .git 或斜槓）
     seen = set()
     cleaned_urls = []
@@ -85,12 +87,11 @@ def find_files_in_text(text: str) -> list[str]:
     """
     從文本中提取所有有效的本地文件路徑
     """
-    import re
     # 支持帶空格的路徑（通常用引號包裹），以及常見分隔符
     # 先嘗試匹配被引號包裹的
-    quoted = re.findall(r'["\'](.*?\.md)["\']', text)
+    quoted = QUOTED_MD_FILE_PATTERN.findall(text)
     # 再按常見分隔符切分
-    parts = re.split(r'[\s,，;；]+', text)
+    parts = TEXT_SPLIT_PATTERN.split(text)
     
     valid_files = []
     for p in set(quoted + parts):
@@ -98,6 +99,34 @@ def find_files_in_text(text: str) -> list[str]:
         if p and os.path.isfile(p):
             valid_files.append(os.path.abspath(p))
     return list(set(valid_files))
+
+
+def collect_target_urls(original_input: str) -> tuple[list[str], list[str], list[tuple[str, int]], list[tuple[str, str]]]:
+    """
+    從輸入文本中收集 GitHub URL（直接輸入 + 本地文件內容）。
+    返回：
+    - target_urls: 去重後 URL
+    - found_files: 命中的本地文件
+    - file_hits: [(文件路徑, 文件內提取到的 URL 數量)]
+    - file_errors: [(文件路徑, 錯誤信息)]
+    """
+    target_urls = extract_github_urls(original_input)
+    found_files = find_files_in_text(original_input)
+    file_hits: list[tuple[str, int]] = []
+    file_errors: list[tuple[str, str]] = []
+
+    for fpath in found_files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                content = f.read()
+            f_urls = extract_github_urls(content)
+            target_urls.extend(f_urls)
+            file_hits.append((fpath, len(f_urls)))
+        except Exception as e:
+            file_errors.append((fpath, str(e)))
+
+    target_urls = list(dict.fromkeys(target_urls))
+    return target_urls, found_files, file_hits, file_errors
 
 
 async def main():
@@ -280,7 +309,8 @@ async def main():
                             with open(report_path, "w", encoding="utf-8") as f:
                                 f.write(full_report)
                             print(f"💾 完整報告已自動保存到: {report_path}\n")
-                        except: pass
+                        except Exception as e:
+                            logger.warning("搜索報告歸檔失敗: %s", e)
                         
                     except Exception as e:
                         logger.error("Agent 处理异常: %s", e)
@@ -292,26 +322,15 @@ async def main():
                     if not original_input:
                         print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
                         continue
-                    
-                    # 1. 提取直接給出的 URL
-                    target_urls = extract_github_urls(original_input)
-                    
-                    # 2. 尋找文件並提取其中的 URL
-                    found_files = find_files_in_text(original_input)
+
+                    target_urls, found_files, file_hits, file_errors = collect_target_urls(original_input)
+
                     if found_files:
                         print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
-                        for fpath in found_files:
-                            try:
-                                with open(fpath, "r", encoding="utf-8") as f:
-                                    content = f.read()
-                                f_urls = extract_github_urls(content)
-                                target_urls.extend(f_urls)
-                                print(f"  ✅ {os.path.basename(fpath)}: 找到 {len(f_urls)} 個地址")
-                            except Exception as e:
-                                print(f"  ❌ 讀取 {fpath} 失敗: {e}")
-                    
-                    # 去重
-                    target_urls = list(dict.fromkeys(target_urls))
+                        for fpath, count in file_hits:
+                            print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 個地址")
+                        for fpath, err in file_errors:
+                            print(f"  ❌ 讀取 {fpath} 失敗: {err}")
                     
                     if not target_urls:
                         print(f"⚠️  未找到任何有效的 GitHub 地址。輸入內容: \"{original_input[:50]}...\"\n")
@@ -364,7 +383,8 @@ async def main():
                         with open(report_path, "w", encoding="utf-8") as f:
                             f.write(final_report)
                         print(f"\n💾 完整的分析報告已自動保存到: {report_path}\n")
-                    except: pass
+                    except Exception as e:
+                        logger.warning("分析報告歸檔失敗: %s", e)
                     continue
                 elif userInput.startswith("/review "):
                     # 專家團評審：支持 URL、本地文件或混合文本
@@ -372,26 +392,15 @@ async def main():
                     if not original_input:
                         print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
                         continue
-                    
-                    # 1. 直接提取 URL
-                    target_urls = extract_github_urls(original_input)
-                    
-                    # 2. 尋找文件並提取 URL
-                    found_files = find_files_in_text(original_input)
+
+                    target_urls, found_files, file_hits, file_errors = collect_target_urls(original_input)
+
                     if found_files:
                         print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
-                        for fpath in found_files:
-                            try:
-                                with open(fpath, "r", encoding="utf-8") as f:
-                                    content = f.read()
-                                f_urls = extract_github_urls(content)
-                                target_urls.extend(f_urls)
-                                print(f"  ✅ {os.path.basename(fpath)}: 找到 {len(f_urls)} 個地址")
-                            except Exception as e:
-                                print(f"  ❌ 讀取 {fpath} 失敗: {e}")
-
-                    # 去重
-                    target_urls = list(dict.fromkeys(target_urls))
+                        for fpath, count in file_hits:
+                            print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 個地址")
+                        for fpath, err in file_errors:
+                            print(f"  ❌ 讀取 {fpath} 失敗: {err}")
 
                     if not target_urls:
                         print(f"⚠️  未找到任何有效的 GitHub 地址。\n")
@@ -419,7 +428,8 @@ async def main():
                             with open(report_path, "w", encoding="utf-8") as f:
                                 f.write(full_report)
                             print(f"💾 評審報告已自動保存到: {report_path}\n")
-                        except: pass
+                        except Exception as e:
+                            logger.warning("評審報告歸檔失敗: %s", e)
                         
                     except Exception as e:
                         logger.error("評審流程異常: %s", e)
@@ -574,31 +584,18 @@ async def main():
                     # 极速回复，不进记忆
                     print(f"\n🤖 Agent: 你好呀，我是道子！随时听候吩咐。如果是执行类任务，请使用 /auto 开头。")
                     continue
-                
-                # 显式 Hot Mode: 必须以 /auto 开头
-                if userInput.startswith("/auto "):
-                    demand = userInput[6:].strip()
-                    print(f"\n🚀 [Hot Mode] 识别到显式自治指令，启动刺客模式...\n")
-                    try:
-                        async for chunk in agent.autonomous_execute(demand):
-                            print(chunk, end="", flush=True)
-                        print("\n")
-                    except Exception as e:
-                        logger.error("自治任务失败: %s", e)
-                        print(f"\n❌ 执行失败: {e}\n")
-                
+
                 # 隐式 Cold Mode: 针对普通对话，锁定无工具权限
-                else:
-                    print(f"\n🤖 Agent: [Cold Mode] ", end="", flush=True)
-                    try:
-                        # [AOS 7.0] 物理限权：no_tools=True 确保 AI 只有嘴，没有手
-                        chat_tier = "PREMIUM" if AGENT_MODE == "TURBO" else "LOCAL"
-                        async for chunk in agent.chat(userInput, tier=chat_tier, no_tools=True):
-                            print(chunk, end="", flush=True)
-                        print("\n")
-                    except Exception as e:
-                        logger.error("对话异常: %s", e)
-                        print(f"\n❌ 处理失败: {e}\n")
+                print(f"\n🤖 Agent: [Cold Mode] ", end="", flush=True)
+                try:
+                    # [AOS 7.0] 物理限权：no_tools=True 确保 AI 只有嘴，没有手
+                    chat_tier = "PREMIUM" if AGENT_MODE == "TURBO" else "LOCAL"
+                    async for chunk in agent.chat(userInput, tier=chat_tier, no_tools=True):
+                        print(chunk, end="", flush=True)
+                    print("\n")
+                except Exception as e:
+                    logger.error("对话异常: %s", e)
+                    print(f"\n❌ 处理失败: {e}\n")
 
     # 退出前保存所有记忆
     await agent.saveAllMemories()
