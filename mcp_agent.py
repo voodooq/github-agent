@@ -1856,7 +1856,7 @@ class McpAgent:
         success_count = 0  # [AOS 4.8] 工具执行成功计数
         failure_count = 0  # [AOS 4.8] 工具执行失败计数
         consecutive_stale_rounds = 0 # [AOS 7.3] 连续无产出轮次
-        has_logical_delta = False    # [AOS 7.5.8] 逻辑位移：是否从工具中拿到了新数据
+        self.has_logical_delta = False    # [AOS 7.5.8] 逻辑位移：是否从工具中拿到了新数据
         
         current_max = MAX_ITERATIONS
         for iteration in range(100): # 物理硬上限，逻辑上限由 current_max 控制
@@ -2135,9 +2135,8 @@ class McpAgent:
                         consecutive_stale_rounds += 0.5 
                     else:
                         fingerprint_history.add(fingerprint)
-                        # [AOS 7.5.8] 核心突破：只要拿到了新数据（非重复指纹），就视为产生了逻辑位移
                         if any(kw in funcName for kw in ["read", "list", "get_file", "search"]):
-                             has_logical_delta = True
+                             self.has_logical_delta = True
                              logger.info("🧠 [AOS 7.5.8] 侦测到逻辑位移（拿到了新信息）: %s", funcName)
 
                     self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
@@ -2165,12 +2164,12 @@ class McpAgent:
             hash_after = self.blackboard.get_snapshot_hash()
             has_physical_delta = (hash_before != hash_after) or (len(self._get_workspace_delta(iteration_start_files, workspace_override=effective_workspace)) > 0)
             
-            if has_physical_delta or has_logical_delta:
+            if has_physical_delta or self.has_logical_delta:
                 consecutive_stale_rounds = 0
                 # 如果有产出且接近上限，自动延展（最高至 50 轮，确保读完大文件）
                 if iteration >= current_max - 2 and current_max < 50:
                     current_max += 5
-                    logger.info("📈 [AOS 7.5.8] 检测到有效位移（物理:%s, 逻辑:%s），动态延展预算至 %d 轮", has_physical_delta, has_logical_delta, current_max)
+                    logger.info("📈 [AOS 7.5.8] 检测到有效位移（物理:%s, 逻辑:%s），动态延展预算至 %d 轮", has_physical_delta, self.has_logical_delta, current_max)
             else:
                 consecutive_stale_rounds += 1
                 
@@ -2316,12 +2315,12 @@ class McpAgent:
 
     async def multiAgentReview(self, repo_urls: str | list[str]) -> AsyncGenerator[str, None]:
         """
-        混合多 Agent 評審流：支持單個或多個項目的併發評審與對比分析。
+        混合多 Agent 评审流：支持单个或多个项目的并发评审与对比分析。
         """
         if isinstance(repo_urls, str):
             repo_urls = [repo_urls]
 
-        # [AOS 7.1] 激活隔離工作區
+        # [AOS 7.1] 激活隔离工作区
         wsp = self._setup_action_workspace("review")
         yield f"📁 [隔離] 正在 Review 空間建立沙盒: {wsp}\n"
         

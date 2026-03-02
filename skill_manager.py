@@ -204,13 +204,13 @@ class SkillManager:
                 resolved_cmd = shutil.which(cmd_name) or cmd_name
             
             if not resolved_cmd:
-                logger.warning("⚠️ [AOS 7.5.2] 未能找到可執行文件: %s，嘗試使用原始名稱。", cmd_name)
+                logger.warning("⚠️ [AOS 7.5.2] 未能找到可執行文件: %s，尝试使用原始名稱。", cmd_name)
                 resolved_cmd = cmd_name
             
-            # [AOS 7.5.3] Shell Protocol：在 Windows 上，如果是腳本類指令，可能需要 cmd /c 輔助
+            # [AOS 7.5.3] Shell Protocol：在 Windows 上，如果是脚本類指令，可能需要 cmd /c 輔助
             final_args = args
             if os.name == "nt" and resolved_cmd.lower().endswith((".cmd", ".bat", ".ps1")):
-                logger.info("🐚 [Shell Protocol] 偵測到 Windows 腳本，封裝為 cmd /c 模式")
+                logger.info("🐚 [Shell Protocol] 检测到 Windows 脚本，封装为 cmd /c 模式")
                 final_args = ["/c", resolved_cmd] + args
                 resolved_cmd = "cmd.exe"
 
@@ -793,7 +793,7 @@ class SkillManager:
 
         # 注册到 registry（npm 包名推断）
         # [AOS 7.5.7] 智能包名推斷：不再盲目加前綴
-        # 如果是官方 repo 則保留，否則嘗試使用 winner["repo"] 或原始名稱
+        # 如果是官方 repo 則保留，否則尝试使用 winner["repo"] 或原始名稱
         pkg_name = winner.get("repo", f"@modelcontextprotocol/server-{winner['name']}")
         if "/" in pkg_name and not pkg_name.startswith("@"):
             # 如果是 github 路径，npx 通常需要补全或从 search 结果映射
