@@ -862,21 +862,30 @@ class Orchestrator:
     async def classify_intent(self, demand: str) -> str:
         """
         [AOS 6.0] 战术分诊器：判断任务是 L1_BLITZ 还是 L2_EXPERT。
-        极速前额叶：优先词法匹配，兜底 LLM 语义判断。
+        极大优化长尾复杂任务与简单短指令的二分能力。
         """
-        # 1. 极速词法预检
+        # 1. 核心关键词与长度分析
         blitz_keywords = [
-            "schedule", "task", "定时", "提醒", "remind", "reminder", 
-            "fetch", "抓取", "获取", "新闻", "status", "check", "wallet", "balance",
-            "clear", "cleanup", "清空", "清理", "install", "安装", "新闻"
+            "status", "check", "wallet", "balance",
+            "clear", "cleanup", "清空", "清理", "提醒", "remind"
         ]
-        if any(kw in demand.lower() for kw in blitz_keywords):
+        
+        # [AOS 7.6] 增强型智能调度分诊：调度器操作不能一棍子打死
+        # 如果需求中包含了跨领域的复杂要求（如翻译、爬虫、多层逻辑，或者语句过长），即便带有定时，也应判定为 L2_EXPERT
+        complex_indicators = ["翻译", "总结", "全网", "抓取所有", "并", "分析", "架构", "配置"]
+        demand_lower = demand.lower()
+        
+        # 明显带有复杂特征的长难句，直接判定为 L2 专家级
+        if len(demand) > 30 and any(kw in demand_lower for kw in complex_indicators):
+            return "L2_EXPERT"
+            
+        # 简单的线性单词指令，比如 “帮我建一个每分钟显示时间的定时器” (没有超出范围的复杂逻辑)
+        if any(kw in demand_lower for kw in blitz_keywords) or (("schedule" in demand_lower or "定时" in demand_lower) and len(demand) < 40 and not any(kw in demand_lower for kw in complex_indicators)):
             return "L1_BLITZ"
             
-        # 2. 语义分诊 (使用 LOCAL 模式，追求极速)
-        prompt = f"请判断输入需求是否属于线性/原子任务（L1_BLITZ）或复杂/架构/跨领域任务（L2_EXPERT）。\n需求: \"{demand}\"\n直接输出分类ID，禁止废话。"
+        # 2. 语义分诊兜底 (使用 LOCAL 模式，追求极速)
+        prompt = f"请判断输入需求是否属于线性/简单的步骤（L1_BLITZ）或复杂/需要多步骤/需要代码级思考任务（L2_EXPERT）。\n需求: \"{demand}\"\n直接输出分类ID，禁止废话。"
         try:
-            # 这里的 agent 是 Orchestrator 的成员变量
             resp = await self.agent.unified_client.generate(
                 tier="LOCAL", 
                 messages=[{"role": "user", "content": prompt}]

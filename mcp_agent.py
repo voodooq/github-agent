@@ -786,8 +786,8 @@ class McpAgent:
                             "task_id": {"type": "string", "description": "任务唯一标识，如 'med_reminder'"},
                             "description": {"type": "string", "description": "任务描述"},
                             "cron_expr": {"type": "string", "description": "触发时间，如 '08:30' 或 '*/5' 或 '0 8 * * *'"},
-                            "action": {"type": "string", "description": "动作类型: print/webhook/wechat"},
-                            "payload": {"type": "string", "description": "消息内容或 URL"}
+                            "action": {"type": "string", "description": "动作类型: print/webhook/wechat/autonomous_task(复杂自治任务或普通指令任务)"},
+                            "payload": {"type": "string", "description": "消息内容。若为autonomous_task且需沙箱执行，传入含 'task_id'和'instruction' 的JSON字符串"}
                         },
                         "required": ["task_id", "description", "cron_expr"]
                     }
@@ -855,6 +855,9 @@ class McpAgent:
         ]
         self.openaiTools.extend(phase3_tools)
         toolNames.extend(["add_scheduled_task", "list_scheduled_tasks", "cancel_scheduled_task", "clear_all_scheduled_tasks", "discover_and_install_skill", "http_fetch"])
+
+        # 注册自治任务回调
+        self.scheduler.register_action("autonomous_task", self._handle_scheduled_autonomous_task)
 
         # 启动后台调度器心跳
         self.scheduler.start()
@@ -1023,6 +1026,67 @@ class McpAgent:
         except Exception as e:
             logger.error("子专家 [%s] 执行失败: %s", role, e)
             return f"子专家执行失败: {e}"
+
+    # ========== AOS: 调度任务绑定处理 ==========
+
+    async def _handle_scheduled_autonomous_task(self, payload: str) -> None:
+        """
+        处理关联到自治代理的定时任务回调。
+        1. 对于带 task_id 的复杂需求，走沙箱/单兵突击。
+        2. 对于普通自然语言 payload，走轻量会话处理。
+        """
+        try:
+            import json
+            data = json.loads(payload)
+            task_id = data.get("task_id")
+            instruction = data.get("instruction", payload)
+        except Exception:
+            # 如果解析失败，则当做没有任务ID的纯文字简单任务
+            task_id = None
+            instruction = payload
+            
+        logger.info("🤖 [Agent] 收到定时器唤醒，执行类型: %s, 指令: %s", "多步自治" if task_id else "简单交互", instruction[:50])
+        
+        if task_id:
+            # 带有 task_id 代表复杂任务
+            workspace_path = os.path.join(os.getcwd(), "Workspace", "Blitz", task_id)
+            os.makedirs(workspace_path, exist_ok=True)
+            
+            async def _run_bg():
+                try:
+                    tools_available = self._get_combined_tools(slim=False)
+                    report = await self.execute_with_tools(
+                        system_prompt="你是由定时器唤醒的物理执行者（Blitz 模式）。\n必须通过物理收敛审计，调用可用工具执行并利用写文件等方式保留执行状态。禁止输出无法留存记忆的废话。\n",
+                        user_demand=instruction,
+                        tier="PREMIUM",
+                        context_id=f"timer_{task_id}",
+                        workspace_path=workspace_path,
+                        max_iterations=8,
+                        tools=tools_available
+                    )
+                    logger.info("✅ 定时单兵任务完成。产出: %s", report[:200])
+                except Exception as ex:
+                    logger.error("❌ 定时单兵任务执行失败: %s", ex)
+            
+            # 放后台执行避免阻塞调度器心跳循环
+            asyncio.create_task(_run_bg())
+            
+        else:
+            # 简单任务
+            async def _run_simple_bg():
+                try:
+                    # 使用轻量本地模型生成或执行，这里强制用 PREMIUM 避免本地模型智商太低
+                    result = await self.unified_client.generate(
+                        tier="PREMIUM", 
+                        messages=[{"role": "user", "content": f"系统定时任务触发了。\n预设指令: {instruction}\n如果指令需要回答时间，请直接给出现在的时间。\n只需要返回自然语言文本，不需要调用工具。"}]
+                    )
+                    # 显式使用终端打印和彩色标识强调是定时器的自然响应
+                    print(f"\n🔔 [轻量定时任务触发] \n{result}\n")
+                    logger.info("✅ 定时简单回复完成。")
+                except Exception as ex:
+                    logger.error("❌ 定时简单任务执行失败: %s", ex)
+                    
+            asyncio.create_task(_run_simple_bg())
 
     # ========== AOS: 内部工具调度器 ==========
 
