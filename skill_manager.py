@@ -232,6 +232,23 @@ class SkillManager:
                     env_config[key] = val
 
             args = config.get("args", [])
+
+            # [AOS 8.1] 启动前预检：避免 firecrawl 缺少关键环境变量导致“Connection closed”迷惑报错
+            # firecrawl-mcp 要求至少提供 FIRECRAWL_API_KEY 或 FIRECRAWL_API_URL，否则进程会立即退出。
+            is_firecrawl = (
+                "firecrawl" in str(name).lower()
+                or any("firecrawl" in str(a).lower() for a in args)
+            )
+            if is_firecrawl:
+                firecrawl_api_key = str(env_config.get("FIRECRAWL_API_KEY", "")).strip()
+                firecrawl_api_url = str(env_config.get("FIRECRAWL_API_URL", "")).strip()
+                if not firecrawl_api_key and not firecrawl_api_url:
+                    msg = (
+                        "Firecrawl 启动前预检失败：缺少 FIRECRAWL_API_KEY 或 FIRECRAWL_API_URL。"
+                        "请在 .env 中配置至少一个变量，或在 skills_registry.yaml 的 env 字段中提供。"
+                    )
+                    logger.error("❌ [技能预检] %s", msg)
+                    return {"status": "error", "message": msg}
             
             # [AOS 3.8.6] 授权矩阵：始终允许项目根目录，如果指定了工作区则追加
             # 解决“访问被拒绝”问题：确保 Agent 在沙箱内工作的同时，仍有权读取项目本身的配置或代码。
@@ -885,6 +902,10 @@ class SkillManager:
         # 针对特定大厂技能的特殊映射
         if "firecrawl" in winner["name"].lower():
             skill_config["args"] = ["-y", "firecrawl-mcp"]
+            skill_config["env"] = {
+                "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}",
+                "FIRECRAWL_API_URL": "${FIRECRAWL_API_URL}",
+            }
         elif "sqlite" in winner["name"].lower():
              skill_config["args"] = ["-y", "@modelcontextprotocol/server-sqlite", "./data.db"]
 
