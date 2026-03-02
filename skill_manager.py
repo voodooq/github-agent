@@ -267,7 +267,9 @@ class SkillManager:
             print(f"✅ [技能管理器] 技能 '{name}' 已加载，提供 {len(tool_names)} 个工具: {tool_names}")
             return {"status": "loaded", "tools": tool_names}
 
-        except Exception as e:
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
             error_msg = str(e)
             if hasattr(e, "exceptions"):
                 sub_msgs = [str(sub) for sub in getattr(e, "exceptions")]

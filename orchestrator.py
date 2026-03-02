@@ -875,6 +875,12 @@ class Orchestrator:
         complex_indicators = ["翻译", "总结", "全网", "抓取所有", "并", "分析", "架构", "配置"]
         demand_lower = demand.lower()
         
+        # 1.1 插件开发特许通道 (L3_DEVELOPER)
+        dev_keywords = ["制作", "开发", "编写", "写一个", "做个"]
+        target_keywords = ["插件", "工具", "技能", "扩展", "mcp"]
+        if any(v in demand_lower for v in dev_keywords) and any(n in demand_lower for n in target_keywords):
+            return "L3_DEVELOPER"
+        
         # 明显带有复杂特征的长难句，直接判定为 L2 专家级
         if len(demand) > 30 and any(kw in demand_lower for kw in complex_indicators):
             return "L2_EXPERT"
@@ -911,6 +917,45 @@ class Orchestrator:
         # [AOS 6.0] 自动分诊：取代固定的关键词匹配
         intent = await self.classify_intent(user_demand)
         is_blitz_mode = (intent == "L1_BLITZ")
+        is_dev_mode = (intent == "L3_DEVELOPER")
+        
+        if is_dev_mode:
+            yield f"🚀 [AOS 8.0] 开发者引擎激活：识别为扩展开发任务 (L3)\n"
+            if self.agent:
+                self.workspace_path = self.agent._setup_action_workspace("dev")
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.workspace_path = os.path.join(os.getcwd(), "Workspace", "Dev", f"dev_{timestamp}")
+                os.makedirs(self.workspace_path, exist_ok=True)
+            if self.agent:
+                self.agent.workspace_path = self.workspace_path
+
+            yield f"💻 正在指派工具研发子专家进行全自动闭环开发...\n"
+            
+            # 使用 execute_with_tools 赋予核心开发与搜索能力
+            dev_tools = []
+            allowed = ["discover_and_install_skill", "auto_install_and_load", "write_file", "search_web", "read_url_content", "edit_file", "list_dir"]
+            for t in self.agent._get_combined_tools(slim=False):
+                if t["function"]["name"] in allowed:
+                    dev_tools.append(t)
+            
+            final_report = await self.agent.execute_with_tools(
+                system_prompt=(
+                    "你是一个资深的 MCP 插件研发工程师。\n"
+                    "用户的需求是开发或安装一款工具插件。你可以：\n"
+                    "1. 使用 auto_install_and_load / discover_and_install_skill 从互联网查找并安装相关的现成开源 MCP 服务。\n"
+                    "2. 或是自己编写 Python 或 Node.js 脚本并通过 write_file 落地在 Workspace 中，然后配置成标准的 MCP 规范并启动。\n"
+                    "完成后务必简述你做了什么，以及插件是否已经可用。"
+                ),
+                user_demand=user_demand,
+                tier="PREMIUM",
+                context_id=f"dev_{os.path.basename(self.workspace_path)}",
+                workspace_path=self.workspace_path,
+                max_iterations=10,
+                tools=dev_tools
+            )
+            yield f"\n🛠️ 【插件开发报告】\n{final_report}\n✅ [AOS] 插件开发管线执行完毕。\n"
+            return
         
         if is_blitz_mode:
             yield f"🚀 [AOS 6.0] 物理独裁：识别为 Blitz 线性任务 (L1)，强制锁定‘单兵突击’，拒绝会议。\n"
