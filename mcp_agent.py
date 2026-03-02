@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 import requests
 from typing import AsyncGenerator
 from openai import AsyncOpenAI
@@ -625,7 +626,15 @@ class UnifiedClient:
 
 
 import glob
-from config import TOKEN_BUDGET as TOKEN_BUDGET_LIMIT
+from config import (
+    TOKEN_BUDGET as TOKEN_BUDGET_LIMIT,
+    SELF_UPGRADE_ENABLED,
+    SELF_UPGRADE_RETRY_ORIGINAL_CALL,
+    EVOLUTION_AUDIT_LOG_PATH,
+    SELF_UPGRADE_SAFE_MODE,
+    SELF_UPGRADE_TRUSTED,
+    SELF_UPGRADE_DENYLIST,
+)
 from skill_manager import SkillManager
 from blackboard import Blackboard
 from orchestrator import Orchestrator
@@ -646,6 +655,7 @@ class McpAgent:
         local_config: dict,
         systemPrompt: str = "你是一个智能助手。",
         mode: str = "AUTO",
+        agent_id: str | None = None, # [AOS 7.0] 实例并发隔离ID
     ):
         # AOS 2.0: 黑板共享上下文
         self.blackboard = Blackboard()
@@ -663,8 +673,10 @@ class McpAgent:
         # 核心记忆字典：{ context_id: messages_list }
         self.mode = mode
         
-        # 记忆管理配置
-        self.memory_dir = "memories"
+        self.agent_id = agent_id or f"agent_{int(time.time())}_{id(self)}"
+        
+        # 记忆管理配置 (AOS 7.0 物理隔离)
+        self.memory_dir = os.path.join("memories", self.agent_id)
         os.makedirs(self.memory_dir, exist_ok=True)
         # 运行时缓存 (context_id -> messages)
         self.memories: dict[str, list[dict]] = {}
@@ -680,6 +692,15 @@ class McpAgent:
         self.workspace_path = None
         # [AOS 2.9] 初始化工具列表，防止 connect 前调用引发 AttributeError
         self.openaiTools = []
+        # 自升级/热加载控制
+        self.self_upgrade_enabled = SELF_UPGRADE_ENABLED
+        self.self_upgrade_retry_original_call = SELF_UPGRADE_RETRY_ORIGINAL_CALL
+        self.evolution_audit_log_path = EVOLUTION_AUDIT_LOG_PATH
+        self._upgrade_cooldown_map: dict[str, float] = {}
+        self._upgrade_cooldown_seconds = 20
+        self.self_upgrade_safe_mode = SELF_UPGRADE_SAFE_MODE
+        self.self_upgrade_trusted = SELF_UPGRADE_TRUSTED
+        self.self_upgrade_denylist = SELF_UPGRADE_DENYLIST
 
         
     async def prepare_for_retry(self, blackboard: Blackboard):
@@ -1175,8 +1196,17 @@ class McpAgent:
             
         elif func_name == "discover_and_install_skill" or func_name == "auto_install_and_load":
             query = arguments.get("query", "")
+            if not self.self_upgrade_enabled:
+                msg = {"status": "disabled", "message": "SELF_UPGRADE_ENABLED=false，已禁用自动进化"}
+                self._audit_evolution_event("manual_upgrade_blocked", {"query": query, "reason": "disabled"})
+                return json.dumps(msg, ensure_ascii=False)
             # [AOS 5.0] 升级为全自动闭环安装并加载
             result = await self.skill_manager.auto_install_and_load(query, self.session, self.workspace_path)
+            self._audit_evolution_event("manual_upgrade", {
+                "query": query,
+                "status": result.get("status", "unknown"),
+                "skill_name": result.get("skill_name", ""),
+            })
             return json.dumps(result, ensure_ascii=False)
 
         elif func_name == "run_checkup":
@@ -1236,6 +1266,247 @@ class McpAgent:
                 return err_msg
 
         return None
+
+    def _audit_evolution_event(self, event: str, data: dict | None = None) -> None:
+        """
+        记录自升级/热加载审计事件到本地日志，并在黑板保留最近摘要。
+        """
+        payload = {
+            "ts": datetime.now().isoformat(),
+            "event": event,
+            "data": data or {},
+        }
+        try:
+            log_path = os.path.abspath(self.evolution_audit_log_path)
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning("进化审计写入失败: %s", e)
+
+        try:
+            summary = f"{payload['ts']} | {event} | {json.dumps(payload['data'], ensure_ascii=False)[:600]}"
+            self.blackboard.write("last_evolution_event", summary, author="EvolutionAudit")
+        except Exception:
+            pass
+
+    def _check_evolution_policy(self, query: str) -> tuple[bool, str]:
+        """
+        [AOS 7.0] Evolution Policy Gate
+        安全策略门控，检查目标查询是否在信任名册或触碰黑名单。
+        """
+        q = query.lower()
+        if any(bad in q for bad in self.self_upgrade_denylist):
+            return False, "hit_denylist"
+        
+        if self.self_upgrade_safe_mode:
+            if not self.self_upgrade_trusted:
+                logger.warning("⚠️ 安全模式开启且白名单为空，默认放行所有查询（不建议）。")
+                return True, "pass_empty_trusted"
+            if not any(good in q for good in self.self_upgrade_trusted):
+                return False, "not_in_trusted_list"
+                
+        return True, "pass"
+
+    def _derive_upgrade_query(self, func_name: str, arguments: dict) -> str:
+        """
+        从失败工具名和参数推导技能搜索 query。
+        """
+        normalized = self._normalize_tool_name(func_name)
+        normalized = re.sub(r'^(filesystem|github|browser|sqlite|mcp)[_.]', '', normalized)
+        base = normalized.replace("_", " ").replace(".", " ").strip() or "mcp tool"
+
+        hints = []
+        for k in ["query", "task", "description", "url", "path", "name", "repo", "owner"]:
+            v = arguments.get(k)
+            if isinstance(v, str) and v.strip():
+                hints.append(v.strip()[:80])
+            if len(hints) >= 1:
+                break
+
+        return f"{base} {hints[0]}".strip() if hints else base
+
+    async def _attempt_self_upgrade_for_tool(
+        self,
+        func_name: str,
+        arguments: dict,
+        error_text: str,
+        workspace_override: str | None = None,
+    ) -> dict:
+        """
+        在出现能力缺口时尝试自动进化（发现/安装/热加载）。
+        """
+        if not self.self_upgrade_enabled:
+            return {"upgraded": False, "reason": "disabled"}
+
+        lowered = (error_text or "").lower()
+        gap_markers = [
+            "unknown tool",
+            "not available",
+            "not loaded",
+            "未在注册表中找到",
+            "技能 '",
+            "未找到",
+        ]
+        if not any(m in lowered for m in gap_markers):
+            return {"upgraded": False, "reason": "not_capability_gap"}
+
+        normalized = self._normalize_tool_name(func_name)
+        now_ts = time.time()
+        last_ts = self._upgrade_cooldown_map.get(normalized, 0.0)
+        if now_ts - last_ts < self._upgrade_cooldown_seconds:
+            return {"upgraded": False, "reason": "cooldown"}
+        self._upgrade_cooldown_map[normalized] = now_ts
+
+        if not hasattr(self, "session") or self.session is None:
+            return {"upgraded": False, "reason": "no_session"}
+
+        query = self._derive_upgrade_query(func_name, arguments)
+        
+        # [AOS 7.0] 策略门控与审计
+        policy_pass, policy_reason = self._check_evolution_policy(query)
+        if not policy_pass:
+            logger.warning("🚫 [Policy Gate] 自动进化被策略拦截: Query='%s', Reason=%s", query, policy_reason)
+            self._audit_evolution_event("policy_blocked", {
+                "tool": func_name,
+                "query": query,
+                "reason": policy_reason
+            })
+            return {"upgraded": False, "reason": policy_reason}
+
+        self._audit_evolution_event("self_upgrade_attempt", {
+            "tool": func_name,
+            "query": query,
+            "error": error_text[:300],
+        })
+
+        result = await self.skill_manager.auto_install_and_load(
+            query=query,
+            session=self.session,
+            workspace_path=workspace_override if workspace_override else self.workspace_path,
+        )
+        status = result.get("status", "unknown")
+        success = status in {"evolution_success", "loaded", "already_loaded", "installed"}
+
+        if success:
+            try:
+                self.openaiTools = self._get_combined_tools(slim=False)
+            except Exception:
+                pass
+
+        self._audit_evolution_event("self_upgrade_result", {
+            "tool": func_name,
+            "query": query,
+            "status": status,
+            "skill_name": result.get("skill_name", ""),
+            "success": success,
+        })
+
+        return {
+            "upgraded": success,
+            "query": query,
+            "result": result,
+        }
+
+    async def _retry_tool_call_after_upgrade(
+        self,
+        func_name: str,
+        arguments: dict,
+        workspace_override: str | None = None,
+    ) -> str | None:
+        """
+        热加载成功后，对原始调用执行一次重试。
+        """
+        actual_func = self._normalize_tool_name(func_name)
+        self._anchor_tool_paths(actual_func, arguments, workspace_override=workspace_override)
+
+        result_text = await self._handle_internal_tool(actual_func, arguments)
+        if result_text is None:
+            result_text = await self.skill_manager.call_tool(actual_func, arguments)
+        if result_text is None and hasattr(self, "session") and self.session is not None:
+            result = await self.session.call_tool(func_name, arguments=arguments)
+            if result and hasattr(result, "content") and result.content:
+                texts = []
+                for item in result.content:
+                    if hasattr(item, "text"):
+                        texts.append(item.text)
+                    elif isinstance(item, dict) and "text" in item:
+                        texts.append(item["text"])
+                    else:
+                        texts.append(str(item))
+                result_text = "\n".join(texts)
+        return result_text
+
+    async def _execute_single_tool(
+        self,
+        func_name: str,
+        arguments_json: str,
+        workspace_override: str | None = None
+    ) -> str:
+        """
+        [AOS 7.0] 抽取出的核心单点工具执行入口，统一错误接驳、热加载重试与路径锚定。
+        """
+        try:
+            actual_func = self._normalize_tool_name(func_name)
+            parsed_args = json.loads(arguments_json) if arguments_json else {}
+            resultText = None
+
+            self._anchor_tool_paths(actual_func, parsed_args, workspace_override=workspace_override)
+            
+            read_tools = ["read_file", "read_text_file", "filesystem_read_file", "get_file_contents"]
+            if actual_func in read_tools or any(kw in actual_func for kw in ["read", "content", "file"]):
+                path = parsed_args.get("path")
+                if path and os.path.exists(path) and os.path.isfile(path):
+                    f_size = os.path.getsize(path)
+                    if f_size > 30 * 1024:
+                        offset = parsed_args.get("offset", 0)
+                        logger.warning("🛑 [AOS 7.5] 觸發大文件分片讀取: %s (size: %d, offset: %d)", path, f_size, offset)
+                        resultText = self._read_file_chunked(path, f_size, offset)
+
+            if resultText is None:
+                resultText = await self._handle_internal_tool(actual_func, parsed_args)
+            if resultText is None:
+                resultText = await self.skill_manager.call_tool(actual_func, parsed_args)
+            if resultText is None:
+                result = await self.session.call_tool(func_name, arguments=parsed_args)
+                if result and hasattr(result, "content") and result.content:
+                    texts = []
+                    for item in result.content:
+                        if hasattr(item, "text"):
+                            texts.append(item.text)
+                        elif isinstance(item, dict) and "text" in item:
+                            texts.append(item["text"])
+                        else:
+                            texts.append(str(item))
+                    resultText = "\n".join(texts)
+                else:
+                    resultText = "Error: Tool returned no data (None)"
+            return resultText
+        except Exception as e:
+            error_msg = str(e)
+            logger.error("工具调用失败: %s - %s", func_name, error_msg)
+            retry_result = None
+            try:
+                upgrade_info = await self._attempt_self_upgrade_for_tool(
+                    func_name=func_name,
+                    arguments=json.loads(arguments_json) if arguments_json else {},
+                    error_text=error_msg,
+                    workspace_override=workspace_override,
+                )
+                if upgrade_info.get("upgraded") and self.self_upgrade_retry_original_call:
+                    retry_result = await self._retry_tool_call_after_upgrade(
+                        func_name=func_name,
+                        arguments=json.loads(arguments_json) if arguments_json else {},
+                        workspace_override=workspace_override,
+                    )
+            except Exception as up_e:
+                logger.warning("自动进化尝试失败(_execute_single_tool): %s", up_e)
+
+            if retry_result is not None:
+                logger.info("✅ [自升级重试] 回路重试成功: %s", func_name)
+                return retry_result
+            else:
+                return f"工具执行错误: {error_msg}"
 
     def _normalize_tool_name(self, func_name: str) -> str:
         """
@@ -1545,6 +1816,7 @@ class McpAgent:
             for tc in assistantMsg["tool_calls"]:
                 funcName = tc["function"]["name"]
                 arguments = tc["function"]["arguments"]  # 已经是字符串
+                parsed_args: dict = {}
 
                 # 死循环检测：如果是侦察类请求，给予更大宽容度
                 call_sig = f"{funcName}:{arguments}"
@@ -1560,45 +1832,11 @@ class McpAgent:
                 logger.info("调用工具: %s(%s)", funcName, arguments[:200])
 
                 try:
-                    parsed_args = json.loads(arguments)
-                    # [AOS 3.6] 绝对路径锚定拦截器
-                    self._anchor_tool_paths(funcName, parsed_args)
-
-                    # AOS 3.5.1: 幻觉前缀自动剥离纠偏
-                    actual_func = self._normalize_tool_name(funcName)
-                    if False:
-                        pass
-                    prefixes = ["filesystem_", "github_", "browser_", "sqlite_", "mcp_"]
-                    for p in prefixes:
-                        if funcName.startswith(p):
-                            stripped = funcName[len(p):]
-                            # 验证剥离后是否有效
-                            if self.skill_manager.is_tool_available(stripped):
-                                logger.info("🧪 [AOS 3.5.1] 检测到工具名幻觉: %s -> %s (已纠偏)", funcName, stripped)
-                                actual_func = stripped
-                                break
-
-                    # AOS: 优先尝试内部工具（技能、子专家、黑板）
-                    internal_result = await self._handle_internal_tool(actual_func, parsed_args)
-                    if internal_result is not None:
-                        resultText = internal_result
-                    else:
-                        # AOS 2.0: 尝试从动态加载的技能中调用
-                        skill_result = await self.skill_manager.call_tool(actual_func, parsed_args)
-                        if skill_result is not None:
-                            resultText = skill_result
-                        else:
-                            # 最终回退：主 MCP 会话
-                            result = await self.session.call_tool(funcName, arguments=parsed_args)
-                            texts = []
-                            for item in result.content:
-                                if hasattr(item, "text"):
-                                    texts.append(item.text)
-                                elif isinstance(item, dict) and "text" in item:
-                                    texts.append(item["text"])
-                                else:
-                                    texts.append(str(item))
-                            resultText = "\n".join(texts)
+                    resultText = await self._execute_single_tool(
+                        func_name=funcName,
+                        arguments_json=arguments,
+                        workspace_override=None
+                    )
 
                     # 对工具输出进行长度保护
                     MAX_TOOL_OUTPUT = 30000
@@ -1609,8 +1847,8 @@ class McpAgent:
                     self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
 
                 except Exception as e:
-                    logger.error("工具调用失败: %s - %s", funcName, e)
-                    resultText = f"工具调用失败: {e}"
+                    logger.error("外层工具调用失败: %s - %s", funcName, e)
+                    resultText = f"外层工具调用失败: {e}"
 
                 current_tool_messages.append(
                     {
@@ -2125,6 +2363,7 @@ class McpAgent:
             for tc in assistantMsg["tool_calls"]:
                 funcName = tc["function"]["name"]
                 arguments = tc["function"]["arguments"]
+                parsed_args: dict = {}
                 
                 # 死循环防护
                 call_sig = f"{funcName}:{arguments}"
@@ -2140,39 +2379,11 @@ class McpAgent:
                 logger.info("[%s] 正在执行子任务工具: %s", context_id, funcName)
                 
                 try:
-                    # [AOS 3.8] 工具名纠偏归一化
-                    actual_func = self._normalize_tool_name(funcName)
-
-                    parsed_args = json.loads(arguments)
-                    resultText = None # Initialize as None to allow fallback checks
-                    # [AOS 3.6] 絕對路徑錨定攔截器：使用本輪局部工作區
-                    self._anchor_tool_paths(actual_func, parsed_args, workspace_override=effective_workspace)
-                    
-                    # [AOS 7.5] 大文件手柄協議：攔截讀取操作
-                    read_tools = ["read_file", "read_text_file", "filesystem_read_file", "get_file_contents"]
-                    if actual_func in read_tools or any(kw in actual_func for kw in ["read", "content", "file"]):
-                        path = parsed_args.get("path")
-                        if path and os.path.exists(path) and os.path.isfile(path):
-                            f_size = os.path.getsize(path)
-                            if f_size > 30 * 1024: # 30KB 閾值
-                                offset = parsed_args.get("offset", 0)
-                                logger.warning("🛑 [AOS 7.5] 觸發大文件分片讀取: %s (size: %d, offset: %d)", path, f_size, offset)
-                                resultText = self._read_file_chunked(path, f_size, offset)
-                    
-                    # 按照优先级处理工具：内部 -> 技能 -> MCP
-                    if resultText is None:
-                        resultText = await self._handle_internal_tool(actual_func, parsed_args)
-                    if resultText is None:
-                        resultText = await self.skill_manager.call_tool(actual_func, parsed_args)
-                    if resultText is None:
-                        result = await self.session.call_tool(funcName, arguments=parsed_args)
-                        if result and hasattr(result, "content") and result.content:
-                            resultText = "\n".join([
-                                (item.text if hasattr(item, "text") else str(item))
-                                for item in result.content
-                            ])
-                        else:
-                            resultText = "Error: Tool returned no data (None)"
+                    resultText = await self._execute_single_tool(
+                        func_name=funcName,
+                        arguments_json=arguments,
+                        workspace_override=effective_workspace
+                    )
                     
                     # [AOS 5.2] Physical Convergence Lock (收敛强关补丁)
                     # 如果工具反馈暗示任务已完成或环境已处于目标状态，立即关断循环返回结果，拒绝 Round 2
@@ -2182,7 +2393,7 @@ class McpAgent:
                     # 针对调度器工具的成功信号，实现“活干完立即关断”
                     instant_kill_signals = ["⏰ [调度器]", "💥 [调度器]"]
                     
-                    if any(sig in resultText for sig in instant_kill_signals):
+                    if any(sig in str(resultText) for sig in instant_kill_signals):
                         logger.info("⚡ [AOS 5.3] INSTANT_KILL: 调度器操作成功，强制物理断电。")
                         self.memories[context_id].append({"role": "tool", "tool_call_id": tc["id"], "content": resultText})
                         return f"INSTANT_KILL_PASS: {resultText}"
@@ -2196,12 +2407,12 @@ class McpAgent:
                     # [AOS 4.9] 协议加固 (JSON Pipe Fix)
                     # 针对大尺寸结果（如 JS 源码）进行极致截断预览，防止撑破 OpenAI/MCP JSON 管道
                     # 刺客的任务是“拿回证据”，不是“在对话里展示源码”
-                    if len(resultText) > 1000:
-                        preview = resultText[:500] + "\n\n...(中间数据已物理截断以保护管道)...\n\n" + resultText[-500:]
+                    if len(str(resultText)) > 1000:
+                        preview = str(resultText)[:500] + "\n\n...(中间数据已物理截断以保护管道)...\n\n" + str(resultText)[-500:]
                         resultText = f"【物理数据快照 (已截断)】\n{preview}\n\n⚠️ 提示：完整内容已存入物理文件，严禁要求在对话中输出完整源码！"
                     
                     # [AOS 4.8] 识别工具执行结果，更新成功/失败计数器
-                    if "Error:" in resultText or "错误:" in resultText or "failed" in resultText.lower():
+                    if "Error:" in str(resultText) or "错误:" in str(resultText) or "failed" in str(resultText).lower():
                         failure_count += 1
                     else:
                         success_count += 1
@@ -2224,11 +2435,11 @@ class McpAgent:
                              self.has_logical_delta = True
                              logger.info("🧠 [AOS 7.5.8] 侦测到逻辑位移（拿到了新信息）: %s", funcName)
 
-                    self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
+                    self.token_budget.consume(self.token_budget.estimate_tokens(str(resultText)))
                     
                 except Exception as e:
                     error_msg = str(e)
-                    logger.error("子任务工具调用失败: %s - %s", funcName, error_msg)
+                    logger.error("子任务工具外层调用失败: %s - %s", funcName, error_msg)
                     resultText = f"工具执行错误: {error_msg}"
                     
                     # [AOS 2.9] 同错熔断检测：如果连续两次报完全相同的错，直接断电
@@ -2385,8 +2596,8 @@ class McpAgent:
         try:
             resultText = await self.unified_client.generate(
                 tier=config["tier"],
-                system_prompt=config["prompt"], # 注意这里统一由 UnifiedClient 处理 System Prompt
-                user_content=f"请评价这个项目：\n{projectData}", # 简化处理，暂时不让专家在 messages 中累积无限代码
+                messages=config["prompt"], # UnifiedClient expects `messages` for system prompt string
+                user_content=f"请评价这个项目：\n{projectData}",
                 response_format={"type": "json_object"}
             )
             # 3. 如果需要专家学习，可以在这里 append resultText 到 messages

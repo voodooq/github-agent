@@ -8,6 +8,13 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return str(val).strip().lower() in {"1", "true", "yes", "on", "y"}
+
 # 模型配置体系
 # 1. 线上模型 (Cloud)
 CLOUD_API_KEY = os.getenv("CLOUD_LLM_API_KEY", os.getenv("LLM_API_KEY", ""))
@@ -40,3 +47,13 @@ MEMORY_FILE = os.getenv("MEMORY_FILE", "memory.json")
 
 # AOS: Token 预算上限（单次任务最大 Token 消耗，超过则挂起等待用户确认）
 TOKEN_BUDGET = int(os.getenv("TOKEN_BUDGET", "50000"))
+
+# AOS: 能力缺失 -> 自升级 -> 热加载策略
+SELF_UPGRADE_ENABLED = _env_bool("SELF_UPGRADE_ENABLED", True)
+SELF_UPGRADE_SAFE_MODE = _env_bool("SELF_UPGRADE_SAFE_MODE", True)
+SELF_UPGRADE_MIN_STARS = int(os.getenv("SELF_UPGRADE_MIN_STARS", "20"))
+SELF_UPGRADE_MAX_AGE_DAYS = int(os.getenv("SELF_UPGRADE_MAX_AGE_DAYS", "540"))
+SELF_UPGRADE_TRUSTED = [x.strip() for x in os.getenv("SELF_UPGRADE_TRUSTED", "").split(",") if x.strip()]
+SELF_UPGRADE_DENYLIST = [x.strip() for x in os.getenv("SELF_UPGRADE_DENYLIST", "").split(",") if x.strip()]
+SELF_UPGRADE_RETRY_ORIGINAL_CALL = _env_bool("SELF_UPGRADE_RETRY_ORIGINAL_CALL", True)
+EVOLUTION_AUDIT_LOG_PATH = os.getenv("EVOLUTION_AUDIT_LOG_PATH", "memories/evolution_audit.log")

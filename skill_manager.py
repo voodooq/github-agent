@@ -10,10 +10,17 @@ import os
 import yaml
 import shutil
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from tool_converter import convertMcpToolsToOpenai
+from config import (
+    SELF_UPGRADE_SAFE_MODE,
+    SELF_UPGRADE_MIN_STARS,
+    SELF_UPGRADE_MAX_AGE_DAYS,
+    SELF_UPGRADE_TRUSTED,
+    SELF_UPGRADE_DENYLIST,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +53,13 @@ class SkillManager:
         self.unified_client = unified_client
         self.agent_ref = agent_ref
         self._load_registry()
+
+        # 自升级安全策略
+        self.self_upgrade_safe_mode = SELF_UPGRADE_SAFE_MODE
+        self.self_upgrade_min_stars = max(0, SELF_UPGRADE_MIN_STARS)
+        self.self_upgrade_max_age_days = max(1, SELF_UPGRADE_MAX_AGE_DAYS)
+        self.self_upgrade_trusted = [x.lower() for x in SELF_UPGRADE_TRUSTED]
+        self.self_upgrade_denylist = [x.lower() for x in SELF_UPGRADE_DENYLIST]
         
         # AOS 3.3: 启动时自动初始化/更新基因库
         self._bootstrap_genes()
@@ -94,6 +108,48 @@ class SkillManager:
             if skill["name"] == name:
                 return skill
         return None
+
+    def _is_candidate_allowed(self, candidate: dict) -> tuple[bool, str]:
+        """
+        自升级候选技能安全审核。
+        """
+        name = str(candidate.get("name", "")).strip()
+        repo = str(candidate.get("repo", "")).strip()
+        stars = int(candidate.get("stars", 0) or 0)
+        updated = str(candidate.get("updated", "")).strip()
+        scope = f"{name} {repo}".lower()
+
+        # denylist 永远优先
+        for banned in self.self_upgrade_denylist:
+            if banned and banned in scope:
+                return False, f"命中 denylist: {banned}"
+
+        # 关闭安全模式时只执行 denylist 约束
+        if not self.self_upgrade_safe_mode:
+            return True, "safe_mode=off"
+
+        if stars < self.self_upgrade_min_stars:
+            return False, f"社区信号不足(stars={stars} < {self.self_upgrade_min_stars})"
+
+        # 更新时间约束（防止安装陈旧无人维护技能）
+        if not updated:
+            return False, "缺少更新时间"
+        try:
+            dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).days
+            if age_days > self.self_upgrade_max_age_days:
+                return False, f"更新过旧({age_days} 天 > {self.self_upgrade_max_age_days} 天)"
+        except Exception:
+            return False, f"更新时间不可解析: {updated}"
+
+        # 可选信任来源限制（为空则不限制）
+        if self.self_upgrade_trusted:
+            if not any(t in scope for t in self.self_upgrade_trusted):
+                return False, f"不在 trusted 范围: {self.self_upgrade_trusted}"
+
+        return True, "通过策略审核"
 
     async def _skill_runner(self, name: str, server_params: StdioServerParameters, session_future: asyncio.Future, stop_event: asyncio.Event):
         """
@@ -786,7 +842,23 @@ class SkillManager:
 
         # 评分排名
         ranked = self.score_candidates(candidates)
-        winner = ranked[0]
+        winner = None
+        rejected = []
+        for c in ranked:
+            ok, reason = self._is_candidate_allowed(c)
+            if ok:
+                winner = c
+                break
+            rejected.append(f"{c.get('name', '?')}: {reason}")
+
+        if not winner:
+            reason = "；".join(rejected[:5]) if rejected else "策略拒绝"
+            logger.warning("🚫 [技能安装策略] 已拒绝 query='%s' 的候选技能: %s", query, reason)
+            return {
+                "status": "blocked_by_policy",
+                "message": f"候选技能未通过安全策略审核: {reason}",
+                "query": query,
+            }
         
         # AOS 3.3.1: 基因富集 (Metadata Enrichment)
         description = winner.get("description", "")
@@ -829,7 +901,7 @@ class SkillManager:
 
     async def auto_install_and_load(self, query: str, session=None, workspace_path: str | None = None) -> dict:
         """
-        [AOS 5.0] 完全自治安装闭环：发现 -> 安装 -> 注册 -> 热加载。
+        [AOS 5.0 / 7.0] 完全自治安装闭环：发现 -> 安装 -> 注册 -> 隔离验证 -> 热加载。
         """
         logger.info(f"🛰️ [AOS 5.0] 启动军火采购闭环: {query}")
         
@@ -838,15 +910,49 @@ class SkillManager:
         
         if install_result.get("status") == "installed":
             skill_name = install_result["skill_name"]
-            # 2. 物理热插拔：加载并同步工具
-            load_result = await self.hot_load_skill(skill_name, workspace_path=workspace_path)
             
-            return {
-                "status": "evolution_success",
-                "skill_name": skill_name,
-                "tools": load_result.get("tools", []),
-                "message": f"🏆 进化成功！新技能 '{skill_name}' 已就绪并同步至视网膜。"
-            }
+            # [AOS 7.0] 隔离与验收 (Quarantine Install & Smoke Test)
+            try:
+                temp_quarantine_workspace = os.path.join(workspace_path or ".", ".quarantine_test")
+                os.makedirs(temp_quarantine_workspace, exist_ok=True)
+                
+                logger.info("🧪 [Quarantine] 对新技能 '%s' 执行隔离冒烟测试...", skill_name)
+                load_result = await self.hot_load_skill(skill_name, workspace_path=temp_quarantine_workspace)
+                
+                if load_result.get("status") not in ("loaded", "already_loaded"):
+                    raise RuntimeError(f"热插拔失败: {load_result.get('message', '未知错误')}")
+                
+                tools = load_result.get("tools", [])
+                if not tools:
+                    raise RuntimeError("技能启动成功但未暴露任何有效工具接口。")
+                    
+                logger.info("✅ [Quarantine] 技能验收通过。提供工具数: %d", len(tools))
+                
+                # 若需要对齐至真实的物理工作区，再加载一次
+                if workspace_path and workspace_path != temp_quarantine_workspace:
+                    await self.hot_load_skill(skill_name, workspace_path=workspace_path)
+                
+                return {
+                    "status": "evolution_success",
+                    "skill_name": skill_name,
+                    "tools": tools,
+                    "message": f"🏆 进化成功！新技能 '{skill_name}' (验收通过) 已就绪并同步至视网膜。"
+                }
+                
+            except Exception as e:
+                logger.error("🛑 [Quarantine] 新技能验收失败，正在执行熔断卸载并回滚注册表: %s", str(e))
+                await self.unload_skill(skill_name)
+                self.registry = [s for s in self.registry if s["name"] != skill_name]
+                try:
+                    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+                        yaml.dump({"skills": self.registry}, f, allow_unicode=True, default_flow_style=False)
+                except Exception:
+                    pass
+                return {
+                    "status": "quarantine_failed",
+                    "skill_name": skill_name,
+                    "message": f"自动安装的技能未通过隔离验收测试: {str(e)}。已物理熔断丢弃。"
+                }
         
         return install_result
 
