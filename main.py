@@ -272,7 +272,17 @@ async def main():
             print(f"🧹 专家记忆 [{ctx_id}] 已清除\n")
             continue
         elif userInput == "/tools":
-            print(f"🔧 可用工具: {', '.join(toolNames)}\n")
+            # [AOS P3 Hardening] 冷环境下也能安全查看工具，不依赖 hot_mcp_env 局部变量
+            combined_tools = agent._get_combined_tools(slim=False) or []
+            tool_names = sorted({
+                t.get("function", {}).get("name", "")
+                for t in combined_tools
+                if isinstance(t, dict) and t.get("function", {}).get("name")
+            })
+            if tool_names:
+                print(f"🔧 可用工具 ({len(tool_names)}): {', '.join(tool_names)}\n")
+            else:
+                print("⚠️ 当前处于冷环境，尚未加载 MCP 工具。请先执行 /search、/analyze、/review、/deploy、/auto 或 /checkup 触发热启动。\n")
             continue
         elif userInput == "/help":
             printHelp()

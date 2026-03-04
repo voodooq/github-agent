@@ -1200,11 +1200,17 @@ class McpAgent:
             from runtime_engine import RuntimeEngine
             if getattr(self, 'runtime_engine', None) is None:
                 self.runtime_engine = RuntimeEngine(docker_client=self.docker_sandbox.client)
-                
+
+            # [AOS P2 Hardening] 防御性校验：运行时部署必须绑定有效工作区
+            if not self.workspace_path:
+                return "❌ 物理部署失败: 当前未激活工作区，请先通过 /deploy 或 /auto 进入执行态后再调用 runtime_deploy。"
+            if not os.path.exists(self.workspace_path):
+                os.makedirs(self.workspace_path, exist_ok=True)
+
             tech = arguments.get("tech_stack", "python")
             entry = arguments.get("entry_point", "app.py")
             df_content = self.runtime_engine.generate_dockerfile(tech, entry)
-            
+
             logger.info("🚀 [RuntimeEngine] 触发自动部署, 技术栈: %s, 入口: %s", tech, entry)
             res = await self.runtime_engine.deploy_workspace(self.workspace_path, df_content)
             if res.get("status") == "success":
