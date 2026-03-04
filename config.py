@@ -4,6 +4,7 @@
 """
 
 import os
+import shutil
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -14,6 +15,34 @@ def _env_bool(key: str, default: bool = False) -> bool:
     if val is None:
         return default
     return str(val).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def resolve_executable_command(command: str) -> str:
+    """
+    解析可执行命令的绝对路径（尤其是 Windows 下的 npx.cmd）。
+    找不到时回退原始命令名，保持兼容性。
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return command
+
+    lowered = cmd.lower()
+    if os.name == "nt" and lowered == "npx":
+        return shutil.which("npx.cmd") or shutil.which("npx") or cmd
+    return shutil.which(cmd) or cmd
+
+
+def build_subprocess_env(overlays: dict[str, str] | None = None) -> dict[str, str]:
+    """
+    为子进程构建环境变量：继承宿主环境并叠加覆盖项。
+    """
+    env = os.environ.copy()
+    if overlays:
+        for k, v in overlays.items():
+            if v is None:
+                continue
+            env[str(k)] = str(v)
+    return env
 
 # 模型配置体系
 # 1. 线上模型 (Cloud)
@@ -41,6 +70,9 @@ if _mcp_env_raw:
         if "=" in pair:
             k, v = pair.split("=", 1)
             MCP_ENV[k.strip()] = v.strip()
+
+# 统一解析后的 MCP 主命令（主入口/技能加载可共享）
+MCP_RESOLVED_COMMAND = resolve_executable_command(MCP_COMMAND)
 
 # 记忆持久化
 MEMORY_FILE = os.getenv("MEMORY_FILE", "memory.json")

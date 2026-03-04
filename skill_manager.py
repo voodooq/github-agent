@@ -20,6 +20,8 @@ from config import (
     SELF_UPGRADE_MAX_AGE_DAYS,
     SELF_UPGRADE_TRUSTED,
     SELF_UPGRADE_DENYLIST,
+    resolve_executable_command,
+    build_subprocess_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -216,7 +218,7 @@ class SkillManager:
             # [AOS 7.5.4] NPM 兼容性加固：強制使用官方 Registry 以免鏡像同步延遲導致包找不到
             # [Fix AOS 7.5.6] 環境變量加固：必須繼承原始環境變量（特別是 PATH 和 SystemRoot），否则 npx 会失败
             import os
-            env_config = os.environ.copy()
+            env_config = build_subprocess_env()
             env_config.update({
                 "NPM_CONFIG_REGISTRY": "https://registry.npmjs.org",
                 "NPM_CONFIG_AUDIT": "false",
@@ -269,12 +271,9 @@ class SkillManager:
                 new_args.extend(allowed_roots)
                 args = new_args
 
-            # [AOS 7.5.2] Windows 兼容性補丁：優先使用 .cmd 版本且透過 shutil.which 尋找絕對路徑
+            # [AOS 7.5.2+] 统一命令纠偏：与 main.py 共用解析逻辑
             cmd_name = config["command"]
-            if os.name == "nt" and cmd_name == "npx":
-                resolved_cmd = shutil.which("npx.cmd") or shutil.which("npx")
-            else:
-                resolved_cmd = shutil.which(cmd_name) or cmd_name
+            resolved_cmd = resolve_executable_command(cmd_name)
             
             if not resolved_cmd:
                 logger.warning("⚠️ [AOS 7.5.2] 未能找到可執行文件: %s，尝试使用原始名稱。", cmd_name)

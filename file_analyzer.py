@@ -7,28 +7,44 @@ def extract_sports_data(file_path, month="2026-03"):
     Streaming extraction of sports data to handle large files.
     """
     results = []
-    # Pattern to match the data structure in sportList.js
-    # Assuming it contains objects with match date, name, and location
-    
-    # Example pattern for JSON-like content in JS
-    date_pattern = re.compile(rf'"{month}-\d{{2}}".*?"eventName":"(.*?)".*?"location":"(.*?)"', re.DOTALL)
-    
     print(f"🔍 Analyzing {file_path} for matches in {month}...")
     
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            # For 592K file, we can read chunks if it's not structured JSON
-            content = f.read()
-            
-            # If it's a JS object assignments, we might need to clean it to get JSON
-            # But let's try direct Regex first which is faster for "extraction"
-            matches = re.finditer(r'\{[^{}]*?"matchDate"\s*:\s*"' + month + r'-\d{2}"[^{}]*?\}', content)
-            
+            buffer = ""
+            # Chunk by chunk processing or line by line
+            # For JSON-like structure, let's accumulate enough context
+            for line in f:
+                buffer += line
+                
+                # Check for our target string matches
+                matches = list(re.finditer(r'\{[^{}]*?"matchDate"\s*:\s*"' + month + r'-\d{2}"[^{}]*?\}', buffer))
+                
+                if matches:
+                    for match in matches:
+                        try:
+                            obj_str = match.group(0)
+                            # Convert JS-like object to JSON safely (basic fix for keys)
+                            json_str = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', obj_str)
+                            data = json.loads(json_str)
+                            results.append({
+                                "date": data.get("matchDate", ""),
+                                "event": data.get("eventName", ""),
+                                "location": data.get("location", "")
+                            })
+                        except Exception:
+                            continue
+                    
+                    # Keep tail of buffer to avoid breaking objects across chunks
+                    if len(buffer) > 2000:
+                        buffer = buffer[-800:]
+                    
+            # Process remaining buffer just in case
+            matches = list(re.finditer(r'\{[^{}]*?"matchDate"\s*:\s*"' + month + r'-\d{2}"[^{}]*?\}', buffer))
             for match in matches:
                 try:
                     obj_str = match.group(0)
-                    # Convert JS-like object to JSON safely (basic fix for keys)
-                    json_str = re.sub(r'(\w+)\s*:', r'"\1":', obj_str)
+                    json_str = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', obj_str)
                     data = json.loads(json_str)
                     results.append({
                         "date": data.get("matchDate", ""),

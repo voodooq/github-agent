@@ -19,8 +19,10 @@ from config import (
     LOCAL_BASE_URL,
     LOCAL_MODEL,
     MCP_COMMAND,
+    MCP_RESOLVED_COMMAND,
     MCP_ARGS,
     MCP_ENV,
+    build_subprocess_env,
     MEMORY_FILE,
     AGENT_MODE,
     TOKEN_BUDGET,
@@ -159,9 +161,9 @@ async def main():
     # 加载主对话记忆
     agent.loadMemory("main")
 
-    # 构建 MCP 服务端参数，合并环境变量
-    env = {**os.environ, **MCP_ENV} if MCP_ENV else None
-    serverParams = StdioServerParameters(command=MCP_COMMAND, args=MCP_ARGS, env=env)
+    # 构建 MCP 服务端参数（绝对路径纠偏 + 显式环境继承）
+    env = build_subprocess_env(MCP_ENV)
+    serverParams = StdioServerParameters(command=MCP_RESOLVED_COMMAND, args=MCP_ARGS, env=env)
 
     print(f"\n🚀 OpenClaw Hybrid Agent [AOS 7.0] 已启动 [模式: {AGENT_MODE}]")
     print(f"🛡️  隔离协议: 已激活 (非 /auto 输入将锁定工具权限)")
@@ -169,7 +171,9 @@ async def main():
     local_display = LOCAL_MODEL if agent.unified_client.local_available else "[已禁用 (未配置)]"
     print(f"☁️  线上模型: {cloud_display}")
     print(f"🏠 本地模型: {local_display}")
-    print(f"📡 MCP 服务: {MCP_COMMAND} {' '.join(MCP_ARGS)}")
+    print(f"📡 MCP 服务: {MCP_RESOLVED_COMMAND} {' '.join(MCP_ARGS)}")
+    if MCP_RESOLVED_COMMAND != MCP_COMMAND:
+        print(f"🧭 命令纠偏: {MCP_COMMAND} -> {MCP_RESOLVED_COMMAND}")
     printHelp()
 
 
@@ -549,30 +553,50 @@ async def main():
                     continue
                 elif userInput == "/checkup":
                     print("\n📡 [AOS 4.0] 启动全量免疫扫描与自愈...")
-                    report = await agent.run_checkup()
-                    
-                    overall_status = "✅ HEALTHY" if report['overall'] == 'HEALTHY' else "⚠️ UNSTABLE"
+                    try:
+                        report = await agent.run_checkup()
+                    except (Exception, BaseExceptionGroup) as e:
+                        logger.error("/checkup 执行异常: %s", e)
+                        if isinstance(e, BaseExceptionGroup):
+                            print(f"\n❌ [免疫系统] 部分技能自检异常 ({len(e.exceptions)} 个):")
+                            for i, sub_e in enumerate(e.exceptions, 1):
+                                print(f"  {i}. {type(sub_e).__name__}: {sub_e}")
+                        else:
+                            print(f"\n❌ [免疫系统] 执行失败: {e}")
+                        print("\n")
+                        continue
+
+                    overall_value = str(report.get("overall", "UNSTABLE")) if isinstance(report, dict) else "UNSTABLE"
+                    overall_status = "✅ HEALTHY" if overall_value == "HEALTHY" else "⚠️ UNSTABLE"
+                    ts_value = report.get("timestamp", "N/A") if isinstance(report, dict) else "N/A"
+                    details = report.get("details", []) if isinstance(report, dict) else []
+                    if not isinstance(details, list):
+                        details = []
+
                     print(f"\n📊 [诊断报告] 稳态: {overall_status}")
-                    print(f"⏰ 时间: {report['timestamp']}")
+                    print(f"⏰ 时间: {ts_value}")
                     print("─" * 60)
-                    for detail in report['details']:
-                        # 确定图标
-                        phys_ok = detail.get('phys_ok', False)
-                        handshake_ok = detail.get('handshake_ok', False)
-                        
+
+                    for raw_detail in details:
+                        detail = raw_detail if isinstance(raw_detail, dict) else {}
+                        phys_ok = bool(detail.get("phys_ok", False))
+                        handshake_ok = bool(detail.get("handshake_ok", False))
+
                         if phys_ok and handshake_ok:
                             status_icon = "✅"
-                        elif detail.get('healed'):
+                        elif detail.get("healed"):
                             status_icon = "🚑"
                         elif not phys_ok or not handshake_ok:
                             status_icon = "❌"
                         else:
                             status_icon = "⚪"
-                            
-                        reason = f" | {detail['reason']}" if detail.get('reason') else ""
-                        # [AOS 4.4] 统一显示物理与握手状态
-                        line = f"  {status_icon} {detail['name']:<15} | 物理: {'OK' if phys_ok else 'ERR':<5} | 握手: {'OK' if handshake_ok else 'ERR':<5}{reason}"
+
+                        reason_val = detail.get("reason")
+                        reason = f" | {reason_val}" if reason_val else ""
+                        skill_name = str(detail.get("name", "unknown_skill"))
+                        line = f"  {status_icon} {skill_name:<15} | 物理: {'OK' if phys_ok else 'ERR':<5} | 握手: {'OK' if handshake_ok else 'ERR':<5}{reason}"
                         print(line)
+
                     print("─" * 60 + "\n")
                     continue
 
