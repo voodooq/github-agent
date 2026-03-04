@@ -62,9 +62,12 @@ skills:
 - always_loaded: false
   args:
   - -y
-  - '@modelcontextprotocol/server-scrape-mcp'
+  - firecrawl-mcp
   command: npx
-  description: 高效抓取数据，实现网页解析与信息提取。
+  description: 网页抓取服务（已修复：避免使用不存在的 @modelcontextprotocol/server-fetch 包）。
+  env:
+    FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY}
+    FIRECRAWL_API_URL: ${FIRECRAWL_API_URL}
   name: scrape-mcp
 - always_loaded: false
   args:

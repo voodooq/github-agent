@@ -68,6 +68,9 @@ class SkillManager:
 
         # [AOS 8.3] 并发加载锁：防止多个子专家同时 load_skill 触发重复 npx 冷启动
         self._load_locks: dict[str, asyncio.Lock] = {}
+        # 预加载核心锁以消除首次竞态
+        for k in ["filesystem", "github", "scrape-mcp"]:
+            self._load_locks[k] = asyncio.Lock()
 
     def _load_registry(self) -> None:
         """从 YAML 文件加载技能注册表"""
@@ -195,11 +198,14 @@ class SkillManager:
     async def load_skill(self, name: str, workspace_path: str | None = None) -> dict:
         """
         动态加载指定技能的 MCP 服务。
-        [AOS 8.3] 使用 per-skill 锁序列化并发请求，防止多个子专家同时冷启动同一 npx 进程。
+        [AOS 8.3.1] 改进锁获取逻辑，消除 __init__ 外的竞态。
         """
-        # 获取或创建该技能的专属锁
         if name not in self._load_locks:
             self._load_locks[name] = asyncio.Lock()
+            
+        if self._load_locks[name].locked():
+            print(f"⏳ [技能管理器] 技能 '{name}' 正在被其他专家占用，正在排队等锁...")
+            
         async with self._load_locks[name]:
             return await self._load_skill_inner(name, workspace_path)
 
@@ -210,11 +216,23 @@ class SkillManager:
             current_args = getattr(self.loaded_skills[name], "last_args", [])
             if name == "filesystem" and workspace_path:
                 target_abs = os.path.abspath(workspace_path)
-                current_roots = [os.path.abspath(str(a)) for a in current_args if os.path.isabs(str(a))]
+                # [AOS 8.3.2] 路径比对精度加固：仅比对 args 列表中的物理路径
+                current_roots = []
+                for a in current_args:
+                    arg_str = str(a)
+                    # 排除 cmd/npx/package 等非路径参数
+                    if arg_str.lower() in ["/c", "cmd.exe", "npx", "npx.cmd", "-y"]:
+                        continue
+                    if "@modelcontextprotocol" in arg_str:
+                        continue
+                    
+                    try:
+                        abs_p = os.path.abspath(arg_str)
+                        if os.path.exists(abs_p) or arg_str == ".":
+                            current_roots.append(abs_p)
+                    except:
+                        continue
 
-                # [AOS 8.2] filesystem 重载优化：
-                # 只要目标路径已被某个已授权根目录覆盖（子目录关系），就无需重载。
-                # 避免每次切换到新子工作区都触发一次 npx 冷启动。
                 already_covered = any(
                     target_abs == root or target_abs.startswith(root + os.sep)
                     for root in current_roots
@@ -333,7 +351,15 @@ class SkillManager:
                 ) from e
             except Exception as e:
                 runner_task.cancel()
-                raise e
+                # [AOS 8.4] 优化 ExceptionGroup 报错：提取底层真实原因
+                error_msg = str(e)
+                if hasattr(e, "exceptions") and e.exceptions: # ExceptionGroup or BaseExceptionGroup
+                    # 尝试递归寻找最底层的非 Group 异常
+                    curr = e
+                    while hasattr(curr, "exceptions") and curr.exceptions:
+                        curr = curr.exceptions[0]
+                    error_msg = str(curr)
+                raise RuntimeError(f"技能 '{name}' 加载失败: {error_msg}") from e
 
             # [AOS 3.9.9] 点火验质 (Post-Load Verification)
             # 物理进程虽然起来了，但可能卡在依赖安装（如 Puppeteer），此处强制握手一次

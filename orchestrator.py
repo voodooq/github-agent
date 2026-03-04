@@ -406,9 +406,9 @@ class Orchestrator:
             self.blackboard.update_task(role_id, "WAITING", f"等待前置: {depends}")
             for dep in depends:
                 dep_key = f"_task_done_{dep}"
-                # [AOS 2.9.3] 放宽超时至 10 分钟，确保本地慢速模型或长耗时抓取能跑完
+                # [AOS 8.5] 依赖等待降噪：缩短等待窗口，避免“长时间看似卡死”
                 try:
-                    result = await self.blackboard.wait_for(dep_key, timeout=600.0)
+                    result = await self.blackboard.wait_for(dep_key, timeout=180.0)
                 except asyncio.CancelledError:
                     self.blackboard.update_task(role_id, "FAILED", f"任务取消：等待前置 {dep} 时收到中断信号")
                     self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
@@ -449,11 +449,12 @@ class Orchestrator:
 
             if load_result.get("status") == "error":
                 logger.warning("技能 %s 加载失败: %s", skill_name, load_result.get("message"))
-                self.blackboard.update_task(
-                    role_id,
-                    "RUNNING",
-                    f"技能加载失败: {skill_name} ({load_result.get('message', 'unknown')})"
-                )
+                fail_msg = f"技能加载失败: {skill_name} ({load_result.get('message', 'unknown')})"
+                self.blackboard.update_task(role_id, "FAILED", fail_msg)
+                # [AOS 8.5] Fail-Fast：技能加载失败立刻终止当前角色，避免下游长时间 WAITING
+                self.blackboard.write(f"error_{role_id}", fail_msg, author=role_id)
+                self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
+                return f"[{role_id}] 失败: {fail_msg}"
             else:
                 self.blackboard.update_task(
                     role_id,
@@ -545,20 +546,29 @@ class Orchestrator:
                         print(f"☁️ [柔性路由] 检测到高智商子任务 '{role_id}'，自动升档至 PREMIUM 算力...")
                         break
 
+            # [AOS 8.5] 子专家执行硬超时：防止模型/工具调用长时间挂起
+            execution_timeout = 180.0
+
             # AOS 2.1: 优先使用具备工具执行能力的 Agent.execute_with_tools 避免幻觉
             if self.agent:
-                result_text = await self.agent.execute_with_tools(
-                    full_system_prompt,
-                    task_desc,
-                    tier=target_tier, 
-                    context_id=f"task_{role_id}",
-                    workspace_path=self.workspace_path 
+                result_text = await asyncio.wait_for(
+                    self.agent.execute_with_tools(
+                        full_system_prompt,
+                        task_desc,
+                        tier=target_tier, 
+                        context_id=f"task_{role_id}",
+                        workspace_path=self.workspace_path 
+                    ),
+                    timeout=execution_timeout
                 )
             else:
-                result_text = await self.unified_client.generate(
-                    target_tier, 
-                    full_system_prompt,
-                    task_desc,
+                result_text = await asyncio.wait_for(
+                    self.unified_client.generate(
+                        target_tier, 
+                        full_system_prompt,
+                        task_desc,
+                    ),
+                    timeout=execution_timeout
                 )
 
             # [AOS 4.8] 状态纠偏协议 (State Correction Protocol)
@@ -586,6 +596,12 @@ class Orchestrator:
             self.blackboard.write(f"error_{role_id}", cancel_msg, author=role_id)
             self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
             raise
+        except asyncio.TimeoutError:
+            timeout_msg = "执行超时：超过 180s 未完成，已强制终止"
+            self.blackboard.update_task(role_id, "FAILED", timeout_msg)
+            self.blackboard.write(f"error_{role_id}", timeout_msg, author=role_id)
+            self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
+            return f"[{role_id}] 失败: {timeout_msg}"
         except Exception as e:
             error_msg = f"执行异常: {str(e)}"
             self.blackboard.update_task(role_id, "FAILED", error_msg)
