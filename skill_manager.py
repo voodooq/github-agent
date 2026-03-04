@@ -255,7 +255,7 @@ class SkillManager:
         try:
             # [AOS 7.5.4] NPM 兼容性加固：強制使用官方 Registry 以免鏡像同步延遲導致包找不到
             # [Fix AOS 7.5.6] 環境變量加固：必須繼承原始環境變量（特別是 PATH 和 SystemRoot），否则 npx 会失败
-            import os
+            # NOTE: os 已在文件顶部全局导入，禁止在此处重复 import（会导致 UnboundLocalError）
             env_config = build_subprocess_env()
             env_config.update({
                 "NPM_CONFIG_REGISTRY": "https://registry.npmjs.org",
