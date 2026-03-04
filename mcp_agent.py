@@ -748,6 +748,42 @@ class McpAgent:
             {
                 "type": "function",
                 "function": {
+                    "name": "runtime_deploy",
+                    "description": "[AOS P2] 在隔离的 Runtime 沙箱中生成 Dockerfile 并启动测试容器。如果用户要求部署或运行项目来验证，必须调用此工具。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "tech_stack": {
+                                "type": "string",
+                                "description": "推断出的技术栈，例如 'python', 'flask', 'node', 'react'"
+                            },
+                            "entry_point": {
+                                "type": "string",
+                                "description": "启动入口文件或命令，例如 'app.py' 或 'server.js'"
+                            }
+                        },
+                        "required": ["tech_stack", "entry_point"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "port_probe",
+                    "description": "[AOS P2] 对指定的本地主机端口发起 HTTP 存活探针请求。用于在容器部署后验证服务是否返回 200 OK。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "port": {"type": "integer", "description": "要探测的端口号 (如 8080或3000)"},
+                            "path": {"type": "string", "description": "HTTP 探测路径，默认为 '/'"}
+                        },
+                        "required": ["port"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "read_skill",
                     "description": "读取指定技能文件的完整内容。先用 search_skills 找到文件名，再用此工具读取。",
                     "parameters": {
@@ -1159,6 +1195,37 @@ class McpAgent:
             skills = self.skill_manager.list_available()
             return json.dumps(skills, ensure_ascii=False)
 
+        # --- [AOS P2 内部工具: RuntimeEngine] ---
+        elif target_func == "runtime_deploy":
+            from runtime_engine import RuntimeEngine
+            if getattr(self, 'runtime_engine', None) is None:
+                self.runtime_engine = RuntimeEngine(docker_client=self.docker_sandbox.client)
+                
+            tech = arguments.get("tech_stack", "python")
+            entry = arguments.get("entry_point", "app.py")
+            df_content = self.runtime_engine.generate_dockerfile(tech, entry)
+            
+            logger.info("🚀 [RuntimeEngine] 触发自动部署, 技术栈: %s, 入口: %s", tech, entry)
+            res = await self.runtime_engine.deploy_workspace(self.workspace_path, df_content)
+            if res.get("status") == "success":
+                return f"✅ 物理容器部署成功！Container ID: {res.get('short_id')}, 宿主机映射: {res.get('ports')}\n生成了如下 Dockerfile:\n{df_content}"
+            else:
+                return f"❌ 物理部署失败: {res.get('message')}"
+                
+        elif target_func == "port_probe":
+            from runtime_engine import RuntimeEngine
+            if getattr(self, 'runtime_engine', None) is None:
+                self.runtime_engine = RuntimeEngine(docker_client=self.docker_sandbox.client)
+            port = int(arguments.get("port", 8080))
+            path = str(arguments.get("path", "/"))
+            res = await self.runtime_engine.port_probe("localhost", port, path=path)
+            if res["status"] == "PASS":
+                return f"🟢 [探针通过] 端口 {port} 存活，返回 200 OK!"
+            else:
+                return f"🔴 [探针警报] 端口 {port} 无响应或非 200: {res['message']}"
+
+        # --- --- ---
+
         elif target_func == "write_blackboard":
             key = arguments.get("key")
             value = arguments.get("value")
@@ -1458,7 +1525,7 @@ class McpAgent:
                 path = parsed_args.get("path")
                 if path and os.path.exists(path) and os.path.isfile(path):
                     f_size = os.path.getsize(path)
-                    if f_size > 30 * 1024:
+                    if f_size > 100 * 1024:
                         offset = parsed_args.get("offset", 0)
                         logger.warning("🛑 [AOS 7.5] 觸發大文件分片讀取: %s (size: %d, offset: %d)", path, f_size, offset)
                         resultText = self._read_file_chunked(path, f_size, offset)
@@ -1677,7 +1744,7 @@ class McpAgent:
                 if "offset" not in params:
                     params["offset"] = {
                         "type": "integer",
-                        "description": "[AOS 7.5.8] 大文件读取偏移量 (bytes)。当文件超过 30KB 时，请根据反馈中的建议传入此参数以读取下一分片。"
+                        "description": "[AOS 7.5.8] 大文件读取偏移量 (bytes)。当文件超过 100KB 时，请根据反馈中的建议传入此参数以读取下一分片。"
                     }
                     # 确保 parameters 结构完整
                     if "parameters" not in t["function"]:
@@ -1710,6 +1777,8 @@ class McpAgent:
 
         MAX_ITERATIONS = 50
         call_history = []  # 死循环检测
+        bb_read_tracker: dict[str, int] = {}  # {call_sig: 连续无变化次数}
+        bb_last_result: dict[str, str] = {}   # {call_sig: 上次返回值}
         for iteration in range(MAX_ITERATIONS):
             # Token 预算墙检查
             if self.token_budget.exceeded:
@@ -1842,6 +1911,18 @@ class McpAgent:
                     MAX_TOOL_OUTPUT = 30000
                     if len(resultText) > MAX_TOOL_OUTPUT:
                         resultText = resultText[:MAX_TOOL_OUTPUT] + f"\n\n...(输出过长，已截断前 {MAX_TOOL_OUTPUT} 字符数据)"
+                        
+                    # [P1] 黑板内容读取死循环熔断
+                    if "read_blackboard" in funcName:
+                        if call_sig in bb_last_result and bb_last_result[call_sig] == resultText:
+                            bb_read_tracker[call_sig] = bb_read_tracker.get(call_sig, 0) + 1
+                            if bb_read_tracker[call_sig] >= 3:
+                                logger.error("🚫 [AOS P1] 黑板读取死循环: 连续 3 次无变化 (%s)", call_sig)
+                                yield f"⚠️ [物理熔断] 检测到黑板读取死循环 (连续 3 次内容无变化)，强制中断任务。"
+                                return
+                        else:
+                            bb_read_tracker[call_sig] = 0
+                        bb_last_result[call_sig] = resultText
 
                     # 跟踪 Token 消耗
                     self.token_budget.consume(self.token_budget.estimate_tokens(resultText))
@@ -2174,6 +2255,8 @@ class McpAgent:
         
         MAX_ITERATIONS = max_iterations # [AOS 5.4] 真值对齐：支持外部强制关断
         call_history = []
+        bb_read_tracker: dict[str, int] = {}  # {call_sig: 连续无变化次数}
+        bb_last_result: dict[str, str] = {}   # {call_sig: 上次返回值}
         fingerprint_history = set() # [AOS 7.3] 物理指纹历史：(tool, args_hash, result_hash)
         recent_errors = [] # [AOS 2.9] 同错熔断检测
         success_count = 0  # [AOS 4.8] 工具执行成功计数
@@ -2397,6 +2480,17 @@ class McpAgent:
                         logger.info("⚡ [AOS 5.3] INSTANT_KILL: 调度器操作成功，强制物理断电。")
                         self.memories[context_id].append({"role": "tool", "tool_call_id": tc["id"], "content": resultText})
                         return f"INSTANT_KILL_PASS: {resultText}"
+
+                    # [P1] 黑板内容读取死循环熔断
+                    if "read_blackboard" in funcName:
+                        if call_sig in bb_last_result and bb_last_result[call_sig] == str(resultText):
+                            bb_read_tracker[call_sig] = bb_read_tracker.get(call_sig, 0) + 1
+                            if bb_read_tracker[call_sig] >= 3:
+                                logger.error("🚫 [AOS P1] 黑板读取死循环: 连续 3 次无变化 (%s)", call_sig)
+                                return f"⚠️ [物理熔断] 检测到黑板读取死循环 (连续 3 次内容无变化)，由内核强制终止。"
+                        else:
+                            bb_read_tracker[call_sig] = 0
+                        bb_last_result[call_sig] = str(resultText)
 
                     # 🚨 [Fix AOS 7.5.8] 核心修复：删除此处多余的 append，防止进入 memories 时 ID 重复导致 400
                     # 恢復 AOS 5.2 收斂邏輯
@@ -2864,9 +2958,9 @@ class McpAgent:
 
     def _read_file_chunked(self, path: str, size: int, offset: int = 0) -> str:
         """
-        [AOS 7.5.8] 核心改进：支持大文件分片读取，每分片 30KB。
+        [AOS 7.5.8] 核心改进：支持大文件分片读取，每分片 100KB。
         """
-        CHUNK_SIZE = 30 * 1024 # 30KB (用户要求升级)
+        CHUNK_SIZE = 100 * 1024 # 100KB (用户要求升级)
         try:
             with open(path, 'rb') as f:
                 f.seek(offset)

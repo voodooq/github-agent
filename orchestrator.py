@@ -284,6 +284,9 @@ class Orchestrator:
 
         # 收集当前可用工具信息
         tool_names = self.skill_manager.get_tool_names()
+        # [AOS P2] 注入内置运行时引擎工具
+        tool_names.extend(["runtime_deploy", "port_probe"])
+        
         available = self.skill_manager.list_available()
         tools_info = f"已加载工具: {tool_names}\n可用技能: {json.dumps(available, ensure_ascii=False)}"
 
@@ -603,13 +606,18 @@ class Orchestrator:
 
             # 2. 探测物理截断信号
             for role, res_text in results.items():
+                # 探测 P2 工具闭环信号
+                if any(sig in res_text for sig in ["[探针通过]", "物理容器部署成功"]):
+                    logger.info("✅ [AOS P2] 探测到 Runtime 部署或探针闭环信号，直接判 PASS")
+                    return {"overall": "PASS", "details": [], "correction_hint": "容器物理操作或探针验证闭环。"}
+
                 # [AOS 5.5] Fake Detection: 探测伪装执行
                 fake_indicators = ["echo ", "crontab ", "schtasks ", "manual set"]
                 # 如果回复中出现了伪装关键词，但没有物理成功信号标识，判定为冒充
                 if any(fi in res_text.lower() for fi in fake_indicators):
-                    if not any(sig in res_text for sig in ["⏰ [调度器]", "💥 [调度器]", "INSTANT_KILL_PASS", "TASK_COMPLETED"]):
+                    if not any(sig in res_text for sig in ["⏰ [调度器]", "💥 [调度器]", "INSTANT_KILL_PASS", "TASK_COMPLETED", "[探针通过]", "物理容器部署成功"]):
                         logger.error("❌ [AOS 5.5] 发现伪装执行迹象：模型试图用文本建议代替工具调用。")
-                        return {"overall": "FAIL", "details": [], "correction_hint": "🚨 严禁提供手动建议！你必须调用工具（如 add_scheduled_task）来完成物理操作，禁止使用 echo 或文本描述。"}
+                        return {"overall": "FAIL", "details": [], "correction_hint": "🚨 严禁提供手动建议！你必须调用工具（如 add_scheduled_task 或 runtime_deploy）来完成物理操作，禁止使用 echo 或文本描述。"}
 
                 if "INSTANT_KILL_PASS" in res_text or "TASK_COMPLETED" in res_text:
                     logger.info("✅ [AOS 5.3/5.4/5.5] 探测到物理成功或截断信号，直接判 PASS")

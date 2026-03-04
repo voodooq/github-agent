@@ -4,6 +4,7 @@ CLI 入口
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import os
 import re
@@ -141,6 +142,16 @@ def print_collected_targets(found_files, file_hits, file_errors):
 
 
 
+
+@asynccontextmanager
+async def hot_mcp_env(agent, serverParams):
+    print("🔌 [AOS P3] 正在按需唤醒 MCP 运行时环境...")
+    async with stdio_client(serverParams) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            toolNames = await agent.connect(session)
+            print(f"✅ 热环境就绪: 加载了 {len(toolNames)} 个底层组件工具")
+            yield session
 async def main():
     """主函数：初始化 Agent → 连接 MCP → 交互循环"""
     agent = McpAgent(
@@ -178,452 +189,450 @@ async def main():
 
 
 
-    async with stdio_client(serverParams) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            toolNames = await agent.connect(session)
-            print(f"✅ 已加载 {len(toolNames)} 个工具: {', '.join(toolNames[:10])}")
-            if len(toolNames) > 10:
-                print(f"   ...及其他 {len(toolNames) - 10} 个工具")
-            print()
 
-            # 配置自动补全
-            from prompts import EXPERT_REGISTRY
+    # 配置自动补全
+    from prompts import EXPERT_REGISTRY
+    
+    # 基础命令映射
+    commands = ["/search", "/analyze", "/review", "/deploy", "/auto", "/skills", "/schedule", "/wallet", "/inject", "/prune", "/checkup", "/help", "/clear", "/clear all", "/tools", "/exit", "/quit"]
+    meta = {
+        "/search": "搜索 GitHub 项目",
+        "/analyze": "深入分析单个项目内容",
+        "/review": "Multi-Agent 深度评审",
+        "/deploy": "一键部署项目到 Docker 沙盒",
+        "/auto": "🧠 全自治模式",
+        "/skills": "查看动态技能注册表状态",
+        "/schedule": "📅 查看定时任务",
+        "/wallet": "💰 CFO 财务简报",
+        "/inject": "💵 向 Agent 钱包注资",
+        "/prune": "清理 Docker 资源",
+        "/checkup": "🛡️ 免疫系统自检",
+        "/help": "显示帮助信息",
+        "/clear": "清除主对话记忆",
+        "/clear all": "全量清理所有 Agent 记忆文件 (核爆级)",
+        "/tools": "列出所有可用工具",
+        "/exit": "退出程序",
+        "/quit": "退出程序",
+    }
+    
+    # 动态添加每个 Agent 的清理命令提示
+    for agent_id in EXPERT_REGISTRY:
+        cmd = f"/clear {agent_id}"
+        commands.append(cmd)
+        # 简单从 prompt 提取第一句作为描述
+        desc = EXPERT_REGISTRY[agent_id]["prompt"].split('。')[0].split('：')[0].replace("你是一个", "")
+        meta[cmd] = f"清理【{desc}】的独立记忆"
+
+    word_completer = WordCompleter(
+        commands,
+        meta_dict=meta,
+        ignore_case=True,
+        match_middle=True,
+        sentence=True,
+        pattern=re.compile(r"(/[a-zA-Z0-9_ ]*)"),  # 允许空格
+    )
+
+    class SlashCommandCompleter(Completer):
+        def get_completions(self, document, complete_event):
+            # 仅在输入以 / 开头时触发提示，避免输入空格或普通文字时弹出菜单
+            if document.text.startswith('/'):
+                yield from word_completer.get_completions(document, complete_event)
+
+    prompt_session = PromptSession(completer=SlashCommandCompleter(), complete_while_typing=True)
+
+    # 交互循环
+    while True:
+        try:
+            # 使用 prompt_toolkit 异步获取输入，支持补全
+            userInput = await prompt_session.prompt_async("👤 You: ")
+            userInput = userInput.strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not userInput:
+            continue
+
+        # 内置命令
+        if userInput in ("/quit", "/exit"):
+            break
+        elif userInput == "/clear":
+            agent.clearMemory("main")
+            print("🧹 主对话记忆已清除\n")
+            continue
+        elif userInput == "/clear all":
+            agent.clearAllMemories()
+            # AOS 7.0: 物理级逻辑净空
+            agent.blackboard.clear()
+            agent.exp_engine.clear()
+            print("💥 [物理重启] 所有记忆、黑板事实与经验库已全量清除 (含文件)\n")
+            continue
+        elif userInput.startswith("/clear "):
+            ctx_id = userInput[7:].strip()
+            agent.clearMemory(ctx_id)
+            print(f"🧹 专家记忆 [{ctx_id}] 已清除\n")
+            continue
+        elif userInput == "/tools":
+            print(f"🔧 可用工具: {', '.join(toolNames)}\n")
+            continue
+        elif userInput == "/help":
+            printHelp()
+            continue
+        elif userInput.startswith("/search "):
+            # 快捷搜索：将用户需求包装为搜索指令，强制云端（需要工具调用）
+            query = userInput[8:].strip()
+            if not query:
+                print("⚠️  请输入搜索需求，例如: /search 轻量级 Python WAF\n")
+                continue
             
-            # 基础命令映射
-            commands = ["/search", "/analyze", "/review", "/deploy", "/auto", "/skills", "/schedule", "/wallet", "/inject", "/prune", "/checkup", "/help", "/clear", "/clear all", "/tools", "/exit", "/quit"]
-            meta = {
-                "/search": "搜索 GitHub 项目",
-                "/analyze": "深入分析单个项目内容",
-                "/review": "Multi-Agent 深度评审",
-                "/deploy": "一键部署项目到 Docker 沙盒",
-                "/auto": "🧠 全自治模式",
-                "/skills": "查看动态技能注册表状态",
-                "/schedule": "📅 查看定时任务",
-                "/wallet": "💰 CFO 财务简报",
-                "/inject": "💵 向 Agent 钱包注资",
-                "/prune": "清理 Docker 资源",
-                "/checkup": "🛡️ 免疫系统自检",
-                "/help": "显示帮助信息",
-                "/clear": "清除主对话记忆",
-                "/clear all": "全量清理所有 Agent 记忆文件 (核爆级)",
-                "/tools": "列出所有可用工具",
-                "/exit": "退出程序",
-                "/quit": "退出程序",
-            }
+            # [AOS 7.1] 激活隔离工作区
+            wsp = agent._setup_action_workspace("search")
+            print(f"📁 [隔离] 已分配搜索沙盒: {wsp}\n")
             
-            # 动态添加每个 Agent 的清理命令提示
-            for agent_id in EXPERT_REGISTRY:
-                cmd = f"/clear {agent_id}"
-                commands.append(cmd)
-                # 简单从 prompt 提取第一句作为描述
-                desc = EXPERT_REGISTRY[agent_id]["prompt"].split('。')[0].split('：')[0].replace("你是一个", "")
-                meta[cmd] = f"清理【{desc}】的独立记忆"
-
-            word_completer = WordCompleter(
-                commands,
-                meta_dict=meta,
-                ignore_case=True,
-                match_middle=True,
-                sentence=True,
-                pattern=re.compile(r"(/[a-zA-Z0-9_ ]*)"),  # 允许空格
-            )
-
-            class SlashCommandCompleter(Completer):
-                def get_completions(self, document, complete_event):
-                    # 仅在输入以 / 开头时触发提示，避免输入空格或普通文字时弹出菜单
-                    if document.text.startswith('/'):
-                        yield from word_completer.get_completions(document, complete_event)
-
-            prompt_session = PromptSession(completer=SlashCommandCompleter(), complete_while_typing=True)
-
-            # 交互循环
-            while True:
-                try:
-                    # 使用 prompt_toolkit 异步获取输入，支持补全
-                    userInput = await prompt_session.prompt_async("👤 You: ")
-                    userInput = userInput.strip()
-                except (EOFError, KeyboardInterrupt):
-                    break
-
-                if not userInput:
-                    continue
-
-                # 内置命令
-                if userInput in ("/quit", "/exit"):
-                    break
-                elif userInput == "/clear":
-                    agent.clearMemory("main")
-                    print("🧹 主对话记忆已清除\n")
-                    continue
-                elif userInput == "/clear all":
-                    agent.clearAllMemories()
-                    # AOS 7.0: 物理级逻辑净空
-                    agent.blackboard.clear()
-                    agent.exp_engine.clear()
-                    print("💥 [物理重启] 所有记忆、黑板事实与经验库已全量清除 (含文件)\n")
-                    continue
-                elif userInput.startswith("/clear "):
-                    ctx_id = userInput[7:].strip()
-                    agent.clearMemory(ctx_id)
-                    print(f"🧹 专家记忆 [{ctx_id}] 已清除\n")
-                    continue
-                elif userInput == "/tools":
-                    print(f"🔧 可用工具: {', '.join(toolNames)}\n")
-                    continue
-                elif userInput == "/help":
-                    printHelp()
-                    continue
-                elif userInput.startswith("/search "):
-                    # 快捷搜索：将用户需求包装为搜索指令，强制云端（需要工具调用）
-                    query = userInput[8:].strip()
-                    if not query:
-                        print("⚠️  请输入搜索需求，例如: /search 轻量级 Python WAF\n")
-                        continue
-                    
-                    # [AOS 7.1] 激活隔离工作区
-                    wsp = agent._setup_action_workspace("search")
-                    print(f"📁 [隔离] 已分配搜索沙盒: {wsp}\n")
-                    
-                    # [AOS 7.2] CFO 授權與 ROI 評估
-                    print("💰 [CFO] 正在評估搜索任務 ROI...")
-                    await asyncio.sleep(0.8)
-                    mode = agent.economy.get_survival_mode()
-                    tier = agent.economy.get_recommended_tier()
-                    print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.05 預算。")
-                    
-                    userInput = SEARCH_PROMPT_TEMPLATE.format(user_query=query)
-                    print(f"🔍 正在搜索: {query} [🧠 {tier} 模式]\n")
-                    
-                    # 搜索需要 MCP 工具调用，必须走云端
-                    try:
-                        print(f"\n🤖 Agent: ", end="", flush=True)
-                        full_report = ""
-                        async for chunk in agent.chat(userInput, tier="PREMIUM"):
-                            print(chunk, end="", flush=True)
-                            full_report += chunk
-                        print("\n")
-                        
-                        # [AOS 7.2] 提取結構化 JSON 數據
-                        try:
-                            import json
-                            json_match = re.search(r"```json\s*(\[.*?\])\s*```", full_report, re.DOTALL)
-                            if json_match:
-                                json_data = json_match.group(1)
-                                ranking_path = os.path.join(wsp, "ranking_data.json")
-                                with open(ranking_path, "w", encoding="utf-8") as f:
-                                    f.write(json_data)
-                                print(f"📊 [數據] 結構化排名已導出: {ranking_path}")
-                        except Exception as e:
-                            logger.error("JSON 提取失敗: %s", e)
-
-                        # [AOS 7.1] 物理归档报告
-                        try:
-                            report_path = os.path.join(wsp, "search_report.md")
-                            with open(report_path, "w", encoding="utf-8") as f:
-                                f.write(full_report)
-                            print(f"💾 完整報告已自動保存到: {report_path}\n")
-                        except Exception as e:
-                            logger.warning("搜索報告歸檔失敗: %s", e)
-                        
-                    except Exception as e:
-                        logger.error("Agent 处理异常: %s", e)
-                        print(f"\n❌ 错误: {e}\n")
-                    continue
-                elif userInput.startswith("/analyze "):
-                    # 快捷分析：支持 URL、本地文件路徑或混合文本
-                    original_input = userInput[9:].strip()
-                    if not original_input:
-                        print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
-                        continue
-
-                    target_urls, found_files, file_hits, file_errors = collect_target_urls(original_input)
-                    print_collected_targets(found_files, file_hits, file_errors)
-                    
-                    if not target_urls:
-                        print(f"⚠️  未找到任何有效的 GitHub 地址。輸入內容: \"{original_input[:50]}...\"\n")
-                        continue
-
-                    print(f"🚀 開始準備分析 {len(target_urls)} 個項目...\n")
-
-                    # [AOS 7.2] CFO 授權與 ROI 評估
-                    print("💰 [CFO] 正在評估分析任務 ROI...")
-                    await asyncio.sleep(0.6)
-                    mode = agent.economy.get_survival_mode()
-                    tier = agent.economy.get_recommended_tier()
-                    print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.10 深度分析預算。")
-
-                    # [AOS 7.1] 激活隔離工作區
-                    wsp = agent._setup_action_workspace("analyze")
-                    print(f"📁 [隔離] 已分配分析沙盒: {wsp}\n")
-                    
-                    all_reports = []
-                    for url in target_urls:
-                        print(f"📊 正在分析: {url} [☁️ 雲端模式]\n")
-                        prompt = ANALYZE_PROMPT_TEMPLATE.format(repo_url=url)
-                        try:
-                            print(f"\n🤖 Agent ({url}): ", end="", flush=True)
-                            repo_report = f"## Analysis for {url}\n"
-                            async for chunk in agent.chat(prompt, tier="PREMIUM"):
-                                print(chunk, end="", flush=True)
-                                repo_report += chunk
-                            all_reports.append(repo_report)
-                            print("\n" + "-"*30)
-                        except Exception as e:
-                            logger.error(f"分析 {url} 異常: {e}")
-                            print(f"\n❌ 錯誤: {e}\n")
-
-                    # 如果有多個報告，嘗試生成一個對比總結
-                    if len(all_reports) > 1:
-                        print("\n⚖️ 正在生成多項目對比總結...")
-                        comparison_prompt = f"請對以下多個項目的分析結果進行縱向對比，列出它們的異同點、各自優劣勢，並給出選型建議：\n\n" + "\n\n".join(all_reports)
-                        full_content = ""
-                        async for chunk in agent.chat(comparison_prompt, tier="PREMIUM", no_tools=True):
-                            print(chunk, end="", flush=True)
-                            full_content += chunk
-                        final_report = comparison_prompt + "\n\n# 對比總結\n" + full_content
-                    else:
-                        final_report = all_reports[0] if all_reports else ""
-
-                    # [AOS 7.1] 物理歸檔
-                    try:
-                        report_path = os.path.join(wsp, "analyze_report.md")
-                        with open(report_path, "w", encoding="utf-8") as f:
-                            f.write(final_report)
-                        print(f"\n💾 完整的分析報告已自動保存到: {report_path}\n")
-                    except Exception as e:
-                        logger.warning("分析報告歸檔失敗: %s", e)
-                    continue
-                elif userInput.startswith("/review "):
-                    # 專家團評審：支持 URL、本地文件或混合文本
-                    original_input = userInput[8:].strip()
-                    if not original_input:
-                        print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
-                        continue
-
-                    target_urls, found_files, file_hits, file_errors = collect_target_urls(original_input)
-
-                    if found_files:
-                        print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
-                        for fpath, count in file_hits:
-                            print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 個地址")
-                        for fpath, err in file_errors:
-                            print(f"  ❌ 讀取 {fpath} 失敗: {err}")
-
-                    if not target_urls:
-                        print(f"⚠️  未找到任何有效的 GitHub 地址。\n")
-                        continue
-
-                    # [AOS 7.2] CFO 授權與 ROI 評估
-                    print("💰 [CFO] 正在評估多專家評審任務 ROI...")
-                    await asyncio.sleep(1.0)
-                    mode = agent.economy.get_survival_mode()
-                    tier = agent.economy.get_recommended_tier()
-                    print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.25 專家團專項預算。")
-
-                    try:
-                        # 觸發混合算力專家團評審 (支持單個或多個地址)
-                        print(f"\n🤖 專家團綜合評審報告 (共 {len(target_urls)} 個項目)：\n", end="", flush=True)
-                        full_report = ""
-                        async for chunk in agent.multiAgentReview(target_urls):
-                            print(chunk, end="", flush=True)
-                            full_report += chunk
-                        print("\n")
-                        
-                        # [AOS 7.1] 物理歸檔報告
-                        try:
-                            report_path = os.path.join(agent.workspace_path, "review_report.md")
-                            with open(report_path, "w", encoding="utf-8") as f:
-                                f.write(full_report)
-                            print(f"💾 評審報告已自動保存到: {report_path}\n")
-                        except Exception as e:
-                            logger.warning("評審報告歸檔失敗: %s", e)
-                        
-                    except Exception as e:
-                        logger.error("評審流程異常: %s", e)
-                        print(f"\n❌ 錯誤: {e}\n")
-                    continue
-                elif userInput.startswith("/deploy "):
-                    # 一键部署：自适应加载 -> 自动 Docker 配置 -> 沙盒运行
-                    repoUrl = userInput[8:].strip()
-                    if not repoUrl:
-                        print("⚠️  请输入仓库地址，例如: /deploy https://github.com/owner/repo\n")
-                        continue
-                    try:
-                        print(f"\n🚀 启动 Docker 沙盒部署流程：\n", end="", flush=True)
-                        async for chunk in agent.deploy_project(repoUrl):
-                            print(chunk, end="", flush=True)
-                        print("\n")
-                    except Exception as e:
-                        logger.error("部署流程异常: %s", e)
-                        print(f"\n❌ 错误: {e}\n")
-                    continue
-                elif userInput == "/bb":
-                    # AOS 2.1: 查看黑板报告
-                    print("\n📖 [黑板报告] 当前任务事实:")
-                    print("─" * 50)
-                    print(agent.blackboard.read_all())
-                    print("─" * 50)
-                    print(agent.blackboard.get_timeline())
-                    print()
-                    continue
-                elif userInput == "/exp":
-                    # AOS 2.4: 查看经验库
-                    exps = agent.exp_engine.list_experiences()
-                    print("\n🧠 [经验引擎] 当前已学习的执行模式:")
-                    if not exps:
-                        print("  (暂无成功经验，请先运行 /auto 任务)")
-                    for e in exps:
-                        print(f"  ⭐ {e['status']} | 置信度: {e['rate']} | 复用: {e['matches']}次 | 任务: {e['id']}")
-                    print()
-                    continue
-                elif userInput.startswith("/auto "):
-                    # AOS 2.0: 全自治模式
-                    demand = userInput[6:].strip()
-                    if not demand:
-                        print("⚠️  請輸入任務需求，例如: /auto 找到最火的 3 個 Python 量化框架\n")
-                        continue
-                    
-                    # [AOS 7.2] CFO 授權與 ROI 評估
-                    print("💰 [CFO] 正在評估自治任務 ROI...")
-                    await asyncio.sleep(0.8)
-                    mode = agent.economy.get_survival_mode()
-                    tier = agent.economy.get_recommended_tier()
-                    print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.50 全自治預算。")
-
-                    try:
-                        async for chunk in agent.autonomous_execute(demand):
-                            print(chunk, end="", flush=True)
-                        print("\n")
-                    except Exception as e:
-                        logger.error("自治模式异常: %s", e)
-                        print(f"\n❌ 自治任务执行失败: {e}\n")
-                    continue
-                elif userInput == "/skills":
-                    # AOS 2.0: 查看技能状态
-                    skills = agent.skill_manager.list_available()
-                    print("\n📦 动态技能注册表:")
-                    for s in skills:
-                        icon = "🟢" if s["loaded"] else ("🟡" if s["always_loaded"] else "⚪")
-                        print(f"  {icon} {s['name']}: {s['description']}")
-                    print(f"  ───")
-                    print(f"  🟢 已加载  🟡 自动加载  ⚪ 按需加载\n")
-                    continue
-                elif userInput == "/schedule":
-                    # AOS Phase 3: 查看定时任务
-                    tasks = agent.scheduler.list_tasks()
-                    if not tasks:
-                        print("\n📅 暂无定时任务。可以自然语言对话创建，例如: '每天早上8点提醒我吃药'\n")
-                    else:
-                        print(f"\n📅 定时任务 ({len(tasks)} 个):")
-                        for t in tasks:
-                            print(f"  ⏰ {t['task_id']}: {t['description']} | {t['cron']} | 下次: {t['next_trigger']} | 已执行: {t['run_count']}次")
-                        print()
-                    continue
-                elif userInput == "/wallet":
-                    # AOS AEA: CFO 财务简报
-                    print(agent.economy.get_financial_report())
-                    # 最近交易
-                    txs = agent.economy.get_recent_transactions(5)
-                    if txs:
-                        print("📜 最近交易:")
-                        for tx in txs:
-                            print(f"  {tx['time']} | {tx['type']:>7} | {tx['amount']:>10} | {tx['description']}")
-                    print()
-                    continue
-                elif userInput.startswith("/inject "):
-                    # AOS AEA: 注资
-                    try:
-                        amount = float(userInput[8:].strip())
-                        agent.economy.inject_funds(amount)
-                        # 同步到黑板
-                        for key, val in agent.economy.get_blackboard_facts().items():
-                            agent.blackboard.write(key, val, author="CFO")
-                        print(agent.economy.get_financial_report() + "\n")
-                    except ValueError:
-                        print("⚠️  请输入有效金额，例如: /inject 5.00\n")
-                    continue
-                elif userInput == "/prune":
-                    print("🧹 正在清理 Docker 资源...")
-                    try:
-                        result = agent.docker_sandbox.system_prune()
-                        print(f"{result}\n")
-                    except Exception as e:
-                        print(f"❌ 清理异常: {e}\n")
-                    continue
-                elif userInput == "/checkup":
-                    print("\n📡 [AOS 4.0] 启动全量免疫扫描与自愈...")
-                    try:
-                        report = await agent.run_checkup()
-                    except (Exception, BaseExceptionGroup) as e:
-                        logger.error("/checkup 执行异常: %s", e)
-                        if isinstance(e, BaseExceptionGroup):
-                            print(f"\n❌ [免疫系统] 部分技能自检异常 ({len(e.exceptions)} 个):")
-                            for i, sub_e in enumerate(e.exceptions, 1):
-                                print(f"  {i}. {type(sub_e).__name__}: {sub_e}")
-                        else:
-                            print(f"\n❌ [免疫系统] 执行失败: {e}")
-                        print("\n")
-                        continue
-
-                    overall_value = str(report.get("overall", "UNSTABLE")) if isinstance(report, dict) else "UNSTABLE"
-                    overall_status = "✅ HEALTHY" if overall_value == "HEALTHY" else "⚠️ UNSTABLE"
-                    ts_value = report.get("timestamp", "N/A") if isinstance(report, dict) else "N/A"
-                    details = report.get("details", []) if isinstance(report, dict) else []
-                    if not isinstance(details, list):
-                        details = []
-
-                    print(f"\n📊 [诊断报告] 稳态: {overall_status}")
-                    print(f"⏰ 时间: {ts_value}")
-                    print("─" * 60)
-
-                    for raw_detail in details:
-                        detail = raw_detail if isinstance(raw_detail, dict) else {}
-                        phys_ok = bool(detail.get("phys_ok", False))
-                        handshake_ok = bool(detail.get("handshake_ok", False))
-
-                        if phys_ok and handshake_ok:
-                            status_icon = "✅"
-                        elif detail.get("healed"):
-                            status_icon = "🚑"
-                        elif not phys_ok or not handshake_ok:
-                            status_icon = "❌"
-                        else:
-                            status_icon = "⚪"
-
-                        reason_val = detail.get("reason")
-                        reason = f" | {reason_val}" if reason_val else ""
-                        skill_name = str(detail.get("name", "unknown_skill"))
-                        line = f"  {status_icon} {skill_name:<15} | 物理: {'OK' if phys_ok else 'ERR':<5} | 握手: {'OK' if handshake_ok else 'ERR':<5}{reason}"
-                        print(line)
-
-                    print("─" * 60 + "\n")
-                    continue
-
-                # [AOS 7.0] Cold-Hot Isolation Protocol (冷热隔离协议)
-                # 彻底摒弃语义分诊，将主权交还给用户。
-                
-                # 1. 社交词/超短内容预处理
-                social_words = ["hi", "hello", "你好", "你是谁", "help", "帮助", "谢谢", "thanks"]
-                is_social = userInput.lower() in social_words or len(userInput) < 5
-                
-                # 2. 隔离路由
-                if is_social:
-                    # 极速回复，不进记忆
-                    print(f"\n🤖 Agent: 你好呀，我是道子！随时听候吩咐。如果是执行类任务，请使用 /auto 开头。")
-                    continue
-
-                # 隐式 Cold Mode: 针对普通对话，锁定无工具权限
-                print(f"\n🤖 Agent: [Cold Mode] ", end="", flush=True)
-                try:
-                    # [AOS 7.0] 物理限权：no_tools=True 确保 AI 只有嘴，没有手
-                    chat_tier = "PREMIUM" if AGENT_MODE == "TURBO" else "LOCAL"
-                    async for chunk in agent.chat(userInput, tier=chat_tier, no_tools=True):
+            # [AOS 7.2] CFO 授權與 ROI 評估
+            print("💰 [CFO] 正在評估搜索任務 ROI...")
+            await asyncio.sleep(0.8)
+            mode = agent.economy.get_survival_mode()
+            tier = agent.economy.get_recommended_tier()
+            print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.05 預算。")
+            
+            userInput = SEARCH_PROMPT_TEMPLATE.format(user_query=query)
+            print(f"🔍 正在搜索: {query} [🧠 {tier} 模式]\n")
+            
+            # 搜索需要 MCP 工具调用，必须走云端
+            try:
+                print(f"\n🤖 Agent: ", end="", flush=True)
+                full_report = ""
+                async with hot_mcp_env(agent, serverParams):
+                    async for chunk in agent.chat(userInput, tier="PREMIUM"):
                         print(chunk, end="", flush=True)
-                    print("\n")
+                        full_report += chunk
+                print("\n")
+                
+                # [AOS 7.2] 提取結構化 JSON 數據
+                try:
+                    import json
+                    json_match = re.search(r"```json\s*(\[.*?\])\s*```", full_report, re.DOTALL)
+                    if json_match:
+                        json_data = json_match.group(1)
+                        ranking_path = os.path.join(wsp, "ranking_data.json")
+                        with open(ranking_path, "w", encoding="utf-8") as f:
+                            f.write(json_data)
+                        print(f"📊 [數據] 結構化排名已導出: {ranking_path}")
                 except Exception as e:
-                    logger.error("对话异常: %s", e)
-                    print(f"\n❌ 处理失败: {e}\n")
+                    logger.error("JSON 提取失敗: %s", e)
+
+                # [AOS 7.1] 物理归档报告
+                try:
+                    report_path = os.path.join(wsp, "search_report.md")
+                    with open(report_path, "w", encoding="utf-8") as f:
+                        f.write(full_report)
+                    print(f"💾 完整報告已自動保存到: {report_path}\n")
+                except Exception as e:
+                    logger.warning("搜索報告歸檔失敗: %s", e)
+                
+            except Exception as e:
+                logger.error("Agent 处理异常: %s", e)
+                print(f"\n❌ 错误: {e}\n")
+            continue
+        elif userInput.startswith("/analyze "):
+            # 快捷分析：支持 URL、本地文件路徑或混合文本
+            original_input = userInput[9:].strip()
+            if not original_input:
+                print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
+                continue
+
+            target_urls, found_files, file_hits, file_errors = collect_target_urls(original_input)
+            print_collected_targets(found_files, file_hits, file_errors)
+            
+            if not target_urls:
+                print(f"⚠️  未找到任何有效的 GitHub 地址。輸入內容: \"{original_input[:50]}...\"\n")
+                continue
+
+            print(f"🚀 開始準備分析 {len(target_urls)} 個項目...\n")
+
+            # [AOS 7.2] CFO 授權與 ROI 評估
+            print("💰 [CFO] 正在評估分析任務 ROI...")
+            await asyncio.sleep(0.6)
+            mode = agent.economy.get_survival_mode()
+            tier = agent.economy.get_recommended_tier()
+            print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.10 深度分析預算。")
+
+            # [AOS 7.1] 激活隔離工作區
+            wsp = agent._setup_action_workspace("analyze")
+            print(f"📁 [隔離] 已分配分析沙盒: {wsp}\n")
+            
+            all_reports = []
+            for url in target_urls:
+                print(f"📊 正在分析: {url} [☁️ 雲端模式]\n")
+                prompt = ANALYZE_PROMPT_TEMPLATE.format(repo_url=url)
+                try:
+                    print(f"\n🤖 Agent ({url}): ", end="", flush=True)
+                    repo_report = f"## Analysis for {url}\n"
+                    async with hot_mcp_env(agent, serverParams):
+                        async for chunk in agent.chat(prompt, tier="PREMIUM"):
+                            print(chunk, end="", flush=True)
+                            repo_report += chunk
+                    all_reports.append(repo_report)
+                    print("\n" + "-"*30)
+                except Exception as e:
+                    logger.error(f"分析 {url} 異常: {e}")
+                    print(f"\n❌ 錯誤: {e}\n")
+
+            # 如果有多個報告，嘗試生成一個對比總結
+            if len(all_reports) > 1:
+                print("\n⚖️ 正在生成多項目對比總結...")
+                comparison_prompt = f"請對以下多個項目的分析結果進行縱向對比，列出它們的異同點、各自優劣勢，並給出選型建議：\n\n" + "\n\n".join(all_reports)
+                full_content = ""
+                async for chunk in agent.chat(comparison_prompt, tier="PREMIUM", no_tools=True):
+                    print(chunk, end="", flush=True)
+                    full_content += chunk
+                final_report = comparison_prompt + "\n\n# 對比總結\n" + full_content
+            else:
+                final_report = all_reports[0] if all_reports else ""
+
+            # [AOS 7.1] 物理歸檔
+            try:
+                report_path = os.path.join(wsp, "analyze_report.md")
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write(final_report)
+                print(f"\n💾 完整的分析報告已自動保存到: {report_path}\n")
+            except Exception as e:
+                logger.warning("分析報告歸檔失敗: %s", e)
+            continue
+        elif userInput.startswith("/review "):
+            # 專家團評審：支持 URL、本地文件或混合文本
+            original_input = userInput[8:].strip()
+            if not original_input:
+                print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
+                continue
+
+            target_urls, found_files, file_hits, file_errors = collect_target_urls(original_input)
+
+            if found_files:
+                print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
+                for fpath, count in file_hits:
+                    print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 個地址")
+                for fpath, err in file_errors:
+                    print(f"  ❌ 讀取 {fpath} 失敗: {err}")
+
+            if not target_urls:
+                print(f"⚠️  未找到任何有效的 GitHub 地址。\n")
+                continue
+
+            # [AOS 7.2] CFO 授權與 ROI 評估
+            print("💰 [CFO] 正在評估多專家評審任務 ROI...")
+            await asyncio.sleep(1.0)
+            mode = agent.economy.get_survival_mode()
+            tier = agent.economy.get_recommended_tier()
+            print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.25 專家團專項預算。")
+
+            try:
+                # 觸發混合算力專家團評審 (支持單個或多個地址)
+                print(f"\n🤖 專家團綜合評審報告 (共 {len(target_urls)} 個項目)：\n", end="", flush=True)
+                full_report = ""
+                async with hot_mcp_env(agent, serverParams):
+                    async for chunk in agent.multiAgentReview(target_urls):
+                        print(chunk, end="", flush=True)
+                        full_report += chunk
+                print("\n")
+                
+                # [AOS 7.1] 物理歸檔報告
+                try:
+                    report_path = os.path.join(agent.workspace_path, "review_report.md")
+                    with open(report_path, "w", encoding="utf-8") as f:
+                        f.write(full_report)
+                    print(f"💾 評審報告已自動保存到: {report_path}\n")
+                except Exception as e:
+                    logger.warning("評審報告歸檔失敗: %s", e)
+                
+            except Exception as e:
+                logger.error("評審流程異常: %s", e)
+                print(f"\n❌ 錯誤: {e}\n")
+            continue
+        elif userInput.startswith("/deploy "):
+            # 一键部署：自适应加载 -> 自动 Docker 配置 -> 沙盒运行
+            repoUrl = userInput[8:].strip()
+            if not repoUrl:
+                print("⚠️  请输入仓库地址，例如: /deploy https://github.com/owner/repo\n")
+                continue
+            try:
+                print(f"\n🚀 启动 Docker 沙盒部署流程：\n", end="", flush=True)
+                async with hot_mcp_env(agent, serverParams):
+                    async for chunk in agent.deploy_project(repoUrl):
+                        print(chunk, end="", flush=True)
+                print("\n")
+            except Exception as e:
+                logger.error("部署流程异常: %s", e)
+                print(f"\n❌ 错误: {e}\n")
+            continue
+        elif userInput == "/bb":
+            # AOS 2.1: 查看黑板报告
+            print("\n📖 [黑板报告] 当前任务事实:")
+            print("─" * 50)
+            print(agent.blackboard.read_all())
+            print("─" * 50)
+            print(agent.blackboard.get_timeline())
+            print()
+            continue
+        elif userInput == "/exp":
+            # AOS 2.4: 查看经验库
+            exps = agent.exp_engine.list_experiences()
+            print("\n🧠 [经验引擎] 当前已学习的执行模式:")
+            if not exps:
+                print("  (暂无成功经验，请先运行 /auto 任务)")
+            for e in exps:
+                print(f"  ⭐ {e['status']} | 置信度: {e['rate']} | 复用: {e['matches']}次 | 任务: {e['id']}")
+            print()
+            continue
+        elif userInput.startswith("/auto "):
+            # AOS 2.0: 全自治模式
+            demand = userInput[6:].strip()
+            if not demand:
+                print("⚠️  請輸入任務需求，例如: /auto 找到最火的 3 個 Python 量化框架\n")
+                continue
+            
+            # [AOS 7.2] CFO 授權與 ROI 評估
+            print("💰 [CFO] 正在評估自治任務 ROI...")
+            await asyncio.sleep(0.8)
+            mode = agent.economy.get_survival_mode()
+            tier = agent.economy.get_recommended_tier()
+            print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.50 全自治預算。")
+
+            try:
+                async with hot_mcp_env(agent, serverParams):
+                    async for chunk in agent.autonomous_execute(demand):
+                        print(chunk, end="", flush=True)
+                print("\n")
+            except Exception as e:
+                logger.error("自治模式异常: %s", e)
+                print(f"\n❌ 自治任务执行失败: {e}\n")
+            continue
+        elif userInput == "/skills":
+            # AOS 2.0: 查看技能状态
+            skills = agent.skill_manager.list_available()
+            print("\n📦 动态技能注册表:")
+            for s in skills:
+                icon = "🟢" if s["loaded"] else ("🟡" if s["always_loaded"] else "⚪")
+                print(f"  {icon} {s['name']}: {s['description']}")
+            print(f"  ───")
+            print(f"  🟢 已加载  🟡 自动加载  ⚪ 按需加载\n")
+            continue
+        elif userInput == "/schedule":
+            # AOS Phase 3: 查看定时任务
+            tasks = agent.scheduler.list_tasks()
+            if not tasks:
+                print("\n📅 暂无定时任务。可以自然语言对话创建，例如: '每天早上8点提醒我吃药'\n")
+            else:
+                print(f"\n📅 定时任务 ({len(tasks)} 个):")
+                for t in tasks:
+                    print(f"  ⏰ {t['task_id']}: {t['description']} | {t['cron']} | 下次: {t['next_trigger']} | 已执行: {t['run_count']}次")
+                print()
+            continue
+        elif userInput == "/wallet":
+            # AOS AEA: CFO 财务简报
+            print(agent.economy.get_financial_report())
+            # 最近交易
+            txs = agent.economy.get_recent_transactions(5)
+            if txs:
+                print("📜 最近交易:")
+                for tx in txs:
+                    print(f"  {tx['time']} | {tx['type']:>7} | {tx['amount']:>10} | {tx['description']}")
+            print()
+            continue
+        elif userInput.startswith("/inject "):
+            # AOS AEA: 注资
+            try:
+                amount = float(userInput[8:].strip())
+                agent.economy.inject_funds(amount)
+                # 同步到黑板
+                for key, val in agent.economy.get_blackboard_facts().items():
+                    agent.blackboard.write(key, val, author="CFO")
+                print(agent.economy.get_financial_report() + "\n")
+            except ValueError:
+                print("⚠️  请输入有效金额，例如: /inject 5.00\n")
+            continue
+        elif userInput == "/prune":
+            print("🧹 正在清理 Docker 资源...")
+            try:
+                result = agent.docker_sandbox.system_prune()
+                print(f"{result}\n")
+            except Exception as e:
+                print(f"❌ 清理异常: {e}\n")
+            continue
+        elif userInput == "/checkup":
+            print("\n📡 [AOS 4.0] 启动全量免疫扫描与自愈...")
+            try:
+                async with hot_mcp_env(agent, serverParams):
+                    report = await agent.run_checkup()
+            except (Exception, BaseExceptionGroup) as e:
+                logger.error("/checkup 执行异常: %s", e)
+                if isinstance(e, BaseExceptionGroup):
+                    print(f"\n❌ [免疫系统] 部分技能自检异常 ({len(e.exceptions)} 个):")
+                    for i, sub_e in enumerate(e.exceptions, 1):
+                        print(f"  {i}. {type(sub_e).__name__}: {sub_e}")
+                else:
+                    print(f"\n❌ [免疫系统] 执行失败: {e}")
+                print("\n")
+                continue
+
+            overall_value = str(report.get("overall", "UNSTABLE")) if isinstance(report, dict) else "UNSTABLE"
+            overall_status = "✅ HEALTHY" if overall_value == "HEALTHY" else "⚠️ UNSTABLE"
+            ts_value = report.get("timestamp", "N/A") if isinstance(report, dict) else "N/A"
+            details = report.get("details", []) if isinstance(report, dict) else []
+            if not isinstance(details, list):
+                details = []
+
+            print(f"\n📊 [诊断报告] 稳态: {overall_status}")
+            print(f"⏰ 时间: {ts_value}")
+            print("─" * 60)
+
+            for raw_detail in details:
+                detail = raw_detail if isinstance(raw_detail, dict) else {}
+                phys_ok = bool(detail.get("phys_ok", False))
+                handshake_ok = bool(detail.get("handshake_ok", False))
+
+                if phys_ok and handshake_ok:
+                    status_icon = "✅"
+                elif detail.get("healed"):
+                    status_icon = "🚑"
+                elif not phys_ok or not handshake_ok:
+                    status_icon = "❌"
+                else:
+                    status_icon = "⚪"
+
+                reason_val = detail.get("reason")
+                reason = f" | {reason_val}" if reason_val else ""
+                skill_name = str(detail.get("name", "unknown_skill"))
+                line = f"  {status_icon} {skill_name:<15} | 物理: {'OK' if phys_ok else 'ERR':<5} | 握手: {'OK' if handshake_ok else 'ERR':<5}{reason}"
+                print(line)
+
+            print("─" * 60 + "\n")
+            continue
+
+        # [AOS 7.0] Cold-Hot Isolation Protocol (冷热隔离协议)
+        # 彻底摒弃语义分诊，将主权交还给用户。
+        
+        # 1. 社交词/超短内容预处理
+        social_words = ["hi", "hello", "你好", "你是谁", "help", "帮助", "谢谢", "thanks"]
+        is_social = userInput.lower() in social_words or len(userInput) < 5
+        
+        # 2. 隔离路由
+        if is_social:
+            # 极速回复，不进记忆
+            print(f"\n🤖 Agent: 你好呀，我是道子！随时听候吩咐。如果是执行类任务，请使用 /auto 开头。")
+            continue
+
+        # 隐式 Cold Mode: 针对普通对话，锁定无工具权限
+        print(f"\n🤖 Agent: [Cold Mode] ", end="", flush=True)
+        try:
+            # [AOS 7.0] 物理限权：no_tools=True 确保 AI 只有嘴，没有手
+            chat_tier = "PREMIUM" if AGENT_MODE == "TURBO" else "LOCAL"
+            async for chunk in agent.chat(userInput, tier=chat_tier, no_tools=True):
+                print(chunk, end="", flush=True)
+            print("\n")
+        except Exception as e:
+            logger.error("对话异常: %s", e)
+            print(f"\n❌ 处理失败: {e}\n")
 
     # 退出前保存所有记忆
     await agent.saveAllMemories()
