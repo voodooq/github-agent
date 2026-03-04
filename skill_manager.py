@@ -66,6 +66,9 @@ class SkillManager:
         # AOS 3.3: 启动时自动初始化/更新基因库
         self._bootstrap_genes()
 
+        # [AOS 8.3] 并发加载锁：防止多个子专家同时 load_skill 触发重复 npx 冷启动
+        self._load_locks: dict[str, asyncio.Lock] = {}
+
     def _load_registry(self) -> None:
         """从 YAML 文件加载技能注册表"""
         if not os.path.exists(REGISTRY_PATH):
@@ -192,8 +195,16 @@ class SkillManager:
     async def load_skill(self, name: str, workspace_path: str | None = None) -> dict:
         """
         动态加载指定技能的 MCP 服务。
-        [AOS 2.7] 支持 workspace_path 硬约束：如果是 filesystem 技能，强制锁死其目录。
+        [AOS 8.3] 使用 per-skill 锁序列化并发请求，防止多个子专家同时冷启动同一 npx 进程。
         """
+        # 获取或创建该技能的专属锁
+        if name not in self._load_locks:
+            self._load_locks[name] = asyncio.Lock()
+        async with self._load_locks[name]:
+            return await self._load_skill_inner(name, workspace_path)
+
+    async def _load_skill_inner(self, name: str, workspace_path: str | None = None) -> dict:
+        """实际的技能加载逻辑（被锁保护）。"""
         if name in self.loaded_skills:
             # AOS 2.8.4/3.8.6: 路径校验逻辑。如果当前已加载技能的路径与请求的 workspace_path 不符，强制重载。
             current_args = getattr(self.loaded_skills[name], "last_args", [])
