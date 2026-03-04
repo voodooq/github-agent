@@ -199,9 +199,18 @@ class SkillManager:
             current_args = getattr(self.loaded_skills[name], "last_args", [])
             if name == "filesystem" and workspace_path:
                 target_abs = os.path.abspath(workspace_path)
-                # [Fix AOS 3.8.6] 修正索引：路径参数在 args 列表末尾，而不是 [0]
-                if not current_args or target_abs not in current_args:
-                    logger.info("🔄 [AOS 3.8.6] 检测到工作区变更，正在为技能 '%s' 重新授权物理路径...", name)
+                current_roots = [os.path.abspath(str(a)) for a in current_args if os.path.isabs(str(a))]
+
+                # [AOS 8.2] filesystem 重载优化：
+                # 只要目标路径已被某个已授权根目录覆盖（子目录关系），就无需重载。
+                # 避免每次切换到新子工作区都触发一次 npx 冷启动。
+                already_covered = any(
+                    target_abs == root or target_abs.startswith(root + os.sep)
+                    for root in current_roots
+                )
+
+                if not current_args or not already_covered:
+                    logger.info("🔄 [AOS 8.2] 检测到工作区超出当前授权矩阵，正在为技能 '%s' 重新授权物理路径...", name)
                     await self.unload_skill(name)
                 else:
                     return {"status": "already_loaded", "tools": len(self.loaded_skills[name].tools)}
@@ -301,8 +310,16 @@ class SkillManager:
             )
 
             # 等待初始化完成并获取成果
+            # [AOS 8.2] 防卡死补丁：增加启动等待超时，避免 session_future 无期限挂起
+            startup_timeout = float(config.get("startup_timeout", 90))
             try:
-                session, raw_tools = await session_future
+                session, raw_tools = await asyncio.wait_for(session_future, timeout=startup_timeout)
+            except asyncio.TimeoutError as e:
+                runner_task.cancel()
+                raise RuntimeError(
+                    f"技能 '{name}' 启动超时（>{int(startup_timeout)}s）。"
+                    f" command={resolved_cmd}, args={final_args[:6]}"
+                ) from e
             except Exception as e:
                 runner_task.cancel()
                 raise e

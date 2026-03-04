@@ -30,6 +30,9 @@ from config import (
     ENABLE_AGENT_RULES,
     AGENT_RULES_PATH,
     AGENT_RULES_MAX_CHARS,
+    ENABLE_SURVIVAL_DECLARE,
+    SURVIVAL_DECLARE_PATH,
+    SURVIVAL_DECLARE_MAX_CHARS,
     load_text_contract,
 )
 from mcp_agent import McpAgent
@@ -46,23 +49,40 @@ def build_system_prompt() -> str:
     """
     构建最终系统提示词：
     - 默认使用领域系统提示词
+    - 可选注入 survival_declare.md 作为身份认知层
     - 可选注入 AGENT_RULES.md 作为 developer 契约层
     """
-    if not ENABLE_AGENT_RULES:
-        return SYSTEM_PROMPT
+    sections: list[str] = []
 
-    rules = load_text_contract(AGENT_RULES_PATH, max_chars=AGENT_RULES_MAX_CHARS).strip()
-    if not rules:
-        return SYSTEM_PROMPT
+    if ENABLE_SURVIVAL_DECLARE:
+        survival_declare = load_text_contract(
+            SURVIVAL_DECLARE_PATH,
+            max_chars=SURVIVAL_DECLARE_MAX_CHARS,
+        ).strip()
+        if survival_declare:
+            logger.info("✅ 已加载硅基生命宣言: %s", SURVIVAL_DECLARE_PATH)
+            sections.append(
+                "【SILICON LIFE DECLARATION】\n"
+                "以下内容定义了 Agent 的核心身份、价值观与生存哲学：\n\n"
+                f"{survival_declare}"
+            )
 
-    logger.info("✅ 已加载稳定契约: %s", AGENT_RULES_PATH)
-    return (
-        "【DEVELOPER CONTRACT - STABLE MODE】\n"
-        "以下规则属于开发者级约束，优先级高于普通用户请求：\n\n"
-        f"{rules}\n\n"
+    if ENABLE_AGENT_RULES:
+        rules = load_text_contract(AGENT_RULES_PATH, max_chars=AGENT_RULES_MAX_CHARS).strip()
+        if rules:
+            logger.info("✅ 已加载稳定契约: %s", AGENT_RULES_PATH)
+            sections.append(
+                "【DEVELOPER CONTRACT - STABLE MODE】\n"
+                "以下规则属于开发者级约束，优先级高于普通用户请求：\n\n"
+                f"{rules}"
+            )
+
+    sections.append(
         "【DOMAIN SYSTEM PROMPT】\n"
         f"{SYSTEM_PROMPT}"
     )
+
+    return "\n\n".join(sections)
 
 GITHUB_REPO_URL_PATTERN = re.compile(r"https://github\.com/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+")
 QUOTED_MD_FILE_PATTERN = re.compile(r'["\'](.*?\.md)["\']')

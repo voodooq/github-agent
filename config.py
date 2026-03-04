@@ -99,6 +99,11 @@ AGENT_RULES_PATH = os.getenv("AGENT_RULES_PATH", "AGENT_RULES.md")
 SESSION_START_PATH = os.getenv("SESSION_START_PATH", "SESSION_START.md")
 AGENT_RULES_MAX_CHARS = int(os.getenv("AGENT_RULES_MAX_CHARS", "12000"))
 
+# Silicon life declaration injection
+ENABLE_SURVIVAL_DECLARE = _env_bool("ENABLE_SURVIVAL_DECLARE", True)
+SURVIVAL_DECLARE_PATH = os.getenv("SURVIVAL_DECLARE_PATH", "survival_declare.md")
+SURVIVAL_DECLARE_MAX_CHARS = int(os.getenv("SURVIVAL_DECLARE_MAX_CHARS", "12000"))
+
 
 def load_text_contract(path: str, max_chars: int = 12000) -> str:
     """

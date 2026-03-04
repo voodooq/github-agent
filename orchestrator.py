@@ -425,10 +425,41 @@ class Orchestrator:
         
         for skill_name in required_skills:
             self.blackboard.update_task(role_id, "RUNNING", f"加载技能: {skill_name}")
-            # [AOS 2.7+] 传入物理隔离的工作区路径
-            load_result = await self.skill_manager.load_skill(skill_name, workspace_path=self.workspace_path)
+
+            # [AOS 8.2] 加载可见性补丁：
+            # 将技能加载放入独立任务，每 5 秒输出一次心跳，避免“无输出像卡死”的错觉。
+            start_ts = time.time()
+            load_task = asyncio.create_task(
+                self.skill_manager.load_skill(skill_name, workspace_path=self.workspace_path)
+            )
+
+            while not load_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(load_task), timeout=5.0)
+                except asyncio.TimeoutError:
+                    elapsed = int(time.time() - start_ts)
+                    self.blackboard.update_task(
+                        role_id,
+                        "RUNNING",
+                        f"等待技能初始化: {skill_name} (已 {elapsed}s)"
+                    )
+
+            load_result = await load_task
+            elapsed = int(time.time() - start_ts)
+
             if load_result.get("status") == "error":
                 logger.warning("技能 %s 加载失败: %s", skill_name, load_result.get("message"))
+                self.blackboard.update_task(
+                    role_id,
+                    "RUNNING",
+                    f"技能加载失败: {skill_name} ({load_result.get('message', 'unknown')})"
+                )
+            else:
+                self.blackboard.update_task(
+                    role_id,
+                    "RUNNING",
+                    f"技能就绪: {skill_name} ({elapsed}s)"
+                )
 
         # 执行任务
         self.blackboard.update_task(role_id, "RUNNING", "正在执行任务...")
