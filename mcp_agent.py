@@ -139,6 +139,10 @@ class UnifiedClient:
         self.local_config = local_config
         self.agent_mode = agent_mode.upper()
         self.economy = economy
+        # Stable mode execution limits
+        self.command_timeout_seconds = 120
+        self.hang_timeout_seconds = 60
+        self.max_retry_per_call = 1
         
         # 检测可用性
         self.cloud_available = bool(cloud_config.get("api_key") and cloud_config.get("model"))
@@ -160,8 +164,8 @@ class UnifiedClient:
         self.cloud_client = AsyncOpenAI(
             api_key=cloud_config.get("api_key", "none"),
             base_url=base_url,
-            timeout=30,  # [AOS 2.8.7] 提升超时到 30s，减少网络波动导致的 CancelledError
-            max_retries=1,
+            timeout=self.command_timeout_seconds,
+            max_retries=self.max_retry_per_call,
         )
         
         # [AOS 2.1] 熔断机制：防止线上 API 抽风导致系统假死
@@ -188,7 +192,11 @@ class UnifiedClient:
         """惰性初始化并复用本地 HTTP 客户端。"""
         import httpx
         if self._local_http_client is None:
-            self._local_http_client = httpx.AsyncClient(timeout=180, proxy=None, trust_env=False)
+            self._local_http_client = httpx.AsyncClient(
+                timeout=self.command_timeout_seconds,
+                proxy=None,
+                trust_env=False
+            )
         return self._local_http_client
 
     async def close(self):
@@ -701,6 +709,31 @@ class McpAgent:
         self.self_upgrade_safe_mode = SELF_UPGRADE_SAFE_MODE
         self.self_upgrade_trusted = SELF_UPGRADE_TRUSTED
         self.self_upgrade_denylist = SELF_UPGRADE_DENYLIST
+
+    @staticmethod
+    def _format_stable_error(
+        symptom: str,
+        likely_causes: list[str] | None = None,
+        tried: list[str] | None = None,
+        next_action: str = "停止自动重试，等待人工决策",
+        rollback_status: str = "未回滚"
+    ) -> str:
+        """
+        稳定模式错误合同输出。
+        """
+        causes = likely_causes or ["未知原因，需进一步日志定位"]
+        attempted = tried or ["执行了单次调用并触发标准错误处理"]
+
+        cause_text = "\n".join([f"- {c}" for c in causes[:3]])
+        tried_text = "\n".join([f"- {t}" for t in attempted])
+
+        return (
+            f"1) Symptom: {symptom}\n"
+            f"2) Likely cause:\n{cause_text}\n"
+            f"3) What was already tried:\n{tried_text}\n"
+            f"4) Next safest action: {next_action}\n"
+            f"5) Rollback/checkpoint status: {rollback_status}"
+        )
 
         
     async def prepare_for_retry(self, blackboard: Blackboard):
@@ -1579,7 +1612,21 @@ class McpAgent:
                 logger.info("✅ [自升级重试] 回路重试成功: %s", func_name)
                 return retry_result
             else:
-                return f"工具执行错误: {error_msg}"
+                return self._format_stable_error(
+                    symptom=f"{func_name} 调用失败: {error_msg}",
+                    likely_causes=[
+                        "工具名不存在或未加载",
+                        "参数格式与工具 schema 不匹配",
+                        "底层 MCP/网络临时故障"
+                    ],
+                    tried=[
+                        "执行了标准工具调用",
+                        "触发了自动进化尝试",
+                        "执行了最多 1 次升级后重试"
+                    ],
+                    next_action="校验工具可用性与参数后再手动重试一次",
+                    rollback_status="未修改外部状态或未知（需结合工具类型确认）"
+                )
 
     def _normalize_tool_name(self, func_name: str) -> str:
         """
@@ -2540,12 +2587,37 @@ class McpAgent:
                 except Exception as e:
                     error_msg = str(e)
                     logger.error("子任务工具外层调用失败: %s - %s", funcName, error_msg)
-                    resultText = f"工具执行错误: {error_msg}"
+                    resultText = self._format_stable_error(
+                        symptom=f"{funcName} 外层调用异常: {error_msg}",
+                        likely_causes=[
+                            "工具执行路径发生运行时异常",
+                            "参数解析或路径锚定失败",
+                            "外部依赖（MCP/文件系统/网络）异常"
+                        ],
+                        tried=[
+                            "已走标准工具调用链",
+                            "已进入异常捕获并记录日志"
+                        ],
+                        next_action="停止盲重试，先检查同名工具与参数，再决定是否继续",
+                        rollback_status="未显式回滚"
+                    )
                     
                     # [AOS 2.9] 同错熔断检测：如果连续两次报完全相同的错，直接断电
                     recent_errors.append(error_msg)
                     if len(recent_errors) >= 2 and recent_errors[-1] == recent_errors[-2]:
-                        return f"🛑 [熔断警报] 子 Agent 陷入重复错误: {error_msg}。为保护 CFO 资金，强制停止探索！"
+                        return self._format_stable_error(
+                            symptom=f"重复错误熔断: {error_msg}",
+                            likely_causes=[
+                                "同一错误被重复触发，策略未产生位移",
+                                "当前任务上下文无法继续推进"
+                            ],
+                            tried=[
+                                "连续执行后捕获到相同错误",
+                                "触发重复错误熔断保护"
+                            ],
+                            next_action="暂停自动流程，人工决定是否切换策略或新会话重试",
+                            rollback_status="流程已中断，未执行额外回滚"
+                        )
 
                 current_tool_messages.append({
                     "role": "tool",

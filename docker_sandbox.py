@@ -5,10 +5,12 @@ import subprocess
 import shutil
 import logging
 import stat
+import time
 import urllib.request
 import urllib.error
 
 logger = logging.getLogger("mcp-agent")
+
 
 class DockerSandboxAgent:
     def __init__(self):
@@ -18,9 +20,11 @@ class DockerSandboxAgent:
         except Exception as e:
             logger.error(f"无法连接到 Docker: {e}")
             self.client = None
-            
+
         self.sandbox_dir = os.path.abspath("./sandbox_workspace")
         os.makedirs(self.sandbox_dir, exist_ok=True)
+        # project_name -> 实际源码路径（修复随机后缀导致的清理丢失）
+        self._project_dirs: dict[str, str] = {}
 
     def _on_rm_error(self, func, path, exc_info):
         """
@@ -36,26 +40,41 @@ class DockerSandboxAgent:
         except Exception as e:
             logger.debug(f"[_on_rm_error] 彻底删除失败 {path}: {e}")
 
-    def clone_repo(self, repo_url, project_name, workspace_path=None):
+    def clone_repo(self, repo_url, project_name, workspace_path=None, clone_timeout_sec: int = 120):
         """克隆仓库到沙盒目录，采用随机后缀防止路径冲突，或直接落盘到指定 workspace"""
         if workspace_path:
             # 如果指定了特定工作区，使用工作区内部按项目名建的子文件夹
-            project_dir = os.path.join(workspace_path, project_name.replace('/', '_'))
+            project_dir = os.path.join(workspace_path, project_name.replace("/", "_"))
         else:
             # 兼容老逻辑：在临时 sandbox_dir 下
             safe_name = f"{project_name.replace('/', '_')}_{random.randint(1000, 9999)}"
             project_dir = os.path.join(self.sandbox_dir, safe_name)
-        
+
         if os.path.exists(project_dir):
             try:
                 shutil.rmtree(project_dir, onerror=self._on_rm_error)
             except Exception as e:
                 logger.warning(f"无法清理预期路径 {project_dir}: {e}")
-        
+
         print(f"🚚 正在克隆仓库 {repo_url} 到 {project_dir}...")
-        result = subprocess.run(["git", "clone", "--depth", "1", repo_url, project_dir], capture_output=True, text=True)
+        try:
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", repo_url, project_dir],
+                capture_output=True,
+                text=True,
+                timeout=clone_timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"git clone 超时（>{clone_timeout_sec}s）"
+        except Exception as e:
+            return False, f"git clone 执行异常: {e}"
+
         if result.returncode != 0:
-            return False, result.stderr
+            err = result.stderr.strip() or result.stdout.strip() or "未知错误"
+            return False, err
+
+        # 记录真实路径，供 destroy_sandbox 精确清理
+        self._project_dirs[project_name] = project_dir
         return True, project_dir
 
     def deploy_in_sandbox(self, project_name, dockerfile_content, repo_url, workspace_path=None):
@@ -73,9 +92,9 @@ class DockerSandboxAgent:
         if not success:
             yield {"type": "error", "message": "代码克隆失败", "details": res}
             return
-            
+
         project_dir = res
-        
+
         # 2. 将大模型写好的 Dockerfile 写入本地临时目录
         dockerfile_path = os.path.join(project_dir, "Dockerfile")
         with open(dockerfile_path, "w", encoding="utf-8") as f:
@@ -85,7 +104,7 @@ class DockerSandboxAgent:
             # 3. 隔离构建镜像 (使用底层 API 获取流式日志)
             image_tag = f"agent-sandbox-{project_name.lower().replace('/', '-')}"
             yield {"type": "progress", "message": f"⏳ 正在构建隔离镜像 [{image_tag}]..."}
-            
+
             # 使用 API client 进行流式构建
             # decode=True 会自动将响应解析为字典
             build_error_details = ""
@@ -96,10 +115,12 @@ class DockerSandboxAgent:
                     rm=True,
                     decode=True
                 ):
-                    if 'stream' in chunk:
-                        yield {"type": "log", "message": chunk['stream'].strip()}
-                    elif 'error' in chunk:
-                        err_msg = chunk.get('errorDetail', {}).get('message', chunk['error'])
+                    if "stream" in chunk:
+                        line = chunk["stream"].strip()
+                        if line:
+                            yield {"type": "log", "message": line}
+                    elif "error" in chunk:
+                        err_msg = chunk.get("errorDetail", {}).get("message", chunk["error"])
                         build_error_details += err_msg + "\n"
                         yield {"type": "error", "message": "镜像构建失败 (Dockerfile 语法或依赖错误)", "details": err_msg}
             except Exception as build_ex:
@@ -107,7 +128,7 @@ class DockerSandboxAgent:
                 yield {"type": "error", "message": "镜像构建过程中断", "details": str(build_ex)}
 
             if build_error_details:
-                return # 发生过错误，不再继续启动容器，让上层去自愈
+                return  # 发生过错误，不再继续启动容器，让上层去自愈
 
             # 二次核对：确认镜像是否真的本地生成了，防止它跑到云端拉取提示无权限
             try:
@@ -119,16 +140,16 @@ class DockerSandboxAgent:
             # 4. 动态分配空闲端口并启动容器
             yield {"type": "progress", "message": "🚀 正在协商空闲端口并启动容器..."}
             container_name = f"sandbox_{project_name.lower().replace('/', '_')}_{random.randint(100, 999)}"
-            
+
             # 将宿主机端口设为 None，让 Docker 自动分配空闲端口
             # 基础映射常见的 Web 端口
             port_bindings = {
-                '80/tcp': None, 
-                '8080/tcp': None, 
-                '3000/tcp': None,
-                '5000/tcp': None
+                "80/tcp": None,
+                "8080/tcp": None,
+                "3000/tcp": None,
+                "5000/tcp": None
             }
-            
+
             container = self.client.containers.run(
                 image_tag,
                 detach=True,
@@ -138,27 +159,54 @@ class DockerSandboxAgent:
                 ports=port_bindings,
                 name=container_name
             )
-            
-            # 等待一会并刷新容器状态以获取分配的端口
-            container.reload()
-            
-            # 获取实际映射到的所有宿主机端口
-            host_ports = []
-            assigned_ports = container.ports
-            for container_port, host_bindings in assigned_ports.items():
-                if host_bindings:
-                    h_port = host_bindings[0]['HostPort']
-                    host_ports.append(f"{container_port} -> {h_port}")
-            
+
+            # 启动窗口：等待容器进入 running 并拿到端口映射，避免“秒回成功”假阳性
+            startup_deadline = time.time() + 20
+            assigned_ports = {}
+            last_status = "created"
+
+            while time.time() < startup_deadline:
+                container.reload()
+                last_status = container.status
+                assigned_ports = container.ports or {}
+                if last_status == "running" and assigned_ports:
+                    break
+                if last_status in ("exited", "dead"):
+                    break
+                time.sleep(1)
+
             # 获取运行日志片段以便排查
             try:
-                startup_logs = container.logs(tail=10).decode('utf-8', errors='replace')
-            except:
-                startup_logs = "无法获取运行日志"
+                startup_logs = container.logs(tail=30).decode("utf-8", errors="replace")
+            except Exception as e:
+                startup_logs = f"无法获取运行日志: {e}"
+
+            if last_status in ("exited", "dead"):
+                yield {
+                    "type": "error",
+                    "message": "容器启动后立即退出",
+                    "details": startup_logs
+                }
+                return
+
+            # 获取实际映射到的所有宿主机端口
+            host_ports = []
+            for container_port, host_bindings in assigned_ports.items():
+                if host_bindings:
+                    h_port = host_bindings[0]["HostPort"]
+                    host_ports.append(f"{container_port} -> {h_port}")
+
+            if not host_ports:
+                yield {
+                    "type": "error",
+                    "message": "容器已运行但未获得可用端口映射",
+                    "details": startup_logs
+                }
+                return
 
             yield {
                 "type": "success",
-                "message": f"✅ 项目已在沙盒中成功启动！",
+                "message": "✅ 项目已在沙盒中成功启动！",
                 "container_id": container.short_id,
                 "ports": host_ports,
                 "logs": startup_logs
@@ -179,24 +227,24 @@ class DockerSandboxAgent:
             container.reload()
             assigned_ports = container.ports or {}
 
-            for container_port, host_bindings in assigned_ports.items():
+            for _, host_bindings in assigned_ports.items():
                 if not host_bindings:
                     continue
-                host_port = host_bindings[0]['HostPort']
+                host_port = host_bindings[0]["HostPort"]
                 url = f"http://localhost:{host_port}/"
                 probe = {"port": host_port, "url": url}
                 try:
                     req = urllib.request.Request(url, method="GET")
                     with urllib.request.urlopen(req, timeout=timeout) as resp:
                         probe["status_code"] = resp.status
-                        body = resp.read(200).decode('utf-8', errors='replace')
+                        body = resp.read(200).decode("utf-8", errors="replace")
                         probe["body_preview"] = body
                         # 200 或 404（前端未挂载但后端活了）都算健康
                         if resp.status in (200, 404):
                             results["healthy"] = True
                 except urllib.error.HTTPError as e:
                     probe["status_code"] = e.code
-                    probe["body_preview"] = e.read(200).decode('utf-8', errors='replace') if e.fp else ""
+                    probe["body_preview"] = e.read(200).decode("utf-8", errors="replace") if e.fp else ""
                     # 500 说明应用启动了但内部有错（数据库等）
                     if e.code in (500, 502, 503):
                         probe["diagnosis"] = "应用已启动但内部报错，可能是数据库连接等问题"
@@ -218,24 +266,30 @@ class DockerSandboxAgent:
             # 1. 停止并删除容器
             try:
                 container = self.client.containers.get(container_id)
-                container.stop()
-                container.remove(v=True) 
+                container.stop(timeout=10)
+                container.remove(v=True)
             except Exception as e:
-                logger.warning(f"容器销毁失败(可能已由于 auto_remove 自动删除): {e}")
-            
+                logger.warning(f"容器销毁失败(可能已自动删除): {e}")
+
             # 2. 删除构建的专属镜像 (可选，根据磁盘压力决定)
             # image_tag = f"agent-sandbox-{project_name.lower().replace('/', '-')}"
             # try:
             #     self.client.images.remove(image_tag, force=True)
-            # except:
-            #     pass
-                
-            # 3. 清理本地临时源码
+            # except Exception as e:
+            #     logger.debug("镜像删除失败: %s", e)
+
+            # 3. 清理本地临时源码（优先使用真实路径映射，兼容历史 fallback）
+            candidate_paths = []
+            mapped = self._project_dirs.pop(project_name, None)
+            if mapped:
+                candidate_paths.append(mapped)
             safe_name = project_name.replace("/", "_")
-            project_dir = os.path.join(self.sandbox_dir, safe_name)
-            if os.path.exists(project_dir):
-                shutil.rmtree(project_dir, onerror=self._on_rm_error)
-                
+            candidate_paths.append(os.path.join(self.sandbox_dir, safe_name))
+
+            for project_dir in candidate_paths:
+                if project_dir and os.path.exists(project_dir):
+                    shutil.rmtree(project_dir, onerror=self._on_rm_error)
+
             return {"status": "success", "message": "✅ 沙盒已彻底销毁，本地资源已释放"}
         except Exception as e:
             return {"status": "error", "message": f"清理失败: {str(e)}"}
@@ -244,13 +298,14 @@ class DockerSandboxAgent:
         """
         全局大扫除：清理所有悬空镜像、停止的容器以及本地源码缓存
         """
-        if not self.client: return
-        
+        if not self.client:
+            return "Docker 客户端不可用，跳过 system_prune"
+
         # 1. Docker 资源清理
         self.client.containers.prune()
-        self.client.images.prune() 
+        self.client.images.prune()
         self.client.networks.prune()
-        
+
         # 2. 本地源码清理
         if os.path.exists(self.sandbox_dir):
             try:
@@ -261,25 +316,29 @@ class DockerSandboxAgent:
                 local_msg = f"，但本地源码清理失败: {e}"
         else:
             local_msg = ""
-            
+
+        self._project_dirs.clear()
         return f"✅ 宿主机 Docker 垃圾清理完成{local_msg}"
 
     def cleanup_all(self):
         """退出时清理所有正在运行的沙盒容器"""
-        if not self.client: return
+        if not self.client:
+            return
         containers = self.client.containers.list(all=True)
         for c in containers:
             if c.name.startswith("sandbox_"):
                 try:
                     print(f"💀 发现残留容器 {c.name}，正在回收...")
-                    c.stop()
+                    c.stop(timeout=10)
                     c.remove(v=True)
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning("残留容器回收失败 %s: %s", c.name, e)
         # 清理临时目录
         if os.path.exists(self.sandbox_dir):
             try:
                 shutil.rmtree(self.sandbox_dir, onerror=self._on_rm_error)
                 os.makedirs(self.sandbox_dir, exist_ok=True)
-            except:
-                pass
+            except Exception as e:
+                logger.warning("临时目录清理失败: %s", e)
+
+        self._project_dirs.clear()

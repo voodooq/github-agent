@@ -5,9 +5,12 @@
 
 import os
 import shutil
+import logging
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+
+logger = logging.getLogger(__name__)
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -89,3 +92,33 @@ SELF_UPGRADE_TRUSTED = [x.strip() for x in os.getenv("SELF_UPGRADE_TRUSTED", "")
 SELF_UPGRADE_DENYLIST = [x.strip() for x in os.getenv("SELF_UPGRADE_DENYLIST", "").split(",") if x.strip()]
 SELF_UPGRADE_RETRY_ORIGINAL_CALL = _env_bool("SELF_UPGRADE_RETRY_ORIGINAL_CALL", True)
 EVOLUTION_AUDIT_LOG_PATH = os.getenv("EVOLUTION_AUDIT_LOG_PATH", "memories/evolution_audit.log")
+
+# Stable rules injection
+ENABLE_AGENT_RULES = _env_bool("ENABLE_AGENT_RULES", True)
+AGENT_RULES_PATH = os.getenv("AGENT_RULES_PATH", "AGENT_RULES.md")
+SESSION_START_PATH = os.getenv("SESSION_START_PATH", "SESSION_START.md")
+AGENT_RULES_MAX_CHARS = int(os.getenv("AGENT_RULES_MAX_CHARS", "12000"))
+
+
+def load_text_contract(path: str, max_chars: int = 12000) -> str:
+    """
+    安全读取文本契约文件。
+    - 文件不存在/读取失败时返回空串，不中断启动流程
+    - 超长内容自动截断，避免撑爆上下文
+    """
+    p = (path or "").strip()
+    if not p:
+        return ""
+    if not os.path.exists(p):
+        logger.warning("契约文件不存在，跳过加载: %s", p)
+        return ""
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            content = f.read()
+        if len(content) > max_chars:
+            logger.warning("契约文件过长，已截断: %s (%d -> %d)", p, len(content), max_chars)
+            content = content[:max_chars] + "\n...[TRUNCATED]"
+        return content
+    except Exception as e:
+        logger.warning("契约文件读取失败，跳过加载: %s | %s", p, e)
+        return ""

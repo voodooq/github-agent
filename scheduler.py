@@ -33,26 +33,39 @@ def _parse_simple_cron(cron_expr: str) -> dict:
     # 每 N 分钟: "*/5" -> 每 5 分钟
     if cron_expr.startswith("*/"):
         interval_min = int(cron_expr[2:])
+        if interval_min <= 0:
+            raise ValueError("间隔分钟必须 > 0")
         return {"type": "interval", "minutes": interval_min}
 
     # 每天定时: "08:30" -> 每天 08:30
     if ":" in cron_expr and " " not in cron_expr:
         parts = cron_expr.split(":")
-        return {"type": "daily", "hour": int(parts[0]), "minute": int(parts[1])}
+        hour = int(parts[0])
+        minute = int(parts[1])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("daily 时间超出范围，应为 00:00~23:59")
+        return {"type": "daily", "hour": hour, "minute": minute}
 
     # 标准 5 段 cron: "0 * * * *" -> 每小时 / "0 8 * * *" -> 每天 8 点
     parts = cron_expr.split()
     if len(parts) == 5:
         minute = parts[0]
         hour = parts[1]
-        
+
         # 每小时: "0 * * * *"
         if minute != "*" and hour == "*":
-            return {"type": "hourly", "minute": int(minute)}
-            
+            minute_int = int(minute)
+            if not (0 <= minute_int <= 59):
+                raise ValueError("hourly 分钟超出范围，应为 0~59")
+            return {"type": "hourly", "minute": minute_int}
+
         # 每天: "0 8 * * *"
         if minute != "*" and hour != "*":
-            return {"type": "daily", "hour": int(hour), "minute": int(minute)}
+            minute_int = int(minute)
+            hour_int = int(hour)
+            if not (0 <= hour_int <= 23 and 0 <= minute_int <= 59):
+                raise ValueError("daily 时间超出范围，应为 00:00~23:59")
+            return {"type": "daily", "hour": hour_int, "minute": minute_int}
         
         # 通配每分钟: "* * * * *"
         if minute == "*" and hour == "*":
@@ -121,6 +134,10 @@ class Scheduler:
         self.tasks: dict[str, ScheduledTask] = {}
         self._running = False
         self._background_task: asyncio.Task | None = None
+        # 正在执行中的任务，防止长任务被重复触发
+        self._inflight_task_ids: set[str] = set()
+        # 单任务执行超时（秒），避免心跳被慢任务拖垮
+        self._task_timeout_sec = 20
         # 可注册的动作执行器（消息推送通道）
         self._action_handlers: dict[str, Callable[[str], Awaitable[None]]] = {}
         self._init_db()
@@ -311,6 +328,18 @@ class Scheduler:
         except Exception as e:
             logger.error("⏰ [调度器] 任务 %s 执行失败: %s", task.task_id, e)
 
+    async def _execute_task_with_timeout(self, task: ScheduledTask) -> None:
+        """带超时和并发保护的任务执行包装器"""
+        self._inflight_task_ids.add(task.task_id)
+        try:
+            await asyncio.wait_for(self._execute_task(task), timeout=self._task_timeout_sec)
+        except asyncio.TimeoutError:
+            logger.error("⏰ [调度器] 任务 %s 执行超时(%ss)，已跳过本轮", task.task_id, self._task_timeout_sec)
+        except Exception as e:
+            logger.error("⏰ [调度器] 任务 %s 执行异常(包装器): %s", task.task_id, e)
+        finally:
+            self._inflight_task_ids.discard(task.task_id)
+
     async def _tick_loop(self) -> None:
         """后台心跳循环"""
         while self._running:
@@ -351,7 +380,13 @@ class Scheduler:
                             should_fire = True
 
                     if should_fire:
-                        await self._execute_task(task)
+                        if task.task_id in self._inflight_task_ids:
+                            logger.warning("⏰ [调度器] 任务 %s 仍在执行中，跳过重复触发", task.task_id)
+                        else:
+                            asyncio.create_task(
+                                self._execute_task_with_timeout(task),
+                                name=f"SchedulerTask-{task.task_id}"
+                            )
 
                 except Exception as e:
                     logger.error("⏰ [调度器] 任务 %s 调度异常: %s", task.task_id, e)
@@ -363,7 +398,7 @@ class Scheduler:
         if self._running:
             return
         self._running = True
-        self._background_task = asyncio.ensure_future(self._tick_loop())
+        self._background_task = asyncio.create_task(self._tick_loop(), name="SchedulerTickLoop")
         task_count = len(self.tasks)
         logger.info("💓 [调度器] 后台心跳已启动 (%d 个任务)", task_count)
         if task_count > 0:

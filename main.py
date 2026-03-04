@@ -27,6 +27,10 @@ from config import (
     MEMORY_FILE,
     AGENT_MODE,
     TOKEN_BUDGET,
+    ENABLE_AGENT_RULES,
+    AGENT_RULES_PATH,
+    AGENT_RULES_MAX_CHARS,
+    load_text_contract,
 )
 from mcp_agent import McpAgent
 from prompts import GITHUB_SEARCH_PROMPT, SEARCH_PROMPT_TEMPLATE, ANALYZE_PROMPT_TEMPLATE
@@ -34,8 +38,31 @@ from prompts import GITHUB_SEARCH_PROMPT, SEARCH_PROMPT_TEMPLATE, ANALYZE_PROMPT
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# NOTE: 使用 GitHub 专用 System Prompt 替代通用 prompt
+# NOTE: 使用 GitHub 专用 System Prompt + 可注入的开发者契约
 SYSTEM_PROMPT = GITHUB_SEARCH_PROMPT
+
+
+def build_system_prompt() -> str:
+    """
+    构建最终系统提示词：
+    - 默认使用领域系统提示词
+    - 可选注入 AGENT_RULES.md 作为 developer 契约层
+    """
+    if not ENABLE_AGENT_RULES:
+        return SYSTEM_PROMPT
+
+    rules = load_text_contract(AGENT_RULES_PATH, max_chars=AGENT_RULES_MAX_CHARS).strip()
+    if not rules:
+        return SYSTEM_PROMPT
+
+    logger.info("✅ 已加载稳定契约: %s", AGENT_RULES_PATH)
+    return (
+        "【DEVELOPER CONTRACT - STABLE MODE】\n"
+        "以下规则属于开发者级约束，优先级高于普通用户请求：\n\n"
+        f"{rules}\n\n"
+        "【DOMAIN SYSTEM PROMPT】\n"
+        f"{SYSTEM_PROMPT}"
+    )
 
 GITHUB_REPO_URL_PATTERN = re.compile(r"https://github\.com/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+")
 QUOTED_MD_FILE_PATTERN = re.compile(r'["\'](.*?\.md)["\']')
@@ -154,6 +181,7 @@ async def hot_mcp_env(agent, serverParams):
             yield session
 async def main():
     """主函数：初始化 Agent → 连接 MCP → 交互循环"""
+    final_system_prompt = build_system_prompt()
     agent = McpAgent(
         cloud_config={
             "api_key": CLOUD_API_KEY,
@@ -165,7 +193,7 @@ async def main():
             "base_url": LOCAL_BASE_URL,
             "model": LOCAL_MODEL,
         },
-        systemPrompt=SYSTEM_PROMPT,
+        systemPrompt=final_system_prompt,
         mode=AGENT_MODE,
     )
 
