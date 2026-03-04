@@ -407,7 +407,12 @@ class Orchestrator:
             for dep in depends:
                 dep_key = f"_task_done_{dep}"
                 # [AOS 2.9.3] 放宽超时至 10 分钟，确保本地慢速模型或长耗时抓取能跑完
-                result = await self.blackboard.wait_for(dep_key, timeout=600.0)
+                try:
+                    result = await self.blackboard.wait_for(dep_key, timeout=600.0)
+                except asyncio.CancelledError:
+                    self.blackboard.update_task(role_id, "FAILED", f"任务取消：等待前置 {dep} 时收到中断信号")
+                    self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
+                    raise
                 if result is None:
                     self.blackboard.update_task(role_id, "FAILED", f"前置 {dep} 超时未完成")
                     return f"[{role_id}] 失败：前置任务 {dep} 超时"
@@ -544,6 +549,12 @@ class Orchestrator:
 
             return result_text
 
+        except asyncio.CancelledError:
+            cancel_msg = "执行中断：收到取消信号"
+            self.blackboard.update_task(role_id, "FAILED", cancel_msg)
+            self.blackboard.write(f"error_{role_id}", cancel_msg, author=role_id)
+            self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
+            raise
         except Exception as e:
             error_msg = f"执行异常: {str(e)}"
             self.blackboard.update_task(role_id, "FAILED", error_msg)
@@ -1163,7 +1174,11 @@ class Orchestrator:
 
             for agent_config, result in zip(sub_agents, results):
                 role_id = agent_config["role_id"]
-                if isinstance(result, Exception):
+                if isinstance(result, asyncio.CancelledError):
+                    agent_results[role_id] = "执行中断: 任务被取消"
+                    yield f"  🛑 {role_id}: 中断 - 收到取消信号\n"
+                    raise result
+                if isinstance(result, BaseException):
                     agent_results[role_id] = f"执行异常: {str(result)}"
                     yield f"  ❌ {role_id}: 异常 - {str(result)}\n"
                 else:

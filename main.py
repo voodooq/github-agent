@@ -541,6 +541,9 @@ async def main():
                     async for chunk in agent.autonomous_execute(demand):
                         print(chunk, end="", flush=True)
                 print("\n")
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                logger.info("自治任务被用户中断")
+                print("\n🛑 自治任务已取消（用户中断）\n")
             except Exception as e:
                 logger.error("自治模式异常: %s", e)
                 print(f"\n❌ 自治任务执行失败: {e}\n")
@@ -679,4 +682,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 程序已中断退出")

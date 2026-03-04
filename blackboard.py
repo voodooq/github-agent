@@ -143,6 +143,9 @@ class Blackboard:
         try:
             await asyncio.wait_for(self._events[key].wait(), timeout=timeout)
             return self.facts.get(key, {}).get("value")
+        except asyncio.CancelledError:
+            logger.info("🛑 [黑板] 等待 '%s' 被取消，正在向上游传播取消信号", key)
+            raise
         except asyncio.TimeoutError:
             # 防御补丁 #1: 超时降级 — 向错误队列抛出详细诊断信息
             error_msg = f"等待 '{key}' 严重超时 ({timeout:.0f}s)，前置任务疑似失败或崩溃"
