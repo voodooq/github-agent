@@ -1,78 +1,55 @@
-# 🚀 OpenClaw GitHub Agent (AOS 7.2)
+# 🚀GitHub Agent OS(AOS 8.0 - Blitz Edition)
 
-基于 **AOS (Agentic OS)** 架构的混合算力多专家 GitHub 协同平台。它不仅仅是一个搜索工具，而是一个具备**经济意识 (CFO)**、**沙盒环境 (Docker)** 和**物理隔离 (Workspace)** 的全自治 Agent 系統。
-
----
-
-## 🌟 AOS 7.2 核心特性
-
-- **📂 物理隔離工作區 (Workspace)**：所有 `/search`, `/analyze`, `/review` 操作都會在獨立、帶時間戳的沙盒目錄中執行，確保數據互不干擾。
-- **💰 CFO 經濟引擎 (AEA)**：內置錢包、ROI 評估與算力路由。根據餘額自動切換生存模式（飢餓/溫飽/土豪），預算不足自動降級本地模型。
-- **🛡️ 專家團橫向對比**：支持同時對比多個 GitHub 項目，提供專業的評分矩陣（UX、架構、安全、活躍度）並給出明確推薦。
-- **🚀 智能文件感官**：`/analyze` 和 `/review` 具備路徑識別與文件內容讀取能力，能自動從搜索報告中提取 URL 進行批量處理。
-- **📦 Docker 沙盒部署**：支持 `/deploy` 一鍵將開源項目構建並部署至隔離容器，自動生成 Dockerfile 並進行自愈檢查。
-- **📅 自治調度器**：內置 Scheduler，支持自然語言預約任務（如“每天早上 8 點複盤量化框架”）。
+基于 **AOS (Agentic OS)** 架构的极速、高可用 GitHub 协同平台。AOS 8.0 引入了全新的 **Blitz 性能引擎**，通过极致的架构瘦身与并行预热，实现了任务周转效率的质变。
 
 ---
 
-## 🛠️ 命令矩陣 (AOS 指令集)
+## 🌟 AOS 8.0 核心特性 (Blitz Edition)
 
-| 指令 | 描述 | 優點 |
+- **⚡ 单兵快路径 (Fast-lane)**：针对极简指令（查询、清理）自动跳过 DoD 生成与招聘流程，实现 **5s 级** 极速首响。
+- **🔥 并发技能预温 (Concurrent Warm-up)**：任务启动瞬态并行初始化 `filesystem`, `github`, `scrape` 等 MCP 技能，消除了子任务冷启动的同步等待。
+- **⚖️ 精准语义审计 (Selective Audit)**：物理判定任务属性，对于纯操作类任务只需客观断言通过即刻结项，节省大量云端 LLM 裁判开销。
+- **📂 物理隔离工作区 (Workspace)**：由 `AOS 7.x` 延续的隔离机制，所有分析、部署都在带时间戳的沙盒中执行，严禁交叉污染。
+- **💰 AEA 2.0 经济引擎**：内置智能算力路由，根据余额自动在 `PREMIUM` (高智商云端) 与 `LOCAL` (极速本地) 间动态升降档。
+- **🛡️ 状态自愈消磁**：针对失败任务实施“按需消磁”，物理重置故障专家标志，支持断点续传且杜绝“假成功”残留。
+
+---
+
+## 🏗️ 性能指标 (SLA)
+
+| 任务类型 | 平均延迟 (P50) | 优化点 |
 | :--- | :--- | :--- |
-| `/search <需求>` | 授權檢索與排名矩陣 | 帶預算的深度調研，自動導出 `ranking_data.json` |
-| `/analyze <URL/文件>` | 精準代碼審計與對比 | 支持讀取本地文件提取 URL，自動生成橫向對比報告 |
-| `/review <URL/文件>` | 混合算力專家團聯合評審 | 5 大專家（架構/安全/UX/DevOps/生命力）併發審計 |
-| `/deploy <URL>` | 一鍵 Docker 沙盒化部署 | 自動環境檢測、鏡像構建、映射運行 |
-| `/auto <需求>` | **Hot Mode** 全自治任務 | AI 自主拆解、招聘專家、執行、歸檔 |
-| `/bb` | 📖 黑板報告 | 查看任務事實、時間軸與物理證據鏈 |
-| `/wallet` | 💰 財務簡報 | 查看當前餘額、日燃燒率、預估跑道 (Runway) |
-| `/checkup` | 🛡️ 全量免疫掃描 | AOS 4.0 系統自檢與動態技能自愈 |
+| 查询类 (Status/Check) | **< 8s** | 命中 Fast-lane，跳过繁琐会议 |
+| 分析类 (Analyze/Audit) | **< 90s** | 后台预加载技能，并发专家审计 |
+| 部署类 (Deploy/Action) | **< 150s** | Docker 沙盒自愈 + 物理收据核验 |
 
 ---
 
-## 🏗️ 物理隔離協議 (Isolation Protocol)
+## 🛠️ 指令矩阵
 
-所有執行結果（報告、數據、鏡像配置）均鎖定在本地 `Workspace/` 目錄下：
-```text
-Workspace/
-├── Search/    # 存儲檢索報告與 ranking_data.json
-├── Analyze/   # 存儲代碼審計報告與多項目對比
-├── Review/    # 存儲專家團聯手彙報的 review_report.md
-└── Deploy/    # 存儲生成的 Dockerfile 與佈署日誌
-```
-> **注意**：該目錄已被列入 `.gitignore`，確保您的隱私數據和分析報告不會洩露至公有倉庫。
-
----
-
-## 🚀 快速開始
-
-### 1. 依賴安裝
-```bash
-pip install -r requirements.txt
-```
-
-### 2. 環境配置
-複製 `.env.example` 為 `.env`，配置您的 `GITHUB_TOKEN` 以及 LLM API Key。
-
-### 3. 動算力分配 (CFO 策略)
-在 `.env` 中設置預計初始金：
-`AEA_INITIAL_BALANCE=10.0`
-Agent 會根據餘額自動在 `PREMIUM` (雲端) 和 `LOCAL` (本地) 算力間切換。
-
----
-
-## 🧠 專家團組成
-
-| 專業維度 | 算力傾向 | 核心觀察點 |
+| 指令 | 描述 | 模式 |
 | :--- | :--- | :--- |
-| **UX/DX** | LOCAL | 文檔友好度、上手門檻、API 易用性 |
-| **DevOps** | LOCAL | CI/CD 支持、Docker 友好性、構建鏈 |
-| **Security** | PREMIUM | 硬編碼、依賴缺陷、靜態漏洞 (SAST) |
-| **Arch** | PREMIUM | 擴展性、模式設計、並發設計 |
-| **Liveliness**| LOCAL | 修 commit 頻率、Issue 響應速度 |
+| `/auto <需求>` | **全自治任务** | 自动分诊 (L1 Blitz / L2 Expert)，闭环交付 |
+| `/search <需求>` | **深度调研** | 带预算的检索与排名，自动导出 JSON 报告 |
+| `/analyze <URL/文件>` | **分层审计** | 支持本地/远程、物理证据提取、横向对比 |
+| `/deploy <URL>` | **沙盒部署** | 一键 Docker 化构建，带环境自愈检查 |
+| `/bb` | **黑板/收据** | 查看物理证据链、任务时间轴与事实记录 |
+| `/wallet` | **财务快报** | 查看余额、日耗、预估跑道 (Runway) |
+
+---
+
+## 🚀 极速开始
+
+1. **依赖安装**
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. **环境配置**
+   复制 `.env.example` 为 `.env`，填入 `GITHUB_TOKEN` 及 LLM API。
+3. **性能微调**
+   在 `.env` 中设置 `AOS_ENABLE_FAST_VERIFY=True` 开启 P1 极速验证模式。
 
 ---
 
 ## 🔗 License
-
-MIT License. 基於開源協議保護。
+MIT License. 极致自治，代码护航。

@@ -413,7 +413,8 @@ class UnifiedClient:
             count = 1
             while True:
                 await asyncio.sleep(10)
-                print(f"⏳ ... 正在生成中 (已运行 {count*10}s) ...")
+                # [AOS P0] 移除冗余心跳
+                # print(f"⏳ ... 正在生成中 (已运行 {count*10}s) ...")
                 count += 1
         for label in order:
             try:
@@ -642,6 +643,10 @@ from config import (
     SELF_UPGRADE_SAFE_MODE,
     SELF_UPGRADE_TRUSTED,
     SELF_UPGRADE_DENYLIST,
+    AUTO_FAST_MODE,
+    AUTO_MAX_TURNS,
+    AUTO_MAX_TOOL_CALLS,
+    AUTO_TIMEOUT_SECONDS,
 )
 from skill_manager import SkillManager
 from blackboard import Blackboard
@@ -2224,10 +2229,11 @@ class McpAgent:
             exp_engine=self.exp_engine, # AOS 2.4+: 共享经验引擎实例
         )
         # run_mission 内部已集成 _setup_action_workspace
+        auto_rounds = 1 if AUTO_FAST_MODE else 3
         async for chunk in orchestrator.run_mission(
             user_demand=user_demand,
             primary_session=self.session,
-            max_rounds=3,
+            max_rounds=auto_rounds,
         ):
             yield chunk
 
@@ -2272,7 +2278,7 @@ class McpAgent:
         tier: str = "LOCAL",
         workspace_path: str | None = None,
         tools: list | None = None,
-        max_iterations: int = 10 # [AOS 5.4] 支持外部指定循环上限
+        max_iterations: int = 6 # [AOS P0] 默认迭代从 10 缩减至 6
     ) -> str:
         """
         核心 ReAct 循环：
@@ -2306,7 +2312,15 @@ class McpAgent:
         # 针对该任务重置预算
         self.token_budget.reset()
         
-        MAX_ITERATIONS = max_iterations # [AOS 5.4] 真值对齐：支持外部强制关断
+        MAX_ITERATIONS = max_iterations # [AOS P0] 物理强制对齐
+        is_auto_workspace = bool(effective_workspace and f"{os.sep}Auto{os.sep}" in effective_workspace)
+        is_auto_flow = AUTO_FAST_MODE and (is_auto_workspace or context_id.startswith("task_") or context_id.startswith("auto_"))
+        if is_auto_flow:
+            MAX_ITERATIONS = min(MAX_ITERATIONS, max(1, int(AUTO_MAX_TURNS)))
+        run_started_at = time.time()
+        total_tool_calls = 0
+        max_tool_calls = max(1, int(AUTO_MAX_TOOL_CALLS)) if is_auto_flow else 10**9
+        timeout_seconds = max(30, int(AUTO_TIMEOUT_SECONDS)) if is_auto_flow else 10**9
         call_history = []
         bb_read_tracker: dict[str, int] = {}  # {call_sig: 连续无变化次数}
         bb_last_result: dict[str, str] = {}   # {call_sig: 上次返回值}
@@ -2319,6 +2333,8 @@ class McpAgent:
         
         current_max = MAX_ITERATIONS
         for iteration in range(100): # 物理硬上限，逻辑上限由 current_max 控制
+            if time.time() - run_started_at > timeout_seconds:
+                return fullContent + f"\n\n⏱️ [AUTO_FAST] 执行超时（>{timeout_seconds}s），已强制收敛返回当前结果。"
             if iteration >= current_max:
                 break
             # [AOS 4.5] 极速闭环：记录执行前的黑板指纹快照
@@ -2352,8 +2368,11 @@ class McpAgent:
             db_hash_before = self.scheduler.get_state_snapshot() if hasattr(self, "scheduler") else "none"
             
             # 使用流式生成并累积结果（复用流量控制与模型降级逻辑）
+            current_tier = tier
+            if is_auto_flow and tier == "PREMIUM" and iteration >= 2:
+                current_tier = "LOCAL"
             response_stream = self.unified_client.generate_stream(
-                tier=tier,
+                tier=current_tier,
                 messages=pruned_history,
                 tools=current_tools if iteration < MAX_ITERATIONS - 1 else None # 最后一步禁用工具
             )
@@ -2413,8 +2432,8 @@ class McpAgent:
             
             # 如果没有工具调用，说明任务执行到阶段性终点
             if not toolCallsDict:
-                # 🚨 AOS 3.9.8/3.9.9: 反演戏拦截器 (Anti-Simulation Interceptor)
-                # 凡是带有模拟操作的代码块但没有任何真实 tool call，直接视为骗局拦截
+                                # [AOS P0] 拦截器分级架构 (Interceptor Triage)
+                # 核心拦截器：反演戏拦截器 (Anti-Simulation Interceptor) - 全模式开启
                 import re
                 simulation_keywords = ["[工具返回结果]", "模拟抓取结果", "仿真测试", "假设执行"]
                 is_simulation = False
@@ -2432,58 +2451,49 @@ class McpAgent:
                     error_msg = "⚠️ [反演戏拦截] 检测到模拟演戏或幻觉捏造特征 (Simulation Trap)！如果你想获取数据或执行命令，必须调用系统提供的真实工具。绝对不允许仅仅输出假设结果而不执行工具。"
                     logger.warning(error_msg)
                     
-                    # [AOS 3.10.1] 幻觉连坐清除 (Simulation Trap Cleanup)
-                    # 识别子专家 ID 并强制清空其黑板存档，防止 stale checkpoint 误导 Orchestrator
                     if context_id.startswith("task_"):
                         role_id = context_id[5:]
                         keys_to_clear = [f"_task_done_{role_id}", f"result_{role_id}", f"error_{role_id}"]
                         for k in keys_to_clear:
-                            self.blackboard.write(k, None) # 彻底注销该键值
+                            self.blackboard.write(k, None) 
                         logger.info("🧹 [AOS 3.10.1] 已清除子专家 '%s' 的残留黑板证据，强制下一轮重跑", role_id)
 
                     self.memories[context_id].append({"role": "user", "content": error_msg})
-                    continue # 强制退回并要求重新执行真实工具
+                    continue 
 
-                # [AOS 6.3] 逻辑欺诈拦截 (Tool-Sign Mandate)
-                if context_id == "blitz_direct" and not toolCallsDict:
-                    # 1. 检测伪代码块 (Pseudo-Code Detection)
+                # 增强型拦截器：仅在 Blitz (L1) 或 LOCAL 模式下开启，减少 Expert 模式空转
+                is_blitz = context_id.startswith("blitz_") or tier == "LOCAL"
+                if is_blitz:
+                    # [AOS 6.3] 逻辑欺诈拦截 (Tool-Sign Mandate)
                     pseudo_code_indicators = ["```python", "```bash", "```javascript", "def ", "import ", "const ", "with open"]
                     has_pseudo_code = any(indicator in fullContent for indicator in pseudo_code_indicators)
-                    
-                    # 2. 检测推卸辞令 (Advice/Apology Detection)
                     advice_keywords = ["可以使用", "可以直接", "建议你", "参考代码", "由于我无法", "抱歉", "sorry"]
                     has_loitering = any(kw in fullContent for kw in advice_keywords)
-
-                    # 逻辑欺诈判定：写了代码但没有任何工具调用标识
                     is_logical_fraud = has_pseudo_code and not toolCallsDict
 
                     if is_logical_fraud or has_loitering or (has_pseudo_code and len(fullContent) > 80):
-                        logger.warning(f"🚨 [AOS 6.3 Tool-Sign Mandate] 拦截到专家 {context_id} 的‘逻辑欺诈’尝试。")
+                        logger.warning(f"🚨 [AOS P0] 拦截到 Blitz 专家的‘逻辑欺察’尝试。")
                         fraud_feedback = (
                             "🚨 [内核指令：逻辑欺诈拦截] 严禁在 BLITZ 模式下编写代码块或提供文档建议！\n"
-                            "你当前的任务是【执行】，禁止通过文字进行‘教学’或‘演示’。必须且只能调用实弹工具（如 add_scheduled_task）。\n"
-                            "立刻清除所有 Markdown 代码块，直接输出工具调用指令。多说一个字即视为内核逻辑死锁。"
+                            "你当前的任务是【执行】，禁止通过文字进行‘教学’或‘演示’。必须且只能调用实弹工具。\n"
+                            "立刻清除所有 Markdown 代码块，直接输出工具调用指令。"
                         )
                         self.memories[context_id].append({"role": "user", "content": fraud_feedback})
-                        continue # 强制重写
-
-                # [AOS 6.2] 多维零增量拦截 (Multi-Dim Guard)：指纹、DB 与物理增量核对
-                hash_after = self.blackboard.get_snapshot_hash()
-                db_hash_after = self.scheduler.get_state_snapshot() if hasattr(self, "scheduler") else "none"
-                
-                # 判定是否有任何维度的物理产出
-                has_fs_delta = len(self._get_workspace_delta(iteration_start_files, workspace_override=effective_workspace)) > 0
-                has_bb_delta = hash_before != hash_after
-                has_db_delta = db_hash_before != db_hash_after
-                
-                # 如果没有任何物理变化且非单纯对话，拦截
-                if not toolCallsDict and not (has_fs_delta or has_bb_delta or has_db_delta):
-                    # 允许极简的确认信息通过，但禁止长篇大论的“假报告”
-                    if len(fullContent) > 80:
-                        logger.warning(f"⚠️ [极速拦截] 专家 {context_id} 试图输出无意义对话（物理/逻辑零增量），强制纠偏！")
-                        loitering_feedback = "🚨 [极速拦截] 检测到你的回复未产生任何物理变化（文件/黑板/数据库皆无更新）。请停止吹嘘，必须立即使用工具执行物理操作！"
-                        self.memories[context_id].append({"role": "user", "content": loitering_feedback})
                         continue 
+
+                    # [AOS 6.2] 多维零增量拦截 (Multi-Dim Guard)
+                    hash_after = self.blackboard.get_snapshot_hash()
+                    db_hash_after = self.scheduler.get_state_snapshot() if hasattr(self, "scheduler") else "none"
+                    has_fs_delta = len(self._get_workspace_delta(iteration_start_files, workspace_override=effective_workspace)) > 0
+                    has_bb_delta = hash_before != hash_after
+                    has_db_delta = db_hash_before != db_hash_after
+                    
+                    if not toolCallsDict and not (has_fs_delta or has_bb_delta or has_db_delta):
+                        if len(fullContent) > 80:
+                            logger.warning(f"⚠️ [极速拦截] Blitz 专家试图输出无意义对话，强制纠偏！")
+                            loitering_feedback = "🚨 [极速拦截] 检测到你的回复未产生任何物理变化。请停止吹嘘，必须立即使用工具执行物理操作！"
+                            self.memories[context_id].append({"role": "user", "content": loitering_feedback})
+                            continue  
 
                 self.token_budget.consume(self.token_budget.estimate_tokens(fullContent))
                 return fullContent
@@ -2497,6 +2507,8 @@ class McpAgent:
             
             # 执行工具调用 (ReAct Action)
             for tc in assistantMsg["tool_calls"]:
+                if total_tool_calls >= max_tool_calls:
+                    return fullContent + f"\n\n🧮 [AUTO_FAST] 工具调用已达上限（{max_tool_calls}），提前收敛。"
                 funcName = tc["function"]["name"]
                 arguments = tc["function"]["arguments"]
                 parsed_args: dict = {}
@@ -2512,6 +2524,7 @@ class McpAgent:
                     logger.error("🚫 [物理熔断] 专家逻辑陷入死锁 (超限调用 %s)，已强行断路。", funcName)
                     return f"⚠️ [物理熔断] 检测到工具调用死循环 (%s)，已由内核强制终止任务链路。" % funcName
 
+                total_tool_calls += 1
                 logger.info("[%s] 正在执行子任务工具: %s", context_id, funcName)
                 
                 try:

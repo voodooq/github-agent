@@ -209,6 +209,32 @@ class SkillManager:
         async with self._load_locks[name]:
             return await self._load_skill_inner(name, workspace_path)
 
+    async def load_skills_parallel(self, names: list[str], workspace_path: str | None = None) -> dict[str, bool]:
+        """
+        [AOS P1] 并发预加载多个技能，消除串行冷启动延迟。
+        """
+        if not names:
+            return {}
+            
+        logger.info("⚡ [技能管理器] 正在并发预加载技能: %s", ", ".join(names))
+        # 过滤掉重复项和空字符串
+        unique_names = list(set(n for n in names if n))
+        tasks = [self.load_skill(name, workspace_path=workspace_path) for name in unique_names]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        report = {}
+        for name, res in zip(unique_names, results):
+            if isinstance(res, Exception):
+                logger.error("❌ 技能 %s 预加载失败: %s", name, res)
+                report[name] = False
+            else:
+                # [AOS P0-1] 修复：dict 被判定为 True 的缺陷，需检查内部 status
+                if isinstance(res, dict):
+                    report[name] = res.get("status") in {"loaded", "already_loaded"}
+                else:
+                    report[name] = bool(res)
+        return report
+
     async def _load_skill_inner(self, name: str, workspace_path: str | None = None) -> dict:
         """实际的技能加载逻辑（被锁保护）。"""
         if name in self.loaded_skills:
@@ -394,8 +420,6 @@ class SkillManager:
             return {"status": "loaded", "tools": tool_names}
 
         except BaseException as e:
-            import traceback
-            traceback.print_exc()
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
             error_msg = str(e)
@@ -456,8 +480,6 @@ class SkillManager:
                 
             return load_result
         except Exception as e:
-            import traceback
-            traceback.print_exc()
             logger.error(f"❌ [AOS 5.0] 技能 '{name}' 热插拔失败: {e}")
             return {"status": "error", "message": f"技能 '{name}' 热插拔失败: {e}"}
 
@@ -527,11 +549,64 @@ class SkillManager:
         }
         return TOOL_ALIASES.get(clean_name, clean_name)
 
+    def _tool_min_required_args(self, func_name: str) -> list[str]:
+        """
+        /auto 快速模式：常用高频工具最小参数约束，避免无效调用浪费轮次。
+        """
+        rules = {
+            "write_file": ["path", "content"],
+            "read_file": ["path"],
+            "edit_file": ["path"],
+            "create_or_update_file": ["owner", "repo", "path", "content", "message"],
+            "search_repositories": ["query"],
+            "search_code": ["query"],
+            "read_url_content": ["url"],
+            "http_fetch": ["url"],
+            "fetch": ["url"],
+            "add_scheduled_task": ["task_id", "description", "cron_expr", "action"],
+            "cancel_scheduled_task": ["task_id"],
+        }
+        return rules.get(func_name, [])
+
+    def _tool_risk_level(self, func_name: str) -> str:
+        """
+        工具分级：LOW/MEDIUM/HIGH（目前用于日志与可观测性）。
+        """
+        high = {
+            "create_or_update_file",
+            "push_files",
+            "delete_file",
+            "add_scheduled_task",
+            "cancel_scheduled_task",
+            "clear_all_scheduled_tasks",
+            "inject_funds",
+        }
+        medium = {"write_file", "edit_file", "discover_and_install_skill", "auto_install_and_load"}
+        if func_name in high:
+            return "HIGH"
+        if func_name in medium:
+            return "MEDIUM"
+        return "LOW"
+
     async def call_tool(self, func_name: str, arguments: dict) -> str | None:
         """
         [AOS 3.7.2/3.7.3/3.9.5/3.9.7] 语义增强版：支持拦截大类调用、脱水与别名纠偏、直通内部工具
         """
         import re
+
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise ValueError(f"Invalid arguments for {func_name}: must be object/dict")
+
+        final_target_name = self.resolve_alias(func_name)
+        required = self._tool_min_required_args(final_target_name)
+        missing = [k for k in required if not str(arguments.get(k, "")).strip()]
+        if missing:
+            raise ValueError(f"Invalid arguments for {final_target_name}: missing required fields {missing}")
+
+        risk = self._tool_risk_level(final_target_name)
+        logger.info("🧭 [ToolRisk] %s => %s", final_target_name, risk)
 
         # 🚨 AOS 3.9.7: 内部工具直通车 (Absolute Sync)
         # 防止由于专家工具列表缺失或未同步导致重要生存工具报 Unknown tool
@@ -551,9 +626,6 @@ class SkillManager:
         # 2. ⚔️ 脱水与别名决策 (Dehydration & Alias Strategy)
         # 先执行命名空间脱水 (github. / github_ -> tool)
         clean_func_name = re.sub(r'^(filesystem|github|browser|sqlite|mcp)[_.]', '', func_name)
-        
-        # 使用统一解析器获取最终物理名称
-        final_target_name = self.resolve_alias(func_name)
         
         # 2. 物理工具查找
         available_tool_names = self.get_tool_names()

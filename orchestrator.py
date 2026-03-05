@@ -19,6 +19,7 @@ from datetime import datetime
 from blackboard import Blackboard
 from skill_manager import SkillManager
 from experience_engine import ExperienceEngine
+from config import AUTO_FAST_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ========== Prompt 常量 ==========
 
 DOD_GENERATOR_PROMPT = """你是一个极其严格的需求分析师。
-用户给你一段自然语言需求，你必须将其转化为 3-5 条【可量化的验收标准】。
+用户给你一段自然语言需求，你必须将其转化为 2-4 条【可量化的验收标准】。
 每条标准必须同时包含：
 1. 人类可读的任务描述
 2. 机器可验证的客观断言（Assertion）—— 基于“黑板”数据或物理文件系统
@@ -256,6 +257,8 @@ class Orchestrator:
             # 兼容新旧格式
             if isinstance(dod_data, list):
                 dod = dod_data
+                if AUTO_FAST_MODE:
+                    dod = dod[:4]
             elif isinstance(dod_data, dict) and "dod" in dod_data:
                 dod = dod_data["dod"]
             else:
@@ -278,7 +281,8 @@ class Orchestrator:
         根据需求和 DoD 生成动态"招聘计划"。
         AOS 2.4+: 注入负面模式以避坑。
         """
-        print("👔 [项目经理] 正在制定招聘计划...")
+        # [AOS P0 Log Dehydration] 移除仪式化日志
+        # print("👔 [项目经理] 正在制定招聘计划...")
 
         negatives = self.exp_engine.get_negative_patterns() if hasattr(self, "exp_engine") else ""
 
@@ -313,9 +317,10 @@ class Orchestrator:
             if not isinstance(plan, dict) or "sub_agents" not in plan:
                 raise ValueError("JSON 格式不符合招聘计划要求")
                 
-            print(f"✅ [招聘计划] {plan.get('plan_summary', '自定义分工')}")
-            for agent in plan.get("sub_agents", []):
-                print(f"  🧑‍💼 {agent['role_id']}: {agent['expertise']}")
+            # [AOS P0 Log Dehydration] 移除仪式化日志
+            # print(f"✅ [招聘计划] {plan.get('plan_summary', '自定义分工')}")
+            # for agent in plan.get("sub_agents", []):
+            #     print(f"  🧑‍💼 {agent['role_id']}: {agent['expertise']}")
             return plan
         except Exception as e:
             logger.error("招聘计划解析失败: %s. 尝试从文本恢复...", e)
@@ -406,16 +411,19 @@ class Orchestrator:
             self.blackboard.update_task(role_id, "WAITING", f"等待前置: {depends}")
             for dep in depends:
                 dep_key = f"_task_done_{dep}"
-                # [AOS 8.5] 依赖等待降噪：缩短等待窗口，避免“长时间看似卡死”
+                # [AOS P0] 依赖等待缩短: 180 -> 75
                 try:
-                    result = await self.blackboard.wait_for(dep_key, timeout=180.0)
+                    result = await self.blackboard.wait_for(dep_key, timeout=75.0)
                 except asyncio.CancelledError:
                     self.blackboard.update_task(role_id, "FAILED", f"任务取消：等待前置 {dep} 时收到中断信号")
                     self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
                     raise
-                if result is None:
-                    self.blackboard.update_task(role_id, "FAILED", f"前置 {dep} 超时未完成")
-                    return f"[{role_id}] 失败：前置任务 {dep} 超时"
+                if result is None or result == "failed":
+                    fail_reason = "超时" if result is None else "前置任务失败"
+                    self.blackboard.update_task(role_id, "FAILED", f"前置 {dep} {fail_reason}")
+                    # [AOS P0] Fail-Fast: 立即标记当前任务失败并传播
+                    self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
+                    return f"[{role_id}] 失败：前置任务 {dep} {fail_reason}"
 
         # 加载所需技能
         # [AOS 3.7.4] 核心工具强制注入 (笔与笔记本)
@@ -547,7 +555,8 @@ class Orchestrator:
                         break
 
             # [AOS 8.5] 子专家执行硬超时：防止模型/工具调用长时间挂起
-            execution_timeout = 180.0
+            # [AOS P0] 执行超时缩短: 180 -> 90
+            execution_timeout = 90.0
 
             # AOS 2.1: 优先使用具备工具执行能力的 Agent.execute_with_tools 避免幻觉
             if self.agent:
@@ -597,7 +606,8 @@ class Orchestrator:
             self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
             raise
         except asyncio.TimeoutError:
-            timeout_msg = "执行超时：超过 180s 未完成，已强制终止"
+            # [AOS P0-2] 修复：文案与真实超时值 (90s) 对齐
+            timeout_msg = f"执行超时：超过 {int(execution_timeout)}s 未完成，已强制终止"
             self.blackboard.update_task(role_id, "FAILED", timeout_msg)
             self.blackboard.write(f"error_{role_id}", timeout_msg, author=role_id)
             self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
@@ -638,6 +648,24 @@ class Orchestrator:
         return False
 
     async def verify_results(self, dod: list, results: dict[str, str]) -> dict:
+        def _pack_verdict(overall: str, details: list | None = None, correction_hint: str = "", missing_evidence: list | None = None) -> dict:
+            criteria = []
+            for item in (details or []):
+                if isinstance(item, dict):
+                    criteria.append({
+                        "name": item.get("criterion", ""),
+                        "pass": str(item.get("result", "")).upper() == "PASS",
+                        "evidence": item.get("reason", ""),
+                    })
+            final = "PASS" if str(overall).upper() == "PASS" else "FAIL"
+            return {
+                "overall": final,  # 兼容旧字段
+                "details": details or [],  # 兼容旧字段
+                "correction_hint": correction_hint or "",
+                "criteria": criteria,
+                "missing_evidence": missing_evidence or [],
+                "final_verdict": final,
+            }
         # [AOS 5.4] Truth-Driven Verifier (真值驱动验收)
         if self.current_mission_plan.get("plan_summary") == "自维护单兵任务":
             logger.info("⚡ [AOS 5.4] 正在应用极速验证：物理真值审计 (Truth-Driven Pass)...")
@@ -658,7 +686,7 @@ class Orchestrator:
                         conn.close()
                         if count == 0:
                             logger.info("✅ [AOS 5.4 物理真值] 数据库任务已归零，判定 PASS")
-                            return {"overall": "PASS", "details": [], "correction_hint": "物理审计通过：数据库已处于净空状态。"}
+                            return _pack_verdict("PASS", [], "物理审计通过：数据库已处于净空状态。")
                 except Exception as e:
                     logger.warning("⚠️ 物理审计失败: %s", e)
 
@@ -667,7 +695,7 @@ class Orchestrator:
                 # 探测 P2 工具闭环信号
                 if any(sig in res_text for sig in ["[探针通过]", "物理容器部署成功"]):
                     logger.info("✅ [AOS P2] 探测到 Runtime 部署或探针闭环信号，直接判 PASS")
-                    return {"overall": "PASS", "details": [], "correction_hint": "容器物理操作或探针验证闭环。"}
+                    return _pack_verdict("PASS", [], "容器物理操作或探针验证闭环。")
 
                 # [AOS 5.5] Fake Detection: 探测伪装执行
                 fake_indicators = ["echo ", "crontab ", "schtasks ", "manual set"]
@@ -675,11 +703,11 @@ class Orchestrator:
                 if any(fi in res_text.lower() for fi in fake_indicators):
                     if not any(sig in res_text for sig in ["⏰ [调度器]", "💥 [调度器]", "INSTANT_KILL_PASS", "TASK_COMPLETED", "[探针通过]", "物理容器部署成功"]):
                         logger.error("❌ [AOS 5.5] 发现伪装执行迹象：模型试图用文本建议代替工具调用。")
-                        return {"overall": "FAIL", "details": [], "correction_hint": "🚨 严禁提供手动建议！你必须调用工具（如 add_scheduled_task 或 runtime_deploy）来完成物理操作，禁止使用 echo 或文本描述。"}
+                        return _pack_verdict("FAIL", [], "🚨 严禁提供手动建议！你必须调用工具（如 add_scheduled_task 或 runtime_deploy）来完成物理操作，禁止使用 echo 或文本描述。", ["检测到伪装执行关键词且无物理成功信号"])
 
                 if "INSTANT_KILL_PASS" in res_text or "TASK_COMPLETED" in res_text:
                     logger.info("✅ [AOS 5.3/5.4/5.5] 探测到物理成功或截断信号，直接判 PASS")
-                    return {"overall": "PASS", "details": [], "correction_hint": "物理操作已闭环。"}
+                    return _pack_verdict("PASS", [], "物理操作已闭环。")
 
             # 3. [AOS 5.7] Apology Check (拒收道歉信)
             for role, res_text in results.items():
@@ -688,7 +716,7 @@ class Orchestrator:
                 if any(ak in res_text for ak in apology_keywords):
                     if not any(sig in res_text for sig in ["⏰ [调度器]", "💥 [调度器]", "INSTANT_KILL_PASS", "TASK_COMPLETED", "✅"]):
                         logger.error("❌ [AOS 5.7] 发现‘礼貌性失败’迹象：模型在用道歉掩盖执行失败。")
-                        return {"overall": "FAIL", "details": [], "correction_hint": "🚨 拒绝道歉！我不需要解释为什么失败，我只需要物理结果。请重新检查工具调用参数并确保执行成功。"}
+                        return _pack_verdict("FAIL", [], "🚨 拒绝道歉！我不需要解释为什么失败，我只需要物理结果。请重新检查工具调用参数并确保执行成功。", ["检测到道歉/失败话术且无成功闭环信号"])
 
             # 4. [AOS 6.0] Universal Physical Delta Audit for Blitz
             # 对于非纯维护/清空类的单兵任务，强制检查物理工作区是否有产出
@@ -699,7 +727,7 @@ class Orchestrator:
                         files = [f for f in os.listdir(self.workspace_path) if os.path.isfile(os.path.join(self.workspace_path, f)) and not f.startswith(".")]
                         if not files:
                             logger.error("❌ [AOS 6.0] 物理审计失败：单兵任务未产生任何物理文件产出。")
-                            return {"overall": "FAIL", "details": [], "correction_hint": "物理审计失败：Blitz 模式下未发现任何物理文件产出。我拒绝接受纯文本的虚假成功报告，必须有物理记录。"}
+                            return _pack_verdict("FAIL", [], "物理审计失败：Blitz 模式下未发现任何物理文件产出。我拒绝接受纯文本的虚假成功报告，必须有物理记录。", ["工作区未发现物理文件产出"])
                 except Exception as e:
                     logger.warning("⚠️ 物理增量审计异常: %s", e)
 
@@ -711,7 +739,7 @@ class Orchestrator:
                     break
             if found_stop:
                 logger.info("✅ [AOS 5.2/5.4/5.7] 物理状态已收敛，判定 PASS")
-                return {"overall": "PASS", "details": [], "correction_hint": "物理目标已达成，单兵任务自动结项。"}
+                return _pack_verdict("PASS", [], "物理目标已达成，单兵任务自动结项。")
 
         pre_check_results = []
         has_assertions = False
@@ -807,12 +835,28 @@ class Orchestrator:
             failed = [r for r in pre_check_results if r["result"] == "FAIL"]
             if failed:
                 print(f"❌ [客观预检] {len(failed)} 条断言未通过，跳过 AI 语义验证")
-                return {
-                    "overall": "FAIL",
-                    "details": pre_check_results,
-                    "correction_hint": f"客观断言未通过: {', '.join(r['criterion'][:30] for r in failed)}"
-                }
-            print("✅ [客观预检] 所有断言通过，进入 AI 语义验证...")
+                return _pack_verdict(
+                    "FAIL",
+                    pre_check_results,
+                    f"客观断言未通过: {', '.join(r['criterion'][:30] for r in failed)}",
+                    [r.get("criterion", "") for r in failed],
+                )
+            
+            # [AOS P1] 精确语义验证开关 (Semantic-only Refinement)
+            # 如果客观断言全过，且 DoD 中不包含主观性词汇，直接通过。
+            subjective_keywords = ["分析", "评估", "质量", "外观", "逻辑", "analyze", "evaluate", "quality", "logic", "check the correctness"]
+            is_subjective = any(any(skw in str(d).lower() for skw in subjective_keywords) for d in dod)
+            
+            if not is_subjective:
+                print("✅ [AOS P1] 任务被判定为“纯物理操作”，客观断言全通，跳过语义裁判。")
+                return _pack_verdict("PASS", pre_check_results, "物理审计已闭环（非主观任务）。")
+
+            # [AOS P0] 优化：验证快路径 (Fast Track) - 保留作为兜底
+            if verdict := self.blackboard.read("AOS_ENABLE_FAST_VERIFY"):
+                if str(verdict).lower() == "true":
+                    print("✅ [AOS P0] 命中快路径配置，直接 PASS。")
+                    return _pack_verdict("PASS", pre_check_results, "客观审计已闭环。")
+            print("⚖️ [AOS P1] 检测到主观评价需求，进入 AI 语义验证...")
 
         # 阶段 2: AI 语义验证
         print("⚖️ [阶段二] AI 语义验证...")
@@ -835,10 +879,12 @@ class Orchestrator:
             lower_text = text.lower()
             if any(kw in lower_text for kw in negative_keywords):
                 logger.error(f"🚫 [AOS 5.0 Anti-Mocking] 子专家 '{role}' 试图通过文字报告忽悠，判定为 FAIL")
-                return {
-                    "overall": "FAIL",
-                    "correction_hint": f"子专家 '{role}' 的报告中包含失败信号（{negative_keywords[0]}等），物理动作未闭环。禁止文字演戏！"
-                }
+                return _pack_verdict(
+                    "FAIL",
+                    [],
+                    f"子专家 '{role}' 的报告中包含失败信号（{negative_keywords[0]}等），物理动作未闭环。禁止文字演戏！",
+                    [f"{role}: 命中失败关键词"],
+                )
             results_text += f"--- {role} 的执行结果 ---\n{text[:4000]}\n\n"
 
         verification_input = (
@@ -869,10 +915,15 @@ class Orchestrator:
             for detail in verdict.get("details", []):
                 icon = "✅" if detail.get("result") == "PASS" else "❌"
                 print(f"  {icon} {detail.get('criterion', '')[:60]}: {detail.get('reason', '')}")
-            return verdict
+            return _pack_verdict(
+                verdict.get("overall", "FAIL"),
+                verdict.get("details", []),
+                verdict.get("correction_hint", ""),
+                verdict.get("missing_evidence", []),
+            )
         except (json.JSONDecodeError, TypeError):
             logger.warning("裁判结果解析失败，视为 PASS")
-            return {"overall": "PASS", "details": [], "correction_hint": ""}
+            return _pack_verdict("PASS", [], "")
 
     async def distill_and_save_experience(self, user_demand: str, successful_plan: dict):
         """
@@ -964,17 +1015,31 @@ class Orchestrator:
         self,
         user_demand: str,
         primary_session,
-        max_rounds: int = 3,
+        max_rounds: int = 2,
     ):
         """
         完整的自治任务执行循环。
         """
+        if AUTO_FAST_MODE and max_rounds > 1:
+            max_rounds = 1
         yield f"🚀 [AOS 6.0] 战术分诊启动：正在评估任务复杂度...\n"
 
         # [AOS 6.0] 自动分诊：取代固定的关键词匹配
         intent = await self.classify_intent(user_demand)
         is_blitz_mode = (intent == "L1_BLITZ")
         is_dev_mode = (intent == "L3_DEVELOPER")
+        
+        # [AOS P1] 任务级技能并发预加载
+        # 在分诊后，立即识别潜在需要的技能并后台异步加载
+        potential_skills = ["filesystem"] # 默认必带
+        if any(kw in user_demand.lower() for kw in ["git", "github", "repo", "分支"]):
+            potential_skills.append("github")
+        if any(kw in user_demand.lower() for kw in ["web", "search", "搜索", "crawl"]):
+            potential_skills.append("scrape-mcp")
+        
+        # 触发并发预加载（不阻塞分诊流程太久，但也提供早期暖机）
+        # [AOS P1] 优化：预展开工作区设为 None，避免路径逃逸
+        asyncio.create_task(self.skill_manager.load_skills_parallel(potential_skills, workspace_path=None))
         
         if is_dev_mode:
             yield f"🚀 [AOS 8.0] 开发者引擎激活：识别为扩展开发任务 (L3)\n"
@@ -1015,6 +1080,41 @@ class Orchestrator:
             return
         
         if is_blitz_mode:
+            # [AOS P1] 简单任务“单兵快路径” (Fast-lane)
+            # 针对极短且语义明确的指令，跳过 DoD 生成和冗余招聘，直接执行
+            simple_indicators = ["status", "check", "wallet", "balance", "clear", "cleanup"]
+            is_very_simple = len(user_demand) < 25 and any(kw in user_demand.lower() for kw in simple_indicators)
+            
+            if is_very_simple:
+                yield f"🚀 [AOS P1] 探测到极简指令，激活‘单兵快路径’，跳过招聘逻辑...\n"
+                # 依然需要隔离工作区
+                if self.agent:
+                    self.workspace_path = self.agent._setup_action_workspace("fast")
+                else:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    self.workspace_path = os.path.join(os.getcwd(), "Workspace", "Fast", f"fast_{timestamp}")
+                    os.makedirs(self.workspace_path, exist_ok=True)
+                
+                # [AOS P1-1] 修复：self.agent 空值防护
+                if not self.agent:
+                    yield "❌ [AOS P1-1] 关键错误：快路径模式必须依赖活跃 Agent 实例，执行终止。\n"
+                    return
+
+                # [AOS 8.4] 补全工具列表，防止 NameError
+                targeted_tools = self.agent._get_combined_tools(slim=True)
+
+                final_report = await self.agent.execute_with_tools(
+                    system_prompt="你现在是极速执行官。立即执行用户指令，无需废话。",
+                    user_demand=user_demand,
+                    tier="LOCAL", # 快路径默认本地，追求极致响应
+                    context_id=f"fast_{os.path.basename(self.workspace_path)}",
+                    workspace_path=self.workspace_path,
+                    max_iterations=3, # 极简任务仅允许 3 轮
+                    tools=targeted_tools
+                )
+                yield f"\n📊 【极速执行报告】\n{final_report}\n"
+                return
+
             yield f"🚀 [AOS 6.0] 物理独裁：识别为 Blitz 线性任务 (L1)，强制锁定‘单兵突击’，拒绝会议。\n"
             # [AOS 7.1] 调用 Agent 的集中隔离逻辑
             if self.agent:
@@ -1147,19 +1247,16 @@ class Orchestrator:
         for round_num in range(1, max_rounds + 1):
             yield f"\n{'='*40}\n🔄 第 {round_num}/{max_rounds} 轮执行\n{'='*40}\n"
 
-            # [AOS 4.3] 逻辑消磁：清理上一轮的任务状态，防止 Skip Trap
-            self.blackboard.task_progress.clear()
-            if round_num > 1 and self.agent:
-                # 调用 McpAgent 的消磁逻辑
-                await self.agent.prepare_for_retry(self.blackboard)
-                yield "♻️ [消磁] 侦测到重试信号，已物理擦除所有专家状态标志，拒绝跳过。\n"
-            elif round_num > 1:
-                # 保底清理逻辑
-                for k in list(self.blackboard.facts.keys()):
-                    if "_task_done_" in k:
-                        self.blackboard.delete(k)
-                yield "♻️ [消磁] 侦测到重试信号，已物理清除状态标志。\n"
-
+            # [AOS P0] 增量重试逻辑：不再盲目清除所有状态
+            if round_num > 1:
+                # 仅保留 self.blackboard.task_progress 用户体验日志清理，
+                # 但不再进行全量消磁（agent.prepare_for_retry）
+                # 而是仅清除 FAILED 的标记
+                failed_keys = [k for k, v in self.blackboard.facts.items() if (isinstance(v, str) and "failed" in v.lower()) or "error_" in k]
+                for fk in failed_keys:
+                    self.blackboard.delete(fk)
+                yield "♻️ [增量重试] 仅回滚失败节点，保留已成功的物理成果。\n"
+            
             # 2. 生成招聘计划 (AOS 2.4+: 优先尝试从经验库复用，并过 CFO 海关)
             is_fast_path = False
             match_result = self.exp_engine.match_plan(user_demand)
@@ -1197,6 +1294,15 @@ class Orchestrator:
             
             # [AOS 3.9.5] 物理记录当前执行计划，供 execute_sub_agent 校验
             self.current_mission_plan = plan
+
+            # [AOS P0-3] 物理状态消磁：在 plan 确认后立即执行本轮角色状态清理，杜绝“假完成”残留
+            if plan and "sub_agents" in plan:
+                for sa in plan["sub_agents"]:
+                    rid = sa["role_id"]
+                    self.blackboard.delete(f"_task_done_{rid}")
+                    self.blackboard.delete(f"result_{rid}")
+                    self.blackboard.delete(f"error_{rid}")
+                logger.info("🧹 [AOS P0-3] 已针对本轮 %d 个专家（%s）实施状态消磁。", len(plan["sub_agents"]), round_num)
                 
             yield f"\n👔 招聘计划: {plan.get('plan_summary', '')}\n"
             sub_agents = plan.get("sub_agents", [])

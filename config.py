@@ -83,6 +83,14 @@ MEMORY_FILE = os.getenv("MEMORY_FILE", "memory.json")
 # AOS: Token 预算上限（单次任务最大 Token 消耗，超过则挂起等待用户确认）
 TOKEN_BUDGET = int(os.getenv("TOKEN_BUDGET", "50000"))
 
+# AUTO 快速模式与预算配置（P0）
+AUTO_FAST_MODE = _env_bool("AUTO_FAST_MODE", True)
+AUTO_MAX_TURNS = int(os.getenv("AUTO_MAX_TURNS", "6"))
+AUTO_MAX_TOOL_CALLS = int(os.getenv("AUTO_MAX_TOOL_CALLS", "12"))
+AUTO_MAX_ASK = int(os.getenv("AUTO_MAX_ASK", "1"))
+AUTO_TIMEOUT_SECONDS = int(os.getenv("AUTO_TIMEOUT_SECONDS", "180"))
+AUTO_REQUIRE_FINAL_VERIFY = _env_bool("AUTO_REQUIRE_FINAL_VERIFY", True)
+
 # AOS: 能力缺失 -> 自升级 -> 热加载策略
 SELF_UPGRADE_ENABLED = _env_bool("SELF_UPGRADE_ENABLED", True)
 SELF_UPGRADE_SAFE_MODE = _env_bool("SELF_UPGRADE_SAFE_MODE", True)
