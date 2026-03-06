@@ -413,7 +413,7 @@ class Orchestrator:
                 dep_key = f"_task_done_{dep}"
                 # [AOS P0] 依赖等待缩短: 180 -> 75
                 try:
-                    result = await self.blackboard.wait_for(dep_key, timeout=75.0)
+                    result = await self.blackboard.wait_for(dep_key, timeout=240.0)
                 except asyncio.CancelledError:
                     self.blackboard.update_task(role_id, "FAILED", f"任务取消：等待前置 {dep} 时收到中断信号")
                     self.blackboard.write(f"_task_done_{role_id}", "failed", author=role_id)
@@ -556,7 +556,7 @@ class Orchestrator:
 
             # [AOS 8.5] 子专家执行硬超时：防止模型/工具调用长时间挂起
             # [AOS P0] 执行超时缩短: 180 -> 90
-            execution_timeout = 90.0
+            execution_timeout = 180.0
 
             # AOS 2.1: 优先使用具备工具执行能力的 Agent.execute_with_tools 避免幻觉
             if self.agent:
@@ -1025,9 +1025,11 @@ class Orchestrator:
         yield f"🚀 [AOS 6.0] 战术分诊启动：正在评估任务复杂度...\n"
 
         # [AOS 6.0] 自动分诊：取代固定的关键词匹配
-        intent = await self.classify_intent(user_demand)
-        is_blitz_mode = (intent == "L1_BLITZ")
-        is_dev_mode = (intent == "L3_DEVELOPER")
+        # intent = await self.classify_intent(user_demand)
+        # 强制将所有 auto 的指令按 DIRECT_EXECUTION (单兵大模型直出) 路由
+        intent = "DIRECT_EXECUTION"
+        is_blitz_mode = False
+        is_dev_mode = False
         
         # [AOS P1] 任务级技能并发预加载
         # 在分诊后，立即识别潜在需要的技能并后台异步加载
@@ -1216,194 +1218,32 @@ class Orchestrator:
             os.makedirs(self.workspace_path, exist_ok=True)
             
         yield f"📁 [隔离] 已分配专属工作区: {self.workspace_path}\n"
+        if self.agent:
+            self.agent.workspace_path = self.workspace_path
+
+        yield f"🚀 [AOS Auto 重构] 激活：直接连接大模型核心进行操作与创建。\n"
         
-        # [AOS 4.7] 根参数锚定 (URL-Anchor)
-        root_url_match = re.search(r'https?://[^\s)\]]+', user_demand)
-        if root_url_match:
-            root_url = root_url_match.group(0)
-            self.blackboard.write("SYSTEM_ROOT_URL", root_url, author="SYSTEM", sticky=True)
-            yield f"🔗 [锚定] 已锁定全局资源追踪器: {root_url}\n"
+        # 收集所有可用工具给大模型
+        available_tools = self.agent._get_combined_tools(slim=False) if self.agent else []
         
-        # [AOS 2.8.7] 记录任务开始前的根目录文件快照
-        root_files_before = set(os.listdir(os.getcwd()))
+        # 强制单兵执行
+        final_report = await self.agent.execute_with_tools(
+            system_prompt=(
+                "你是一个全栈 AI 工程师，现在负责完成用户的 /auto 指令任务。\n"
+                "用户要求你直接完成任务需求（包括但不仅限于编写代码、创建文件、整理信息、修改内容等）。\n"
+                "由于剥离了子代理的流转，你必须独自在赋予你的 Workspace 中将所有的代码、脚本写入物理文件，而不是仅在输出中假装完成。\n"
+                "你的目标是：根据你的判断自由地进行多次工具调用（write_file, edit_file 等）。一旦全部完成，请总结你修改了哪些内容并报告任务完毕。\n"
+                "禁止演戏和敷衍，直接交付可运行的结果。"
+            ),
+            user_demand=user_demand,
+            tier="PREMIUM", # 直接上大模型
+            context_id=f"auto_{os.path.basename(self.workspace_path)}",
+            workspace_path=self.workspace_path,
+            max_iterations=15, # 给足弹药迭代
+            tools=available_tools
+        )
 
-        # [AOS 2.9.4] 智能持久化：除非主动要求完整重置，否则保留历史事实实现断点续传
-        # self.blackboard.clear() # 强制关闭清空，改用细粒度清理
-        self.blackboard.task_progress.clear()
-        # self.blackboard.snapshots.clear() # 保留快照供回滚
-        yield "📋 黑板已进入持久化模式（支持断点续传）\n"
+        yield f"\n📊 【/auto 任务最终执行报告】\n{final_report}\n✅ [AOS] 管线执行完毕。\n"
+        return
+        
 
-        # 1. 生成验收标准
-        dod = await self.generate_dod(user_demand)
-        yield f"📝 验收标准 ({len(dod)} 条):\n"
-        for i, item in enumerate(dod, 1):
-            if isinstance(item, dict):
-                crit = item.get("criterion", str(item))
-                a_type = item.get("assertion", {}).get("type", "")
-                yield f"  {i}. {crit} [{a_type}]\n"
-            else:
-                yield f"  {i}. {item}\n"
-
-        for round_num in range(1, max_rounds + 1):
-            yield f"\n{'='*40}\n🔄 第 {round_num}/{max_rounds} 轮执行\n{'='*40}\n"
-
-            # [AOS P0] 增量重试逻辑：不再盲目清除所有状态
-            if round_num > 1:
-                # 仅保留 self.blackboard.task_progress 用户体验日志清理，
-                # 但不再进行全量消磁（agent.prepare_for_retry）
-                # 而是仅清除 FAILED 的标记
-                failed_keys = [k for k, v in self.blackboard.facts.items() if (isinstance(v, str) and "failed" in v.lower()) or "error_" in k]
-                for fk in failed_keys:
-                    self.blackboard.delete(fk)
-                yield "♻️ [增量重试] 仅回滚失败节点，保留已成功的物理成果。\n"
-            
-            # 2. 生成招聘计划 (AOS 2.4+: 优先尝试从经验库复用，并过 CFO 海关)
-            is_fast_path = False
-            match_result = self.exp_engine.match_plan(user_demand)
-            
-            if match_result:
-                plan_template, var_map = match_result
-                yield f"✨ [Experience] 命中快路径！检测到变量: {var_map}\n"
-                
-                # 注入变量
-                plan = inject_variables(plan_template, var_map)
-                
-                yield f"正在请求 CFO 财务授权...\n"
-                
-                # AOS 2.4+: 即使是快路径，也要过 CFO 海关
-                sub_agent_count = len(plan.get("sub_agents", []))
-                est_cost = sub_agent_count * 0.005
-                
-                if self.agent:
-                    cfo_result_json = await self.agent._handle_internal_tool("cfo_approve", {
-                        "estimated_cost": est_cost,
-                        "expected_value": 0.05
-                    })
-                    cfo_data = json.loads(cfo_result_json) if cfo_result_json else {}
-                    
-                    if not cfo_data.get("approved", True):
-                        yield f"⚠️ [CFO 拦截] 余额不足或 ROI 过低，拒绝执行历史方案。尝试降级规划...\n"
-                        plan = await self.generate_recruiting_plan(user_demand, dod)
-                    else:
-                        yield f"✅ [CFO 授权] 财务通过。复用方案预估开销: ${est_cost:.3f}\n"
-                        is_fast_path = True
-                else:
-                    is_fast_path = True
-            else:
-                plan = await self.generate_recruiting_plan(user_demand, dod)
-            
-            # [AOS 3.9.5] 物理记录当前执行计划，供 execute_sub_agent 校验
-            self.current_mission_plan = plan
-
-            # [AOS P0-3] 物理状态消磁：在 plan 确认后立即执行本轮角色状态清理，杜绝“假完成”残留
-            if plan and "sub_agents" in plan:
-                for sa in plan["sub_agents"]:
-                    rid = sa["role_id"]
-                    self.blackboard.delete(f"_task_done_{rid}")
-                    self.blackboard.delete(f"result_{rid}")
-                    self.blackboard.delete(f"error_{rid}")
-                logger.info("🧹 [AOS P0-3] 已针对本轮 %d 个专家（%s）实施状态消磁。", len(plan["sub_agents"]), round_num)
-                
-            yield f"\n👔 招聘计划: {plan.get('plan_summary', '')}\n"
-            sub_agents = plan.get("sub_agents", [])
-            for agent in sub_agents:
-                yield f"  🧑‍💼 {agent['role_id']}: {agent['expertise']}\n"
-
-            # 3. 按依赖关系分组并发执行
-            yield "\n🏭 数字员工开始工作...\n"
-            agent_results: dict[str, str] = {}
-
-            # 拓扑排序：无依赖的先跑，有依赖的通过 wait_for 自动等待
-            tasks = []
-            # [AOS 4.6] Janus Router: 判定任务节点
-            for i, agent_config in enumerate(sub_agents):
-                is_final = (i == len(sub_agents) - 1)
-                tasks.append(
-                    self.execute_sub_agent(agent_config, user_demand, primary_session, is_final=is_final)
-                )
-
-            # 并发执行所有子 Agent（依赖通过黑板事件自动协调）
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for agent_config, result in zip(sub_agents, results):
-                role_id = agent_config["role_id"]
-                if isinstance(result, asyncio.CancelledError):
-                    agent_results[role_id] = "执行中断: 任务被取消"
-                    yield f"  🛑 {role_id}: 中断 - 收到取消信号\n"
-                    raise result
-                if isinstance(result, BaseException):
-                    agent_results[role_id] = f"执行异常: {str(result)}"
-                    yield f"  ❌ {role_id}: 异常 - {str(result)}\n"
-                else:
-                    agent_results[role_id] = result
-                    yield f"  ✅ {role_id}: 完成\n"
-
-            # 输出任务时间轴
-            timeline = self.blackboard.get_timeline()
-            yield f"\n{timeline}\n"
-
-            # 4. AI 裁判验收
-            yield "\n⚖️ AI 裁判验收中...\n"
-            verdict = await self.verify_results(dod, agent_results)
-
-            if verdict.get("overall") == "PASS":
-                # AOS 2.4+: 触发后台经验蒸馏
-                asyncio.create_task(self.distill_and_save_experience(user_demand, plan))
-                
-                yield "\n✅ [裁判判定] 所有验收标准通过！\n"
-                
-                # [AOS 2.8.7] 自动整理：将根目录下意外产生的文件移动到 Workspace
-                root_files_after = set(os.listdir(os.getcwd()))
-                new_files = root_files_after - root_files_before
-                if new_files:
-                    yield "🧹 [整理] 正在将任务产物移动到隔离区...\n"
-                    import shutil
-                    moved_count = 0
-                    for f in new_files:
-                        src = os.path.join(os.getcwd(), f)
-                        if os.path.isfile(src) and not f.startswith(".") and f != "main.py":
-                            try:
-                                # 如果目标已存在（极少见），则覆盖
-                                dest = os.path.join(self.workspace_path, f)
-                                shutil.move(src, dest)
-                                moved_count += 1
-                                logger.info("🚚 自动归档: %s -> %s", f, self.workspace_path)
-                            except Exception as e:
-                                logger.warning("🚚 归档失败 %s: %s", f, e)
-                    if moved_count > 0:
-                        yield f"✅ [整理] 已归档 {moved_count} 个文件至 {self.workspace_path}\n"
-
-                # 汇总最终结果
-                yield "\n📊 最终交付结果:\n"
-                yield "─" * 50 + "\n"
-                for role, text in agent_results.items():
-                    yield f"\n【{role}】:\n{text[:2000]}\n"
-                yield "─" * 50 + "\n"
-                yield f"\n🏁 任务圆满完成。数字团队已解散。方案已存入长期经验库。\n"
-                return
-
-            # 验收失败
-            if is_fast_path:
-                yield f"⚠️ [经验失效] 历史方案未能通过当前环境验证，执行经验衰减并回退到冷启动...\n"
-                self.exp_engine.record_failure(user_demand)
-            
-            # 准备下一轮
-            hint = verdict.get("correction_hint", "")
-            yield f"\n❌ [裁判判定] 未通过验收\n"
-            yield f"📌 修正提示: {hint}\n"
-
-            if round_num < max_rounds:
-                # 将失败原因写入黑板，供下一轮参考
-                self.blackboard.write(
-                    f"round_{round_num}_failure",
-                    hint,
-                    author="Verifier"
-                )
-                yield f"🔁 准备第 {round_num + 1} 轮重试...\n"
-
-        # 所有轮次用尽
-        yield f"\n🚨 [熔断] {max_rounds} 轮尝试后仍未完全通过验收。\n"
-        yield f"📋 部分成果:\n"
-        for role, text in agent_results.items():
-            yield f"  [{role}]: {text[:500]}\n"
-        yield f"\n{self.blackboard.get_timeline()}\n"

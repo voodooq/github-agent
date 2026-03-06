@@ -3,7 +3,7 @@ import traceback
 import sys
 
 with open('compile_err.log', 'w') as errlog:
-    files = ['mcp_agent.py', 'main.py', 'blackboard.py', 'orchestrator.py', 'test_timer.py']
+    files = ['mcp_agent.py', 'main.py', 'blackboard.py', 'orchestrator.py']
     for f in files:
         try:
             py_compile.compile(f, doraise=True)
