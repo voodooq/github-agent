@@ -340,10 +340,10 @@ class SkillManager:
             resolved_cmd = resolve_executable_command(cmd_name)
             
             if not resolved_cmd:
-                logger.warning("⚠️ [AOS 7.5.2] 未能找到可執行文件: %s，尝试使用原始名稱。", cmd_name)
+                logger.warning("⚠️ [AOS 7.5.2] 未能找到可执行文件: %s，尝试使用原始名称。", cmd_name)
                 resolved_cmd = cmd_name
             
-            # [AOS 7.5.3] Shell Protocol：在 Windows 上，如果是脚本類指令，可能需要 cmd /c 輔助
+            # [AOS 7.5.3] Shell Protocol：在 Windows 上，如果是脚本类指令，可能需要 cmd /c 辅助
             final_args = args
             if os.name == "nt" and resolved_cmd.lower().endswith((".cmd", ".bat", ".ps1")):
                 logger.info("🐚 [Shell Protocol] 检测到 Windows 脚本，封装为 cmd /c 模式")
