@@ -111,6 +111,34 @@ def printHelp():
     print("  /quit             退出并保存记忆")
     print("─" * 55)
     print("  【AOS 7.0 冷热隔离协议】")
+
+GITHUB_REPO_URL_PATTERN = re.compile(r"https://github\.com/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+")
+QUOTED_MD_FILE_PATTERN = re.compile(r'["\'](.*?\.md)["\']')
+TEXT_SPLIT_PATTERN = re.compile(r'[\s,，;；]+')
+
+
+def printHelp():
+    """打印帮助信息"""
+    print("─" * 55)
+    print("  /search <需求>    搜索匹配开源项目并排序")
+    print("  /analyze <URL>    精准分析指定 GitHub 仓库")
+    print("  /review <URL>     触发 Multi-Agent 专家团深度评审")
+    print("  /deploy <URL>     一键部署项目到 Docker 沙盒")
+    print("  /auto <需求>      🧠 全自治模式：AI 自主拆解、招聘、执行、验收")
+    print("  /skills           查看动态技能注册表状态")
+    print("  /schedule         📅 查看所有定时任务")
+    print("  /wallet           💰 查看 CFO 财务简报（余额/燃烧率/生存模式）")
+    print("  /inject <金额>     💵 向 Agent 钱包注资")
+    print("  /prune            手动清理 Docker 垃圾镜像/容器")
+    print("  /checkup          🛡️ AOS 4.0 免疫系统：全量技能自检与自愈")
+    print("  /bb               📖 查看黑板报告 (任务事实/执行结果/时间轴)")
+    print("  /exp              🧠 查看已积累的执行经验 (AOS 2.4)")
+    print("  /clear            清除对话记忆")
+    print("  /tools            查看可用 MCP 工具")
+    print("  /help             显示此帮助")
+    print("  /quit             退出并保存记忆")
+    print("─" * 55)
+    print("  【AOS 7.0 冷热隔离协议】")
     print("  - 直接输入: 闲聊/头脑风暴 (Cold Mode) - 🔒 禁用所有执行工具")
     print("  - /auto <需求>: 启动自治任务 (Hot Mode) - 🚀 开启完整执行权限")
     print("─" * 55)
@@ -119,10 +147,10 @@ def printHelp():
 
 def extract_github_urls(text: str) -> list[str]:
     """
-    從文本中提取所有 GitHub 倉庫地址
+    从文本中提取所有 GitHub 仓库地址
     """
     urls = GITHUB_REPO_URL_PATTERN.findall(text)
-    # 去重並清洗（去除末尾的 .git 或斜槓）
+    # 去重并清洗（去除末尾的 .git 或斜杠）
     seen = set()
     cleaned_urls = []
     for url in urls:
@@ -135,12 +163,12 @@ def extract_github_urls(text: str) -> list[str]:
 
 def find_files_in_text(text: str) -> list[str]:
     """
-    從文本中提取所有有效的本地文件路徑
+    从文本中提取所有有效的本地文件路径
     """
-    # 支持帶空格的路徑（通常用引號包裹），以及常見分隔符
-    # 先嘗試匹配被引號包裹的
+    # 支持带空格的路径（通常用引号包裹），以及常见分隔符
+    # 先尝试匹配被引号包裹的
     quoted = QUOTED_MD_FILE_PATTERN.findall(text)
-    # 再按常見分隔符切分
+    # 再按常见分隔符切分
     parts = TEXT_SPLIT_PATTERN.split(text)
     
     valid_files = []
@@ -153,12 +181,12 @@ def find_files_in_text(text: str) -> list[str]:
 
 def collect_target_urls(original_input: str) -> tuple[list[str], list[str], list[tuple[str, int]], list[tuple[str, str]]]:
     """
-    從輸入文本中收集 GitHub URL（直接輸入 + 本地文件內容）。
+    从输入文本中收集 GitHub URL（直接输入 + 本地文件内容）。
     返回：
-    - target_urls: 去重後 URL
+    - target_urls: 去重后 URL
     - found_files: 命中的本地文件
-    - file_hits: [(文件路徑, 文件內提取到的 URL 數量)]
-    - file_errors: [(文件路徑, 錯誤信息)]
+    - file_hits: [(文件路径, 文件内提取到的 URL 数量)]
+    - file_errors: [(文件路径, 错误信息)]
     """
     target_urls = extract_github_urls(original_input)
     found_files = find_files_in_text(original_input)
@@ -181,11 +209,11 @@ def collect_target_urls(original_input: str) -> tuple[list[str], list[str], list
 
 def print_collected_targets(found_files, file_hits, file_errors):
     if found_files:
-        print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
+        print(f"📄 检测到 {len(found_files)} 个本地文件，正在读取...")
         for fpath, count in file_hits:
-            print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 個地址")
+            print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 个地址")
         for fpath, err in file_errors:
-            print(f"  ❌ 讀取 {fpath} 失敗: {err}")
+            print(f"  ❌ 读取 {fpath} 失败: {err}")
 
 
 
@@ -346,12 +374,12 @@ async def main():
             wsp = agent._setup_action_workspace("search")
             print(f"📁 [隔离] 已分配搜索沙盒: {wsp}\n")
             
-            # [AOS 7.2] CFO 授權與 ROI 評估
-            print("💰 [CFO] 正在評估搜索任務 ROI...")
+            # [AOS 7.2] CFO 授权与 ROI 评估
+            print("💰 [CFO] 正在评估搜索任务 ROI...")
             await asyncio.sleep(0.8)
             mode = agent.economy.get_survival_mode()
             tier = agent.economy.get_recommended_tier()
-            print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.05 預算。")
+            print(f"✅ [CFO] 授权成功：当前模式 {mode}，已分配 $0.05 预算。")
             
             userInput = SEARCH_PROMPT_TEMPLATE.format(user_query=query)
             print(f"🔍 正在搜索: {query} [🧠 {tier} 模式]\n")
@@ -366,7 +394,7 @@ async def main():
                         full_report += chunk
                 print("\n")
                 
-                # [AOS 7.2] 提取結構化 JSON 數據
+                # [AOS 7.2] 提取结构化 JSON 数据
                 try:
                     import json
                     json_match = re.search(r"```json\s*(\[.*?\])\s*```", full_report, re.DOTALL)
@@ -375,53 +403,53 @@ async def main():
                         ranking_path = os.path.join(wsp, "ranking_data.json")
                         with open(ranking_path, "w", encoding="utf-8") as f:
                             f.write(json_data)
-                        print(f"📊 [數據] 結構化排名已導出: {ranking_path}")
+                        print(f"📊 [数据] 结构化排名已导出: {ranking_path}")
                 except Exception as e:
-                    logger.error("JSON 提取失敗: %s", e)
+                    logger.error("JSON 提取失败: %s", e)
 
                 # [AOS 7.1] 物理归档报告
                 try:
                     report_path = os.path.join(wsp, "search_report.md")
                     with open(report_path, "w", encoding="utf-8") as f:
                         f.write(full_report)
-                    print(f"💾 完整報告已自動保存到: {report_path}\n")
+                    print(f"💾 完整报告已自动保存到: {report_path}\n")
                 except Exception as e:
-                    logger.warning("搜索報告歸檔失敗: %s", e)
+                    logger.warning("搜索报告归档失败: %s", e)
                 
             except Exception as e:
                 logger.error("Agent 处理异常: %s", e)
                 print(f"\n❌ 错误: {e}\n")
             continue
         elif userInput.startswith("/analyze "):
-            # 快捷分析：支持 URL、本地文件路徑或混合文本
+            # 快捷分析：支持 URL、本地文件路径或混合文本
             original_input = userInput[9:].strip()
             if not original_input:
-                print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
+                print("⚠️  请输入仓库地址、本地报告路径或包含路径的描述。\n")
                 continue
 
             target_urls, found_files, file_hits, file_errors = collect_target_urls(original_input)
             print_collected_targets(found_files, file_hits, file_errors)
             
             if not target_urls:
-                print(f"⚠️  未找到任何有效的 GitHub 地址。輸入內容: \"{original_input[:50]}...\"\n")
+                print(f"⚠️  未找到任何有效的 GitHub 地址。输入内容: \"{original_input[:50]}...\"\n")
                 continue
 
-            print(f"🚀 開始準備分析 {len(target_urls)} 個項目...\n")
+            print(f"🚀 开始准备分析 {len(target_urls)} 个项目...\n")
 
-            # [AOS 7.2] CFO 授權與 ROI 評估
-            print("💰 [CFO] 正在評估分析任務 ROI...")
+            # [AOS 7.2] CFO 授权与 ROI 评估
+            print("💰 [CFO] 正在评估分析任务 ROI...")
             await asyncio.sleep(0.6)
             mode = agent.economy.get_survival_mode()
             tier = agent.economy.get_recommended_tier()
-            print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.10 深度分析預算。")
+            print(f"✅ [CFO] 授权成功：当前模式 {mode}，已分配 $0.10 深度分析预算。")
 
-            # [AOS 7.1] 激活隔離工作區
+            # [AOS 7.1] 激活隔离工作区
             wsp = agent._setup_action_workspace("analyze")
-            print(f"📁 [隔離] 已分配分析沙盒: {wsp}\n")
+            print(f"📁 [隔离] 已分配分析沙盒: {wsp}\n")
             
             all_reports = []
             for url in target_urls:
-                print(f"📊 正在分析: {url} [☁️ 雲端模式]\n")
+                print(f"📊 正在分析: {url} [☁️ 云端模式]\n")
                 prompt = ANALYZE_PROMPT_TEMPLATE.format(repo_url=url)
                 try:
                     print(f"\n🤖 Agent ({url}): ", end="", flush=True)
@@ -433,60 +461,60 @@ async def main():
                     all_reports.append(repo_report)
                     print("\n" + "-"*30)
                 except Exception as e:
-                    logger.error(f"分析 {url} 異常: {e}")
-                    print(f"\n❌ 錯誤: {e}\n")
+                    logger.error(f"分析 {url} 异常: {e}")
+                    print(f"\n❌ 错误: {e}\n")
 
-            # 如果有多個報告，嘗試生成一個對比總結
+            # 如果有多个报告，尝试生成一个对比总结
             if len(all_reports) > 1:
-                print("\n⚖️ 正在生成多項目對比總結...")
-                comparison_prompt = f"請對以下多個項目的分析結果進行縱向對比，列出它們的異同點、各自優劣勢，並給出選型建議：\n\n" + "\n\n".join(all_reports)
+                print("\n⚖️ 正在生成多项目对比总结...")
+                comparison_prompt = f"请对以下多个项目的分析结果进行纵向对比，列出它们的异同点、各自优劣势，并给出选型建议：\n\n" + "\n\n".join(all_reports)
                 full_content = ""
                 async for chunk in agent.chat(comparison_prompt, tier="PREMIUM", no_tools=True):
                     print(chunk, end="", flush=True)
                     full_content += chunk
-                final_report = comparison_prompt + "\n\n# 對比總結\n" + full_content
+                final_report = comparison_prompt + "\n\n# 对比总结\n" + full_content
             else:
                 final_report = all_reports[0] if all_reports else ""
 
-            # [AOS 7.1] 物理歸檔
+            # [AOS 7.1] 物理归档
             try:
                 report_path = os.path.join(wsp, "analyze_report.md")
                 with open(report_path, "w", encoding="utf-8") as f:
                     f.write(final_report)
-                print(f"\n💾 完整的分析報告已自動保存到: {report_path}\n")
+                print(f"\n💾 完整的分析报告已自动保存到: {report_path}\n")
             except Exception as e:
-                logger.warning("分析報告歸檔失敗: %s", e)
+                logger.warning("分析报告归档失败: %s", e)
             continue
         elif userInput.startswith("/review "):
-            # 專家團評審：支持 URL、本地文件或混合文本
+            # 专家团评审：支持 URL、本地文件或混合文本
             original_input = userInput[8:].strip()
             if not original_input:
-                print("⚠️  請輸入倉庫地址、本地報告路徑或包含路徑的描述。\n")
+                print("⚠️  请输入仓库地址、本地报告路径或包含路径的描述。\n")
                 continue
 
             target_urls, found_files, file_hits, file_errors = collect_target_urls(original_input)
 
             if found_files:
-                print(f"📄 檢測到 {len(found_files)} 個本地文件，正在讀取...")
+                print(f"📄 检测到 {len(found_files)} 个本地文件，正在读取...")
                 for fpath, count in file_hits:
-                    print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 個地址")
+                    print(f"  ✅ {os.path.basename(fpath)}: 找到 {count} 个地址")
                 for fpath, err in file_errors:
-                    print(f"  ❌ 讀取 {fpath} 失敗: {err}")
+                    print(f"  ❌ 读取 {fpath} 失败: {err}")
 
             if not target_urls:
                 print(f"⚠️  未找到任何有效的 GitHub 地址。\n")
                 continue
 
-            # [AOS 7.2] CFO 授權與 ROI 評估
-            print("💰 [CFO] 正在評估多專家評審任務 ROI...")
+            # [AOS 7.2] CFO 授权与 ROI 评估
+            print("💰 [CFO] 正在评估多专家评审任务 ROI...")
             await asyncio.sleep(1.0)
             mode = agent.economy.get_survival_mode()
             tier = agent.economy.get_recommended_tier()
-            print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.25 專家團專項預算。")
+            print(f"✅ [CFO] 授权成功：当前模式 {mode}，已分配 $0.25 专家团专项预算。")
 
             try:
-                # 觸發混合算力專家團評審 (支持單個或多個地址)
-                print(f"\n🤖 專家團綜合評審報告 (共 {len(target_urls)} 個項目)：\n", end="", flush=True)
+                # 触发混合算力专家团评审 (支持单个或多个地址)
+                print(f"\n🤖 专家团综合评审报告 (共 {len(target_urls)} 个项目)：\n", end="", flush=True)
                 full_report = ""
                 async with hot_mcp_env(agent, serverParams):
                     async for chunk in agent.multiAgentReview(target_urls):
@@ -494,18 +522,18 @@ async def main():
                         full_report += chunk
                 print("\n")
                 
-                # [AOS 7.1] 物理歸檔報告
+                # [AOS 7.1] 物理归档报告
                 try:
                     report_path = os.path.join(agent.workspace_path, "review_report.md")
                     with open(report_path, "w", encoding="utf-8") as f:
                         f.write(full_report)
-                    print(f"💾 評審報告已自動保存到: {report_path}\n")
+                    print(f"💾 评审报告已自动保存到: {report_path}\n")
                 except Exception as e:
-                    logger.warning("評審報告歸檔失敗: %s", e)
+                    logger.warning("评审报告归档失败: %s", e)
                 
             except Exception as e:
-                logger.error("評審流程異常: %s", e)
-                print(f"\n❌ 錯誤: {e}\n")
+                logger.error("评审流程异常: %s", e)
+                print(f"\n❌ 错误: {e}\n")
             continue
         elif userInput.startswith("/deploy "):
             # 一键部署：自适应加载 -> 自动 Docker 配置 -> 沙盒运行
@@ -546,15 +574,15 @@ async def main():
             # AOS 2.0: 全自治模式
             demand = userInput[6:].strip()
             if not demand:
-                print("⚠️  請輸入任務需求，例如: /auto 找到最火的 3 個 Python 量化框架\n")
+                print("⚠️  请输入任务需求，例如: /auto 找到最火的 3 个 Python 量化框架\n")
                 continue
             
-            # [AOS 7.2] CFO 授權與 ROI 評估
-            print("💰 [CFO] 正在評估自治任務 ROI...")
+            # [AOS 7.2] CFO 授权与 ROI 评估
+            print("💰 [CFO] 正在评估自治任务 ROI...")
             await asyncio.sleep(0.8)
             mode = agent.economy.get_survival_mode()
             tier = agent.economy.get_recommended_tier()
-            print(f"✅ [CFO] 授權成功：當前模式 {mode}，已分配 $0.50 全自治預算。")
+            print(f"✅ [CFO] 授权成功：当前模式 {mode}，已分配 $0.50 全自治预算。")
 
             try:
                 async with hot_mcp_env(agent, serverParams):

@@ -72,6 +72,80 @@ class AsyncRateLimiter:
     def __init__(self, rpm: int):
         self.interval = 60.0 / rpm
         self.last_called = 0.0
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime
+import requests
+from typing import AsyncGenerator
+from openai import AsyncOpenAI
+from mcp import ClientSession
+from tool_converter import convertMcpToolsToOpenai
+from prompts import EXPERT_REGISTRY, COORDINATOR_SYSTEM_PROMPT
+from docker_sandbox import DockerSandboxAgent
+
+# Logger configuration
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def extract_json(text: str) -> dict | list:
+    """
+    从模型输出中稳健地提取第一个合法的 JSON 对象或数组。支持文本混合与 Markdown 标记。
+    """
+    if not text or not text.strip():
+        raise ValueError("模型返回了空文本，无法提取 JSON")
+    
+    text = text.strip()
+    
+    # 策略 1: 扫描所有可能的 { 或 [ 块
+    import json
+    decoder = json.JSONDecoder()
+    pos = 0
+    while True:
+        # 寻找首个可能的起始符
+        start_brace = text.find('{', pos)
+        start_bracket = text.find('[', pos)
+        
+        if start_brace == -1 and start_bracket == -1:
+            break
+            
+        # 确定哪个更靠前
+        if start_brace == -1: start_pos = start_bracket
+        elif start_bracket == -1: start_pos = start_brace
+        else: start_pos = min(start_brace, start_bracket)
+        
+        try:
+            # 尝试从该位置开始解析第一个完整的 JSON 项目
+            obj, end_index = decoder.raw_decode(text[start_pos:])
+            return obj
+        except json.JSONDecodeError:
+            # 如果解析失败，移动位置继续寻找
+            pos = start_pos + 1
+            if pos >= len(text):
+                break
+    
+    # 策略 2: 如果策略 1 失败，尝试正则提取（处理特殊的 Markdown 标记）
+    markdown_match = re.search(r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```", text, re.DOTALL)
+    if markdown_match:
+        try:
+            return json.loads(markdown_match.group(1))
+        except Exception as e:
+            logger.debug(f"JSON extraction regex strategy failed: {e}")
+            
+    raise ValueError(f"JSON 解析失败: 未能在文本中找到合法的 JSON 对象或数组。\n片段: {text[:200]}")
+
+
+class AsyncRateLimiter:
+    """
+    异步频率限制器，确保请求频率不超过设定的 RPM。
+    """
+    def __init__(self, rpm: int):
+        self.interval = 60.0 / rpm
+        self.last_called = 0.0
         self.lock = asyncio.Lock()
 
     async def wait(self):
@@ -80,10 +154,10 @@ class AsyncRateLimiter:
             elapsed = now - self.last_called
             if elapsed < self.interval:
                 sleep_time = self.interval - elapsed
-                # [AOS 7.4] 物理間隔保障：強制睡眠以滿足 API 網關的 TPS 限制
+                # [AOS 7.4] 物理间隔保障：强制睡眠以满足 API 网关的 TPS 限制
                 await asyncio.sleep(sleep_time)
             
-            # [AOS 7.4] 安全緩衝：在每次調用前額外增加 0.5s 抖動防止併發爆發
+            # [AOS 7.4] 安全缓冲：在每次调用前额外增加 0.5s 抖动防止并发爆发
             await asyncio.sleep(0.5)
             self.last_called = asyncio.get_event_loop().time()
 
@@ -180,10 +254,10 @@ class UnifiedClient:
         # Ollama 单 GPU 串行推理，信号量防止并发排队
         self._local_semaphore = asyncio.Semaphore(1)
         
-        # 頻率限制：下調至 20 RPM (約 3s/次)，確保絕對穩定
+        # 频率限制：下调至 20 RPM (约 3s/次)，确保绝对稳定
         self.rate_limiter = AsyncRateLimiter(rpm=20)
         
-        # [AOS 5.0] M2M 協議開關
+        # [AOS 5.0] M2M 协议开关
         self.force_m2m_protocol = False
         # 本地 HTTP 客户端复用（减少频繁建连开销）
         self._local_http_client = None
@@ -276,7 +350,7 @@ class UnifiedClient:
             elif role == "tool":
                 # 3. 工具返回结果如果是纯空，某些 API 也会报错。
                 if not str(new_msg.get("content", "")).strip():
-                    new_msg["content"] = "无输出/Void"
+                    new_msg["content"] = "无输出"
                     
             cleaned.append(new_msg)
             
@@ -812,7 +886,7 @@ class McpAgent:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "port": {"type": "integer", "description": "要探测的端口号 (如 8080或3000)"},
+                            "port": {"type": "integer", "description": "要探测的端口号 (如 8080 或 3000)"},
                             "path": {"type": "string", "description": "HTTP 探测路径，默认为 '/'"}
                         },
                         "required": ["port"]
@@ -1115,7 +1189,7 @@ class McpAgent:
                             expert_available_tools.append(sys_t)
                             break
 
-            # [AOS 7.4] 物理主權：使用 UUID 徹底隔絕併發記憶污染
+            # [AOS 7.4] 物理主权：使用 UUID 彻底隔绝并发记忆污染
             import uuid
             safe_id = f"expert_{role}_{uuid.uuid4().hex[:8]}"
             
@@ -1370,7 +1444,7 @@ class McpAgent:
                     f.write(r.content)
                 size = len(r.content)
                 logger.info(f"🎯 [AOS 4.9] http_fetch 成功: {url} -> {save_path} ({size} 字节)")
-                return f"SUCCESS: {size} bytes saved to {os.path.basename(save_path)}. 物理文件已落地。"
+                return f"成功: 已保存 {size} 字节至 {os.path.basename(save_path)}。物理文件已落地。"
             except Exception as e:
                 err_msg = f"FAILED: http_fetch 无法获取 {url}. 错误: {str(e)}"
                 logger.error(err_msg)
@@ -1571,7 +1645,7 @@ class McpAgent:
                     f_size = os.path.getsize(path)
                     if f_size > 100 * 1024:
                         offset = parsed_args.get("offset", 0)
-                        logger.warning("🛑 [AOS 7.5] 觸發大文件分片讀取: %s (size: %d, offset: %d)", path, f_size, offset)
+                        logger.warning("🛑 [AOS 7.5] 触发大文件分片读取: %s (size: %d, offset: %d)", path, f_size, offset)
                         resultText = self._read_file_chunked(path, f_size, offset)
 
             if resultText is None:
@@ -1793,8 +1867,8 @@ class McpAgent:
         else:
             tools = all_tools if all_tools else []
         
-        # [AOS 7.5.8] 核心增強：動態注入分片讀取參數 (offset)
-        # 防止模型因不知道有 offset 而陷入死循環
+        # [AOS 7.5.8] 核心增强：动态注入分片读取参数 (offset)
+        # 防止模型因不知道有 offset 而陷入死循环
         read_target_tools = ["read_file", "read_text_file", "filesystem_read_file", "get_file_contents"]
         for t in tools:
             if t["function"]["name"] in read_target_tools:
@@ -2187,7 +2261,7 @@ class McpAgent:
             "auto": "Auto",
             "blitz": "Blitz"
         }
-        # [AOS 7.4] 物理隔離：增加納秒與隨機後綴，防止併發啟動導致的路徑衝突
+        # [AOS 7.4] 物理隔离：增加纳秒与随机后缀，防止并发启动导致的路徑冲突
         import time, random
         sub_ms = int((time.time() % 1) * 1000)
         rand_id = random.randint(100, 999)
@@ -2472,7 +2546,7 @@ class McpAgent:
                     is_logical_fraud = has_pseudo_code and not toolCallsDict
 
                     if is_logical_fraud or has_loitering or (has_pseudo_code and len(fullContent) > 80):
-                        logger.warning(f"🚨 [AOS P0] 拦截到 Blitz 专家的‘逻辑欺察’尝试。")
+                        logger.warning(f"🚨 [AOS P0] 拦截到 Blitz 专家的‘逻辑欺诈’尝试。")
                         fraud_feedback = (
                             "🚨 [内核指令：逻辑欺诈拦截] 严禁在 BLITZ 模式下编写代码块或提供文档建议！\n"
                             "你当前的任务是【执行】，禁止通过文字进行‘教学’或‘演示’。必须且只能调用实弹工具。\n"
@@ -2526,344 +2600,6 @@ class McpAgent:
 
                 total_tool_calls += 1
                 logger.info("[%s] 正在执行子任务工具: %s", context_id, funcName)
-                
-                try:
-                    resultText = await self._execute_single_tool(
-                        func_name=funcName,
-                        arguments_json=arguments,
-                        workspace_override=effective_workspace
-                    )
-                    
-                    # [AOS 5.2] Physical Convergence Lock (收敛强关补丁)
-                    # 如果工具反馈暗示任务已完成或环境已处于目标状态，立即关断循环返回结果，拒绝 Round 2
-                    stop_keywords = ["共 0 个", "清理完毕", "Already cleaned", "0 tasks found", "处于最新状态", "已被物理抹除", "当前无任何待执行"]
-                    
-                    # [AOS 5.3] INSTANT_KILL Protocol: 硬核物理截断
-                    # 针对调度器工具的成功信号，实现“活干完立即关断”
-                    instant_kill_signals = ["⏰ [调度器]", "💥 [调度器]"]
-                    
-                    if any(sig in str(resultText) for sig in instant_kill_signals):
-                        logger.info("⚡ [AOS 5.3] INSTANT_KILL: 调度器操作成功，强制物理断电。")
-                        self.memories[context_id].append({"role": "tool", "tool_call_id": tc["id"], "content": resultText})
-                        return f"INSTANT_KILL_PASS: {resultText}"
-
-                    # [P1] 黑板内容读取死循环熔断
-                    if "read_blackboard" in funcName:
-                        if call_sig in bb_last_result and bb_last_result[call_sig] == str(resultText):
-                            bb_read_tracker[call_sig] = bb_read_tracker.get(call_sig, 0) + 1
-                            if bb_read_tracker[call_sig] >= 3:
-                                logger.error("🚫 [AOS P1] 黑板读取死循环: 连续 3 次无变化 (%s)", call_sig)
-                                return f"⚠️ [物理熔断] 检测到黑板读取死循环 (连续 3 次内容无变化)，由内核强制终止。"
-                        else:
-                            bb_read_tracker[call_sig] = 0
-                        bb_last_result[call_sig] = str(resultText)
-
-                    # 🚨 [Fix AOS 7.5.8] 核心修复：删除此处多余的 append，防止进入 memories 时 ID 重复导致 400
-                    # 恢復 AOS 5.2 收斂邏輯
-                    if any(sk.lower() in str(resultText).lower() for sk in stop_keywords):
-                        logger.info("🛑 [AOS 5.2] Physical Convergence: 目标物理达成，强制收敛。")
-                        self.memories[context_id].append({"role": "tool", "tool_call_id": tc["id"], "content": resultText})
-                        return f"TASK_COMPLETED: 物理目标已达成 (AOS 5.2 强行收敛终止)。结果详细反馈: {resultText}"
-                    # [AOS 4.9] 协议加固 (JSON Pipe Fix)
-                    # 针对大尺寸结果（如 JS 源码）进行极致截断预览，防止撑破 OpenAI/MCP JSON 管道
-                    # 刺客的任务是“拿回证据”，不是“在对话里展示源码”
-                    if len(str(resultText)) > 1000:
-                        preview = str(resultText)[:500] + "\n\n...(中间数据已物理截断以保护管道)...\n\n" + str(resultText)[-500:]
-                        resultText = f"【物理数据快照 (已截断)】\n{preview}\n\n⚠️ 提示：完整内容已存入物理文件，严禁要求在对话中输出完整源码！"
-                    
-                    # [AOS 4.8] 识别工具执行结果，更新成功/失败计数器
-                    if "Error:" in str(resultText) or "错误:" in str(resultText) or "failed" in str(resultText).lower():
-                        failure_count += 1
-                    else:
-                        success_count += 1
-                        
-                    # [AOS 7.3] 智能重复与原地踏步检测
-                    import hashlib
-                    # 🛡️ 保护：防止 resultText 为 None 导致 encode() 崩溃
-                    safe_result = str(resultText or "None")
-                    args_hash = hashlib.md5(arguments.encode()).hexdigest()
-                    result_hash = hashlib.md5(safe_result.encode()).hexdigest()
-                    fingerprint = f"{funcName}:{args_hash}:{result_hash}"
-                    
-                    if fingerprint in fingerprint_history:
-                        logger.warning("🚫 [AOS 7.3] 检测到重复执行且无结果位移: %s", funcName)
-                        # 如果重复，不计入成功产出，增加停机权重
-                        consecutive_stale_rounds += 0.5 
-                    else:
-                        fingerprint_history.add(fingerprint)
-                        if any(kw in funcName for kw in ["read", "list", "get_file", "search"]):
-                             self.has_logical_delta = True
-                             logger.info("🧠 [AOS 7.5.8] 侦测到逻辑位移（拿到了新信息）: %s", funcName)
-
-                    self.token_budget.consume(self.token_budget.estimate_tokens(str(resultText)))
-                    
-                except Exception as e:
-                    error_msg = str(e)
-                    logger.error("子任务工具外层调用失败: %s - %s", funcName, error_msg)
-                    resultText = self._format_stable_error(
-                        symptom=f"{funcName} 外层调用异常: {error_msg}",
-                        likely_causes=[
-                            "工具执行路径发生运行时异常",
-                            "参数解析或路径锚定失败",
-                            "外部依赖（MCP/文件系统/网络）异常"
-                        ],
-                        tried=[
-                            "已走标准工具调用链",
-                            "已进入异常捕获并记录日志"
-                        ],
-                        next_action="停止盲重试，先检查同名工具与参数，再决定是否继续",
-                        rollback_status="未显式回滚"
-                    )
-                    
-                    # [AOS 2.9] 同错熔断检测：如果连续两次报完全相同的错，直接断电
-                    recent_errors.append(error_msg)
-                    if len(recent_errors) >= 2 and recent_errors[-1] == recent_errors[-2]:
-                        return self._format_stable_error(
-                            symptom=f"重复错误熔断: {error_msg}",
-                            likely_causes=[
-                                "同一错误被重复触发，策略未产生位移",
-                                "当前任务上下文无法继续推进"
-                            ],
-                            tried=[
-                                "连续执行后捕获到相同错误",
-                                "触发重复错误熔断保护"
-                            ],
-                            next_action="暂停自动流程，人工决定是否切换策略或新会话重试",
-                            rollback_status="流程已中断，未执行额外回滚"
-                        )
-
-                current_tool_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": resultText,
-                })
-                
-            # [AOS 3.9.9] 确保全量 tool_calls 回传，无论中途有无内部异常
-            self.memories[context_id].extend(current_tool_messages)
-
-            # [AOS 7.5.8] 物理或逻辑位移判定
-            hash_after = self.blackboard.get_snapshot_hash()
-            has_physical_delta = (hash_before != hash_after) or (len(self._get_workspace_delta(iteration_start_files, workspace_override=effective_workspace)) > 0)
-            
-            if has_physical_delta or self.has_logical_delta:
-                consecutive_stale_rounds = 0
-                # 如果有产出且接近上限，自动延展（最高至 50 轮，确保读完大文件）
-                if iteration >= current_max - 2 and current_max < 50:
-                    current_max += 5
-                    logger.info("📈 [AOS 7.5.8] 检测到有效位移（物理:%s, 逻辑:%s），动态延展预算至 %d 轮", has_physical_delta, self.has_logical_delta, current_max)
-            else:
-                consecutive_stale_rounds += 1
-                
-            if consecutive_stale_rounds >= 3:
-                logger.warning("🛑 [AOS 7.3] 连续 3 轮无物理增量，判定为无效循环，强行关断。")
-                return fullContent + "\n\n🛑 [AOS 7.3 系统干预] 检测到原地踏步（连续 3 轮无有效产出），已强制终止循环以保护预算。"
-        
-        # [AOS 2.9] 自动整理动态加载的技能，任务结束清空，保持“冷酷无情”的低成本状态
-        # asyncio.create_task(self.skill_manager.unload_all())
-        
-        # [AOS 4.8] 硬核主权：如果任务包含工具调用但全数失败，则返回明确的失败信号，防止伪装成功
-        if failure_count > 0 and success_count == 0:
-            return f"🚫 [AOS 4.8 物理拒绝] 任务关键工具库调用失败 ({failure_count} 次错误)。物理路径未打通，拒绝撰写 Markdown 报告。底层错误细节：{fullContent[:300]}"
-
-        # [AOS 2.9.1] 温柔终止：如果跑满 10 步还没完，返回最后一次的原始内容，而不是报错。
-        return fullContent or f"🛑 [提示] 已达到最大限制 ({MAX_ITERATIONS} 步)，任务已暂停。当前进度：{fullContent[:200] if fullContent else '无输出'}"
-
-    def loadMemory(self, context_id: str = "main", system_prompt: str | None = None) -> list[dict]:
-        """
-        异步加载指定上下文的记忆
-        """
-        path = self._get_memory_path(context_id)
-        prompt = system_prompt or self.systemPrompt
-        
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        self.memories[context_id] = data
-                        # 主动执行一次截断与校验，确保历史记忆序列合法
-                        self._truncate_memory(context_id)
-                        logger.info("🧠 已从文件恢复 [%s] 的历史记忆并完成序列校验", context_id)
-                        return self.memories[context_id]
-            except Exception as e:
-                logger.error("加载记忆失败 %s: %s", context_id, e)
-        
-        # 初始状态
-        initial_msg = [{"role": "system", "content": prompt}]
-        self.memories[context_id] = initial_msg
-        return initial_msg
-
-    def _parse_github_url(self, url: str) -> tuple[str, str]:
-        """从 GitHub URL 中解析 owner 和 repo"""
-        parts = url.rstrip("/").split("/")
-        if len(parts) >= 2:
-            return parts[-2], parts[-1]
-        return "", ""
-
-    async def adaptive_load_data(self, repo_url: str, expert_config: dict | None = None) -> str:
-        """
-        自适应数据加载：根据专家算力层级决定分析深度。
-        """
-        owner, repo = self._parse_github_url(repo_url)
-        if not owner or not repo:
-            raise ValueError(f"无法解析 GitHub URL: {repo_url}")
-
-        tier = expert_config.get("tier", "LOCAL") if expert_config else "LOCAL"
-        print(f"📂 [{self.mode} | {tier}] 正在扫描仓库结构...")
-        try:
-            # 1. 扫描文件 tree (尝试递归获取更多目录信息，帮助模型判断代码分布)
-            tree = await self.session.call_tool("search_repositories", arguments={
-                "query": f"repo:{owner}/{repo} path:/",
-            })
-            # 如果 search 不太好用，由于 MCP 工具限制，我们至少在 adaptive_load_data 中明确告知 LLM 根目录结构
-            tree_content = str(tree.content)
-            
-            # 如果 search_repositories 返回不理想，回退到原来的 list
-            if "total_count" not in tree_content or "items" not in tree_content:
-                tree = await self.session.call_tool("get_file_contents", arguments={
-                    "owner": owner,
-                    "repo": repo,
-                    "path": "."
-                })
-                tree_content = str(tree.content)
-            
-            # 2. 确定待加载文件
-            files_to_read = ["README.md"]
-            if tier in ("PREMIUM", "LONG_CONTEXT") or self.mode == "TURBO":
-                # 深度模式：搜寻核心代码
-                candidates = ["requirements.txt", "package.json", "main.py", "app.py", "index.ts", "src/index.ts", "setup.py", "go.mod"]
-                found_files = [f for f in candidates if f in tree_content]
-                # 限制读取数量，防止上下文溢出
-                limit = 5 if tier == "LONG_CONTEXT" else 2
-                files_to_read.extend(found_files[:limit])
-
-            # 3. 批量读取源码
-            print(f"🚀 正在加载上下文文件: {files_to_read}...")
-            read_tasks = [self.session.call_tool("get_file_contents", arguments={
-                "owner": owner, 
-                "repo": repo, 
-                "path": f
-            }) for f in files_to_read]
-            file_results = await asyncio.gather(*read_tasks)
-            
-            source_context = f"--- 文件树结构 ---\n{tree_content}\n\n"
-            for i, r in enumerate(file_results):
-                content = str(r.content)
-                if len(content) > 15000: # 限制单文件加载大小
-                    content = content[:15000] + "\n...(文件内容过大，已截断前 15000 字符)"
-                source_context += f"--- 文件内容: {files_to_read[i]} ---\n{content}\n\n"
-            
-            # 4. 数据脱水逻辑 (如果专家需要且是本地模型可处理的)
-            if expert_config and expert_config.get("need_preprocess", False):
-                print("🏠 正在触发本地模型进行数据脱水清洗...")
-                wash_prompt = "你是一个代码清洗助手。请删除以下代码中的许可证声明、冗长注释、HTML标签和非逻辑代码，只保留核心业务逻辑和属性定义。保持代码紧凑。"
-                source_context = await self.unified_client.generate("LOCAL", wash_prompt, source_context)
-            
-            return source_context
-        except Exception as e:
-            logger.error("数据加载失败: %s", e)
-            return f"数据加载部分失败: {e}"
-
-    async def expertReview(self, expertName: str, config: dict, projectData: str) -> dict:
-        """
-        单个专家的异步评审逻辑，包含独立记忆持久化。
-        """
-        logger.info("专家评审启动: %s (%s)", expertName, config["tier"])
-        
-        # 1. 加载专家的持久化记忆
-        messages = self.loadMemory(expertName, config["prompt"])
-        
-        # 2. 追加当前评审任务 (不作为长期记忆，仅作为当前上下文)
-        # 专家通常不需要记住所有评审过的代码，但可以记住历史发现的规律
-        # 这里演示为：将项目数据作为一次性 user 输入
-        current_messages = messages + [{"role": "user", "content": f"请评价这个项目：\n{projectData}"}]
-        
-        try:
-            resultText = await self.unified_client.generate(
-                tier=config["tier"],
-                messages=config["prompt"], # UnifiedClient expects `messages` for system prompt string
-                user_content=f"请评价这个项目：\n{projectData}",
-                response_format={"type": "json_object"}
-            )
-            # 3. 如果需要专家学习，可以在这里 append resultText 到 messages
-            # messages.append({"role": "assistant", "content": resultText})
-            # self.saveMemory(expertName)
-            
-            return {expertName: extract_json(resultText)}
-        except Exception as e:
-            logger.error("专家 %s 评审失败: %s", expertName, e)
-            return {expertName: {"error": str(e)}}
-
-    async def multiAgentReview(self, repo_urls: str | list[str]) -> AsyncGenerator[str, None]:
-        """
-        混合多 Agent 评审流：支持单个或多个项目的并发评审与对比分析。
-        """
-        if isinstance(repo_urls, str):
-            repo_urls = [repo_urls]
-
-        # [AOS 7.1] 激活隔离工作区
-        wsp = self._setup_action_workspace("review")
-        yield f"📁 [隔離] 正在 Review 空間建立沙盒: {wsp}\n"
-        
-        print(f"\n🚀 [Hybrid Mode: {self.mode}] 啟動 OpenClaw 多專家聯合評委會...")
-        
-        all_experts_results = []
-        
-        for url in repo_urls:
-            yield f"🔍 正在加載項目數據: {url}...\n"
-            # 1. 自適應加載數據 (基礎掃描)
-            try:
-                project_data = await self.adaptive_load_data(url)
-            except Exception as e:
-                yield f"❌ 加載 {url} 失敗: {e}\n"
-                continue
-            
-            # 2. 調度專家評審 (AUTO/TURBO 模式併發)
-            experts = list(EXPERT_REGISTRY.keys())
-            if "Deployment_Executor" in experts:
-                experts.remove("Deployment_Executor")
-            if "scheduler_configurator" in experts:
-                experts.remove("scheduler_configurator")
-            if "SkillCurator" in experts:
-                experts.remove("SkillCurator")
-                
-            tasks = []
-            for name in experts:
-                tasks.append(self.expertReview(name, EXPERT_REGISTRY[name], project_data))
-                
-            yield f"🕵️  正在調度 {len(tasks)} 位專家評審 {url}...\n"
-            results = await asyncio.gather(*tasks)
-            all_experts_results.append({
-                "url": url,
-                "results": results
-            })
-
-        # 3. 匯總/對比報告 (Coordinator)
-        if len(all_experts_results) == 0:
-            yield "❌ 未能在任何地址執行有效的專家評審。"
-            return
-
-        reviews_summary = ""
-        for item in all_experts_results:
-            url = item["url"]
-            results = item["results"]
-            reviews_summary += f"\n=== 項目評審: {url} ===\n"
-            reviews_summary += "\n".join([
-                f"- {r.get('dimension', '專家')} (得分: {r.get('score', '?')}): {r.get('summary', '')}" 
-                for r in results if r
-            ]) + "\n"
-        
-        if len(all_experts_results) > 1:
-            system_prompt = COORDINATOR_SYSTEM_PROMPT + "\n\n請注意：當前有多個項目，請重點進行【橫向對比】，並在報告結尾給出明確的最佳推薦結論。"
-        else:
-            system_prompt = COORDINATOR_SYSTEM_PROMPT
-            
-        user_input = f"請根據以下專家評審意見生成最終報告。{'涉及對比' if len(all_experts_results) > 1 else ''}\n意見如下:\n{reviews_summary}"
-        
-        async for chunk in self.unified_client.generate_stream("PREMIUM", [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input}
-        ]):
             if not chunk or not hasattr(chunk, "choices") or not chunk.choices:
                 continue
             delta = chunk.choices[0].delta

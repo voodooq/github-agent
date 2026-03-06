@@ -185,12 +185,12 @@ class SkillManager:
             if not session_future.done():
                 session_future.set_exception(e)
             
-            # [AOS 7.5.2] 深度異常診斷：展開 ExceptionGroup 查看真實原因
-            logger.error("🚫 [技能運行器] 運行時異常 (%s): %s", name, str(e))
+            # [AOS 7.5.2] 深度异常诊断：展开 ExceptionGroup 查看真实原因
+            logger.error("🚫 [技能运行器] 运行时异常 (%s): %s", name, str(e))
             if hasattr(e, "exceptions"):
                 for idx, sub_e in enumerate(e.exceptions):
-                    logger.error("  └─ [子異常 %d]: %s", idx, str(sub_e))
-                    # 如果子異常還有堆棧，記錄下來
+                    logger.error("  └─ [子异常 %d]: %s", idx, str(sub_e))
+                    # 如果子异常还有堆栈，记录下来
                     logger.error(traceback.format_exc())
         finally:
             logger.debug("🔌 [技能运行器] 任务已终结: %s", name)
@@ -280,7 +280,7 @@ class SkillManager:
 
         try:
             # [AOS 7.5.4] NPM 兼容性加固：強制使用官方 Registry 以免鏡像同步延遲導致包找不到
-            # [Fix AOS 7.5.6] 環境變量加固：必須繼承原始環境變量（特別是 PATH 和 SystemRoot），否则 npx 会失败
+            # [Fix AOS 7.5.6] 环境变量加固：必须继承原始环境变量（特别是 PATH 和 SystemRoot），否则 npx 会失败
             # NOTE: os 已在文件顶部全局导入，禁止在此处重复 import（会导致 UnboundLocalError）
             env_config = build_subprocess_env()
             env_config.update({
@@ -1148,7 +1148,7 @@ class SkillManager:
 
     async def run_full_checkup(self) -> dict:
         """
-        [AOS 4.3] 免疫系統：物理級真實點火握手體檢。
+        [AOS 4.3] 免疫系统：物理级真实点火握手体检。
         """
         print("\n📡 [OpenClaw 免疫系统] 正在启动全技能深度体检...")
         print("-" * 50)
