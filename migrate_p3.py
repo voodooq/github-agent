@@ -64,9 +64,9 @@ async def hot_mcp_env(agent, serverParams):
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(content)
             
-        print("Migration successful")
+        print("迁移成功")
     except Exception as e:
-        print("Error:")
+        print("错误:")
         traceback.print_exc()
 
 if __name__ == '__main__':

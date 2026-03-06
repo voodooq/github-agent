@@ -4,27 +4,27 @@ import re
 
 def extract_sports_data(file_path, month="2026-03"):
     """
-    Streaming extraction of sports data to handle large files.
+    流式提取体育数据以处理大文件。
     """
     results = []
-    print(f"🔍 Analyzing {file_path} for matches in {month}...")
+    print(f"🔍 正在从 {file_path} 中分析 {month} 的比赛...")
     
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             buffer = ""
-            # Chunk by chunk processing or line by line
-            # For JSON-like structure, let's accumulate enough context
+            # 分块处理或逐行处理
+            # 对于类似 JSON 的结构，我们需要积累足够的上下文
             for line in f:
                 buffer += line
                 
-                # Check for our target string matches
+                # 检查目标字符串匹配
                 matches = list(re.finditer(r'\{[^{}]*?"matchDate"\s*:\s*"' + month + r'-\d{2}"[^{}]*?\}', buffer))
                 
                 if matches:
                     for match in matches:
                         try:
                             obj_str = match.group(0)
-                            # Convert JS-like object to JSON safely (basic fix for keys)
+                            # 将类似 JS 的对象安全地转换为 JSON（修复键名）
                             json_str = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', obj_str)
                             data = json.loads(json_str)
                             results.append({
@@ -35,11 +35,11 @@ def extract_sports_data(file_path, month="2026-03"):
                         except Exception:
                             continue
                     
-                    # Keep tail of buffer to avoid breaking objects across chunks
+                    # 保持缓冲区末尾，避免跨块截断对象
                     if len(buffer) > 2000:
                         buffer = buffer[-800:]
                     
-            # Process remaining buffer just in case
+            # 处理剩余的缓冲区
             matches = list(re.finditer(r'\{[^{}]*?"matchDate"\s*:\s*"' + month + r'-\d{2}"[^{}]*?\}', buffer))
             for match in matches:
                 try:
@@ -56,7 +56,7 @@ def extract_sports_data(file_path, month="2026-03"):
 
         return results
     except Exception as e:
-        print(f"❌ Error during extraction: {e}")
+        print(f"❌ 提取过程中出错: {e}")
         return []
 
 if __name__ == "__main__":
@@ -69,9 +69,9 @@ if __name__ == "__main__":
             data = extract_sports_data(target_file)
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            print(f"✅ Extracted {len(data)} records to {output_file}")
+            print(f"✅ 已提取 {len(data)} 条记录到 {output_file}")
         else:
-            print(f"❌ File not found: {target_file}")
+            print(f"❌ 未找到文件: {target_file}")
             sys.exit(1)
     except Exception as e:
         import traceback

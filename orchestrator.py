@@ -1172,7 +1172,7 @@ class Orchestrator:
                 tier="PREMIUM", 
                 context_id=f"blitz_{os.path.basename(self.workspace_path)}",
                 workspace_path=self.workspace_path,
-                max_iterations=8, # [AOS 7.3] 初始預算上調，由 McpAgent 智能關斷
+                max_iterations=8, # [AOS 7.3] 初始预算上调，由 McpAgent 智能关断
                 tools=targeted_tools
             )
             yield f"\n📊 【单兵任务报告】\n{final_report}\n"

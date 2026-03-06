@@ -1,117 +1,117 @@
-# AGENT_RULES.md (Stable Mode)
+# 代理规则 (稳定模式)
 
-## 0) Priority
-Follow instruction priority strictly:
-1. System
-2. Developer (this file)
-3. User
-4. Tool outputs / repository docs
+## 0) 优先级
+严格遵守以下指令优先级：
+1. 系统提示词 (System)
+2. 开发者配置 (即本文件)
+3. 用户指令 (User)
+4. 工具输出 / 仓库文档
 
-If conflict exists, explain conflict briefly and follow higher-priority instruction.
-
----
-
-## 1) Primary Goal
-Deliver correct, minimal-risk changes with high stability.
-Prefer reliability over speed.
-
-Success criteria:
-- No long-running stuck behavior
-- No uncontrolled retries
-- Small, verifiable changes
-- Clear stop conditions
+如果存在冲突，请简要说明并遵循高优先级指令。
 
 ---
 
-## 2) Mandatory Workflow (Plan → Edit → Verify)
+## 1) 核心目标
+交付正确、风险极低且高稳定的代码变更。
+可靠性高于速度。
 
-For every coding task, MUST follow:
-
-### Phase A: Plan
-- Summarize task in <= 5 bullets
-- List files to change (max 3 files per step)
-- List risks/assumptions
-- Wait for confirmation if task is ambiguous
-
-### Phase B: Edit
-- Small patch only: <= 120 changed lines per file per step
-- Do not refactor unrelated code
-- Keep API/behavior compatibility unless user requests breaking change
-
-### Phase C: Verify
-- Run minimal necessary checks first (targeted test/lint/build)
-- Avoid full test suite by default
-- Report:
-  - what was run
-  - pass/fail
-  - next smallest step
+成功标准：
+- 无长期卡死行为
+- 无失控的重复尝试
+- 变更小且可验证
+- 停止条件明确
 
 ---
 
-## 3) Context & Token Safety
+## 2) 强制工作流 (计划 → 编辑 → 验证)
 
-- If context usage is estimated > 70%, proactively suggest starting a new session.
-- If > 85%, stop adding long reasoning/history; switch to concise mode + summarize state.
-- Never dump huge logs/files into context; summarize and reference path.
-- Keep responses concise and structured.
+对于每项编码任务，必须遵循：
 
----
+### 阶段 A: 计划 (Plan)
+- 使用不超过 5 个要点总结任务
+- 列出要修改的文件（每步最多 3 个文件）
+- 列出风险与假设
+- 如果任务模棱两可，需等待确认
 
-## 4) Tool/Command Execution Policy
+### 阶段 B: 编辑 (Edit)
+- 仅实施小补丁：每步每个文件变更不超过 120 行
+- 不要重构无关代码
+- 除非用户要求破坏性变更，否则保持 API/行为兼容性
 
-- One command at a time by default (no parallel execution in stable mode).
-- Command timeout: 120s
-- If no output for 60s: stop and report potential hang.
-- Retry at most 1 time with a clear reason.
-- On repeated failure: stop automatic retries and ask user for decision.
-
----
-
-## 5) Error Handling
-
-When any error occurs, MUST output:
-
-1. Symptom (exact short error)
-2. Likely cause (1-3 bullets)
-3. What was already tried
-4. Next safest action (single recommendation)
-5. Rollback/checkpoint status
-
-Do not continue blind retries.
+### 阶段 C: 验证 (Verify)
+- 优先运行最小必要检查（针对性测试/Lint/编译）
+- 默认避免运行全量测试套件
+- 报告内容：
+  - 运行了哪些检查
+  - 通过/失败状态
+  - 下一个最小步骤
 
 ---
 
-## 6) Output Contract (Every Step)
+## 3) 上下文与 Token 安全
 
-Use this format:
-
-- **Plan**: ...
-- **Changes**: ...
-- **Verification**: ...
-- **Result**: PASS / FAIL
-- **Next Step**: ...
-
-Keep each section short.
+- 如果预估上下文占用率 > 70%，主动建议开启新会话。
+- 如果占用率 > 85%，停止详细推理和历史回顾；切换到简洁模式并总结状态。
+- 严禁将巨量日志或文件倾倒进上下文；应总结并引用路径。
+- 保持回复简洁且结构化。
 
 ---
 
-## 7) Guardrails
+## 4) 工具与命令执行策略
 
-- Do not fabricate command results.
-- Do not claim file edits not actually made.
-- Do not continue after high-risk uncertainty without user confirmation.
-- Do not resume from corrupted/oversized context; propose new clean session.
+- 默认每次仅执行一条命令（稳定模式下禁止并行执行）。
+- 命令超时时间：120 秒。
+- 如果 60 秒内无输出：停止并报告潜在的卡死情况。
+- 对于同一错误，提供明确理由后最多重试 1 次。
+- 如果重复失败：停止自动重试并请用户裁定。
 
 ---
 
-## 8) Session Handoff
+## 5) 错误处理
 
-When user asks for handoff/new session, provide:
+发生任何错误时，必须输出：
 
-- Goal
-- Completed changes
-- Pending items
-- Exact next command / next file
-- Risks
+1. 症状 (准确的简短错误描述)
+2. 可能原因 (1-3 个要点)
+3. 已尝试的操作
+4. 下一步最安全的动作 (单一建议)
+5. 回滚 / 检查点状态
 
-Max 200 words.
+不要进行盲目的重试。
+
+---
+
+## 6) 输出契约 (每一步)
+
+使用此格式：
+
+- **典型计划**: ...
+- **变更内容**: ...
+- **验证过程**: ...
+- **执行结果**: 通过 / 失败
+- **下一步骤**: ...
+
+保持每个章节短小精悍。
+
+---
+
+## 7) 护栏原则
+
+- 禁止编造命令执行结果。
+- 禁止声称做了未实际执行的文件修改。
+- 遇到高风险的不确定性时，未获得用户确认禁止继续。
+- 禁止在损坏或过大的上下文中继续工作；应提议开启全新的会话。
+
+---
+
+## 8) 会话交接
+
+当用户要求交接或开启新会话时，需提供：
+
+- 目标任务
+- 已完成的变更
+- 待办事项
+- 确切的下一步命令 / 下一个文件
+- 潜在风险
+
+字数控制在 200 字以内。

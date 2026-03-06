@@ -2600,12 +2600,6 @@ class McpAgent:
 
                 total_tool_calls += 1
                 logger.info("[%s] 正在执行子任务工具: %s", context_id, funcName)
-            if not chunk or not hasattr(chunk, "choices") or not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            content = delta.content if hasattr(delta, "content") else ""
-            if content:
-                yield content
 
     async def deploy_project(self, repo_url: str) -> AsyncGenerator[str, None]:
         """

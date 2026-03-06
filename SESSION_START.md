@@ -1,17 +1,17 @@
-# Session Start (Stable)
+# 会话启动 (稳定模式)
 
-Mode: Stability-first
-Workflow: Plan → Edit → Verify
-Limits:
-- max 3 files per step
-- max 120 changed lines per file
-- command timeout 120s
-- stop if no output 60s
-- no parallel tools
-- minimal verification only
+模式: 稳定性优先
+工作流: 计划 → 编辑 → 验证
+约束限制:
+- 每步最多修改 3 个文件
+- 每个文件每步变更上限 120 行
+- 命令超时 120 秒
+- 60 秒无输出自动停止
+- 禁止并行使用工具
+- 仅执行最小化验证
 
-Task:
+任务目标:
 <在这里写本次任务>
 
-Output format:
-Plan / Changes / Verification / Result / Next Step
+输出格式:
+计划 (Plan) / 变更 (Changes) / 验证 (Verification) / 结果 (Result) / 下一步 (Next Step)

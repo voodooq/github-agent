@@ -31,11 +31,11 @@ def check_file(filepath):
                         has_os_def = True
             
             if has_os_def:
-                print(f"FOUND: Function '{node.name}' in {filepath} has a local definition of 'os' at line {node.lineno}")
+                print(f"找到: 在 {filepath} 的第 {node.lineno} 行中，函数 '{node.name}' 有对 'os' 的局部定义")
 
 if __name__ == "__main__":
     cwd = std_os.getcwd()
-    print(f"Checking directory: {cwd}")
+    print(f"正在检查目录: {cwd}")
     for root, dirs, files in std_os.walk("."):
         if ".venv" in root or "node_modules" in root: continue
         for f in files:
